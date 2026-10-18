@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -20,7 +21,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_musa, is_npu
 from sglang.utils import LazyImport
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -143,6 +144,26 @@ def _dflash_top_k_renorm_prob(
 def _dflash_top_p_renorm_prob(
     probs: torch.Tensor, top_ps: torch.Tensor
 ) -> torch.Tensor:
+    if (
+        envs.SGLANG_MUSE_COMPACT_TOP_P.get()
+        and is_hip()
+        and is_gfx95_supported()
+        and probs.is_cuda
+        and probs.ndim == 2
+        and 1 <= probs.shape[0] <= 256
+        and probs.shape[1] == 202048
+        and probs.dtype == torch.float32
+        and probs.is_contiguous()
+        and isinstance(top_ps, torch.Tensor)
+        and top_ps.shape == (probs.shape[0],)
+        and top_ps.device == probs.device
+        and top_ps.dtype == torch.float32
+    ):
+        from sglang.kernels.ops.sampling.renorm_compact import (
+            top_p_renorm_probs_compact,
+        )
+
+        return top_p_renorm_probs_compact(probs, top_ps)
     if top_p_renorm_prob is not None:
         return top_p_renorm_prob(probs, top_ps)
     npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ps=top_ps)

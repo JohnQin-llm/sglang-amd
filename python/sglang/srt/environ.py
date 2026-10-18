@@ -1873,6 +1873,7 @@ class Envs:
     SGLANG_MUSE_MOE_VERIFY_M32 = EnvBool(False)
     # Extra shuffled weight storage; see PrepackedMuseMoE for its memory cost.
     SGLANG_MUSE_MOE_PREPACKED = EnvBool(False)
+    SGLANG_MUSE_COMPACT_TOP_P = EnvBool(False)
     SGLANG_MUSE_COMPACT_MOE_ALIGN = EnvBool(False)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
