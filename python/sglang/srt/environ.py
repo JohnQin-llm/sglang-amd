@@ -1870,6 +1870,8 @@ class Envs:
     SGLANG_MUSE_FUSED_QKV_PREPARE = EnvBool(False)
     SGLANG_MUSE_SPLITK_POOLER = EnvBool(False)
     SGLANG_MUSE_TOKEN_SHARDED_POOLER = EnvBool(False)
+    SGLANG_MUSE_MOE_VERIFY_M32 = EnvBool(False)
+    SGLANG_MUSE_COMPACT_MOE_ALIGN = EnvBool(False)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )
