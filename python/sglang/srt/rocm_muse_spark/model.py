@@ -629,6 +629,7 @@ class MuseSpark1xMxfp4Experts(nn.Module):
         intermediate_size: int,
     ):
         super().__init__()
+        self._prepacked_moe = None
         self.num_local_experts = num_local_experts
         self.expert_hidden_size = expert_hidden_size
         self.intermediate_size = intermediate_size
@@ -669,6 +670,35 @@ class MuseSpark1xMxfp4Experts(nn.Module):
             requires_grad=False,
         )
 
+    def prepare_prepacked_weights(self) -> None:
+        if (
+            not envs.SGLANG_MUSE_MOE_PREPACKED.get()
+            or _moe_backend() != "flydsl"
+            or not self.w13_weight.is_cuda
+            or not getattr(
+                torch.cuda.get_device_properties(self.w13_weight.device),
+                "gcnArchName",
+                "",
+            ).startswith("gfx950")
+            or self.num_local_experts != 32
+            or self.expert_hidden_size != 4096
+            or self.intermediate_size != 4096
+        ):
+            self._prepacked_moe = None
+            return
+        from sglang.kernels.ops.muse_spark.moe_prepacked import PrepackedMuseMoE
+
+        weights = (
+            self.w13_weight,
+            self.w13_weight_scale,
+            self.w2_weight,
+            self.w2_weight_scale,
+        )
+        if self._prepacked_moe is None:
+            self._prepacked_moe = PrepackedMuseMoE(*weights)
+        else:
+            self._prepacked_moe.update_weights(*weights)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -683,6 +713,30 @@ class MuseSpark1xMxfp4Experts(nn.Module):
             raise RuntimeError(
                 "Quark MXFP4 experts require MUSE_MOE_BACKEND=triton or flydsl"
             )
+        if self._prepacked_moe is not None and _moe_backend() == "flydsl":
+            weight, gain, has_norm = _post_expert_norm_args(post_expert_norm)
+            # Match the released Muse post-expert norm: zero-centered gamma
+            # with unit gain and epsilon 1e-8. Other contracts keep the fallback.
+            if (
+                hidden_states.shape == (256, 4096)
+                and hidden_states.dtype == torch.bfloat16
+                and hidden_states.is_contiguous()
+                and topk_ids.shape == topk_scores.shape == (256, 8)
+                and has_norm
+                and weight is not None
+                and weight.shape == (4096,)
+                and weight.dtype == torch.bfloat16
+                and weight.is_contiguous()
+                and gain == 1.0
+                and float(post_expert_norm.eps) == 1e-8
+            ):
+                return self._prepacked_moe(
+                    hidden_states,
+                    topk_scores,
+                    topk_ids,
+                    int(local_expert_start),
+                    weight,
+                )
         return _run_fused_moe(
             hidden_states,
             topk_scores,
@@ -1548,6 +1602,12 @@ class MuseSpark1xForCausalLM(nn.Module):
             ):
                 if isinstance(residual, MuseSpark1xNormPreservingResidualConnection):
                     residual.precompute_coefficients()
+        # Derived layouts are prepared before graph capture and refreshed in
+        # place after weight loading, preserving captured buffer addresses.
+        for layer in self.model.layers:
+            experts = getattr(layer.mlp, "experts", None)
+            if isinstance(experts, MuseSpark1xMxfp4Experts):
+                experts.prepare_prepacked_weights()
         for module in self.model.modules():
             if isinstance(module, MuseSpark1xRMSNorm):
                 module.cache_effective_weight()
