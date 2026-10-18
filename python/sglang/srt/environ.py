@@ -1865,6 +1865,11 @@ class Envs:
     # Use the experimental FlyDSL split-K paged GQA kernel for Muse Spark's
     # short-window decode layers on gfx950.
     SGLANG_MUSE_FLYDSL_DECODE = EnvBool(False)
+    # Opt-in gfx950 Muse target-verification and pooler optimizations.
+    SGLANG_MUSE_SWA_VERIFY = EnvBool(False)
+    SGLANG_MUSE_FUSED_QKV_PREPARE = EnvBool(False)
+    SGLANG_MUSE_SPLITK_POOLER = EnvBool(False)
+    SGLANG_MUSE_TOKEN_SHARDED_POOLER = EnvBool(False)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )
