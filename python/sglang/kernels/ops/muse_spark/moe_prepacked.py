@@ -1,4 +1,4 @@
-"""Opt-in AITER A16W4 schedule for 256-token Muse expert batches.
+"""Opt-in AITER A16W4 schedule for small Muse expert batches.
 
 Retains a shuffled copy of each MXFP4 weight and scale tensor. The native
 weights remain available for other shapes; this costs 816 MiB per eligible
@@ -15,10 +15,20 @@ from sglang.kernels.ops.muse_spark.moe_align import align_local
 
 
 @triton.jit
-def _prepare_routes(Sorted, Total, Tokens, Ones, SIZE: tl.constexpr, B: tl.constexpr):
+def _prepare_routes(
+    Sorted,
+    Total,
+    Tokens,
+    Ones,
+    NUM_ROUTES: tl.constexpr,
+    SIZE: tl.constexpr,
+    B: tl.constexpr,
+):
     offsets = tl.program_id(0) * B + tl.arange(0, B)
     slot = tl.load(
-        Sorted + offsets, (offsets < SIZE) & (offsets < tl.load(Total)), other=2048
+        Sorted + offsets,
+        (offsets < SIZE) & (offsets < tl.load(Total)),
+        other=NUM_ROUTES,
     )
     # AITER stage1 consumes a token index. Stage2 consumes the original route
     # slot, so its atomic scatter has exactly one contribution per output row.
@@ -59,21 +69,26 @@ class PrepackedMuseMoE(nn.Module):
             _require_flydsl,
         )
 
+        num_tokens = hidden_states.shape[0]
+        num_routes = num_tokens * 8
+        block_m = 16 if num_tokens < 64 else 32
         ids = ids.to(torch.int32).contiguous()
         scores = scores.to(torch.float32).contiguous()
-        sorted_ids, experts, total = align_local(ids, 32, local_expert_start, 32)
+        sorted_ids, experts, total = align_local(ids, 32, local_expert_start, block_m)
         size = sorted_ids.numel()
         tokens = torch.empty_like(sorted_ids)
         ones = torch.empty_like(sorted_ids, dtype=torch.float32)
         _prepare_routes[(triton.cdiv(size, 256),)](
-            sorted_ids, total, tokens, ones, size, 256
+            sorted_ids, total, tokens, ones, num_routes, size, 256
         )
         inter = torch.empty(
             (size, 4096), device=hidden_states.device, dtype=torch.bfloat16
         )
         # Stage2 performs an atomic add to each unique route slot. It must start
         # from zero on every replay, including after an all-remote route batch.
-        y = torch.zeros((2048, 4096), device=hidden_states.device, dtype=torch.bfloat16)
+        y = torch.zeros(
+            (num_routes, 4096), device=hidden_states.device, dtype=torch.bfloat16
+        )
         flydsl_a16w4_gemm1(
             a_bf16=hidden_states,
             w1_u8=self.w13,
@@ -82,12 +97,12 @@ class PrepackedMuseMoE(nn.Module):
             cumsum_tensor=total,
             m_indices=tokens,
             inter_sorted_bf16=inter,
-            n_tokens=256,
+            n_tokens=num_tokens,
             NE=32,
             D_HIDDEN=4096,
             D_INTER=4096,
             topk=8,
-            tile_m=32,
+            tile_m=block_m,
             tile_n=128,
             tile_k=256,
             b_nt=2,
@@ -101,13 +116,13 @@ class PrepackedMuseMoE(nn.Module):
             sorted_token_ids=sorted_ids,
             sorted_weights=ones,
             flat_out=y,
-            M_logical=2048,
+            M_logical=num_routes,
             max_sorted=size,
             NE=32,
             D_HIDDEN=4096,
             D_INTER=4096,
             topk=1,
-            tile_m=32,
+            tile_m=block_m,
             tile_n=256,
             tile_k=256,
             b_nt=0,
@@ -128,7 +143,7 @@ class PrepackedMuseMoE(nn.Module):
             32,
             1e-8,
             1.0,
-            256,
+            num_tokens,
             fx.Stream(torch.cuda.current_stream(hidden_states.device).cuda_stream),
         )
         return out

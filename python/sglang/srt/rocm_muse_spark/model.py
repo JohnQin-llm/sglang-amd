@@ -718,10 +718,12 @@ class MuseSpark1xMxfp4Experts(nn.Module):
             # Match the released Muse post-expert norm: zero-centered gamma
             # with unit gain and epsilon 1e-8. Other contracts keep the fallback.
             if (
-                hidden_states.shape == (256, 4096)
+                16 <= hidden_states.shape[0] <= 256
+                and hidden_states.shape[0] % 8 == 0
+                and hidden_states.shape[1] == 4096
                 and hidden_states.dtype == torch.bfloat16
                 and hidden_states.is_contiguous()
-                and topk_ids.shape == topk_scores.shape == (256, 8)
+                and topk_ids.shape == topk_scores.shape == (hidden_states.shape[0], 8)
                 and has_norm
                 and weight is not None
                 and weight.shape == (4096,)
