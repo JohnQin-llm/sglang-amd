@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.rocm_muse_spark.model import MuseSpark1xAttention
     from sglang.srt.speculative.spec_info import SpecInput
 
 try:
@@ -215,6 +216,8 @@ class ForwardMetadata:
     mask_indptr: Optional[torch.Tensor] = None
     max_extend_len: Optional[int] = None
     swa_page_table: Optional[torch.Tensor] = None
+    # Shared by Muse SWA layers; rebuilt once per eager forward / graph replay.
+    muse_swa_verify: tuple[torch.Tensor, torch.Tensor] | None = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
@@ -581,6 +584,16 @@ class AiterAttnBackend(AttentionBackend):
             and not self.use_mla
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
+        )
+        self.use_muse_swa_verify = (
+            envs.SGLANG_MUSE_SWA_VERIFY.get()
+            and is_gfx95_supported()
+            and get_spec().speculative_algorithm == "DFLASH"
+            and "MuseSparkForConditionalGeneration"
+            in (
+                getattr(model_runner.model_config.hf_config, "architectures", None)
+                or []
+            )
         )
 
         # aiter kernel related initialization
@@ -2054,6 +2067,13 @@ class AiterAttnBackend(AttentionBackend):
                 :n
             ]
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        # Warmup and capture reuse the metadata object. Reset the Python cache
+        # so the first SWA layer records the metadata-producing GPU operation
+        # into every captured graph. Replay then executes that operation once.
+        if self.use_muse_swa_verify:
+            self.forward_metadata.muse_swa_verify = None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
         reset_verify_attn_plan_cache()
@@ -3475,6 +3495,84 @@ class AiterAttnBackend(AttentionBackend):
         # base class NotImplementedError.
         pass
 
+    def prepare_muse_qkv(
+        self,
+        attention: MuseSpark1xAttention,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Opt-in Muse target verify fusion; unsupported layouts keep old writes."""
+        layer = attention.attn
+        rope = attention.rotary_emb
+        if not (
+            is_gfx95_supported()
+            and forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.attn_attend_prefix_cache
+            and not self.use_mla
+            and not self.kv_cache_is_vectorized_5d
+            and self.kv_cache_dtype == fp8_dtype
+            and self.use_triton_unified_attention
+            and attention.use_qk_norm
+            and not attention.use_attn_temperature_tuning
+            and not layer.is_cross_attention
+            and attention.head_dim == 64
+            and attention.num_heads == 16
+            and attention.num_kv_heads == 2
+            and q.shape[0] in (8, 16, 24, 32)
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and q.stride(1) == k.stride(1) == v.stride(1) == 1
+            and q.shape[1] == 1024
+            and k.shape == v.shape == (q.shape[0], 128)
+            and positions.shape == (q.shape[0],)
+            and positions.is_contiguous()
+            and forward_batch.out_cache_loc.is_contiguous()
+            and (
+                rope is None
+                or (
+                    not rope.is_neox_style
+                    and rope.rotary_dim == 64
+                    and rope.cos_sin_cache.dtype == torch.float32
+                    and rope.cos_sin_cache.device == q.device
+                    and not rope._force_native
+                )
+            )
+        ):
+            return None
+        kc, vc = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        if not (
+            kc.is_contiguous()
+            and vc.is_contiguous()
+            and kc.dtype == vc.dtype == fp8_dtype
+        ):
+            return None
+        mapping = None
+        if self.use_sliding_window_kv_pool and layer.sliding_window_size > 0:
+            mapping = self.swa_kv_pool.full_to_swa_index_mapping
+        ks = layer.k_scale if layer.k_scale is not None else self.k_scale
+        vs = layer.v_scale if layer.v_scale is not None else self.v_scale
+        if (ks is None) != (vs is None):
+            return None
+        from sglang.kernels.ops.muse_spark.qkv_prepare import fused_qkv_prepare
+
+        return fused_qkv_prepare(
+            q,
+            k,
+            v,
+            positions,
+            rope.cos_sin_cache if rope is not None else None,
+            kc,
+            vc,
+            forward_batch.out_cache_loc,
+            eps=attention.norm_eps,
+            q_scale=attention.scale_query_by,
+            swa_mapping=mapping,
+            k_scale=ks,
+            v_scale=vs,
+        )
+
     def _use_fused_fp8_kv_write(self, layer: RadixAttention) -> bool:
         # Fused write reuses K's num_heads/head_dim for V, so it needs FP8,
         # non-MLA, non-SWA, and matching K/V head count + head_dim.
@@ -4209,6 +4307,47 @@ class AiterAttnBackend(AttentionBackend):
                     v_unified = v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
+                    if (
+                        self.use_muse_swa_verify
+                        and self.forward_metadata.max_q_len == 8
+                        and 1 <= forward_batch.seq_lens.numel() <= 32
+                        and q_unified.shape[0] == forward_batch.seq_lens.numel() * 8
+                        and self.page_size == 16
+                        and layer.qk_head_dim == layer.v_head_dim == 64
+                        and layer.tp_q_head_num == layer.tp_k_head_num * 8
+                        and layer.tp_k_head_num == layer.tp_v_head_num
+                        and q_unified.dtype == torch.bfloat16
+                        and k_unified.dtype == v_unified.dtype == fp8_dtype
+                        # Preserve the existing model/backend offset conversion.
+                        and window_size == (2046, 0)
+                        and not layer.logit_cap
+                        and sinks is None
+                    ):
+                        from sglang.kernels.ops.muse_spark.swa_verify import (
+                            muse_swa_verify_attention,
+                            prepare_muse_swa_verify,
+                        )
+
+                        if self.forward_metadata.muse_swa_verify is None:
+                            self.forward_metadata.muse_swa_verify = (
+                                prepare_muse_swa_verify(
+                                    forward_batch.seq_lens + 8, page_table
+                                )
+                            )
+                        muse_swa_verify_attention(
+                            q_unified,
+                            k_unified,
+                            v_unified,
+                            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                            self.forward_metadata.qo_indptr,
+                            forward_batch.seq_lens,
+                            page_table,
+                            layer.scaling,
+                            k_descale,
+                            v_descale,
+                            prepared=self.forward_metadata.muse_swa_verify,
+                        )
+                        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                     # Shape gate, not a model gate: the kernel is tuned for a 16:1
                     # GQA ratio (block_m=32 -> block_q=2 packs two draft tokens per
                     # tile), and head_dim 256 is the only validated size. The kv-head

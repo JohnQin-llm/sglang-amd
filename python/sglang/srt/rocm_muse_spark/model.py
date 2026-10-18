@@ -27,6 +27,7 @@ from sglang.srt.configs.muse_spark import (
     should_skip_weight_loading,
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.environ import envs
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -42,6 +43,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.rocm_muse_spark.fp4_moe import MuseSpark1xFp4Experts
 from sglang.srt.rocm_muse_spark.fused_muse_spark_routing import FusedMuseSparkRouting
@@ -280,11 +282,18 @@ _USE_ROUTER_GEMV = (
 _USE_AITER_DENSE = (
     os.environ.get("MUSE_AITER_DENSE", "0") == "1" and torch.version.hip is not None
 )
+_USE_SPLITK_POOLER = envs.SGLANG_MUSE_SPLITK_POOLER.get()
 _tgemm = None
 
 
 def _dense_linear(x: torch.Tensor, linear: nn.Linear, max_m: int) -> torch.Tensor:
     global _tgemm
+    if _USE_SPLITK_POOLER and linear.bias is None:
+        from sglang.kernels.ops.muse_spark.pooler import try_splitk_pooler
+
+        result = try_splitk_pooler(x, linear.weight)
+        if result is not None:
+            return result
     if (
         _USE_AITER_DENSE
         and linear.bias is None
@@ -326,6 +335,7 @@ class MuseSpark1xAttention(nn.Module):
         self.use_o_gate = True
         self.use_o_norm = True
         self.use_qk_norm = True
+        self.use_fused_qkv_prepare = envs.SGLANG_MUSE_FUSED_QKV_PREPARE.get()
         self.use_rope = _compute_use_rope(config, layer_idx)
         sliding_window = _compute_sliding_window(config, layer_idx)
         # Attention temperature tuning is not part of the released architecture.
@@ -446,7 +456,14 @@ class MuseSpark1xAttention(nn.Module):
         else:
             q, k, v = qkv.split(split_sizes, dim=-1)
             o_gate = None
-        if self.use_qk_norm:
+        prepared = None
+        if self.use_fused_qkv_prepare:
+            prepare = getattr(get_attn_backend(), "prepare_muse_qkv", None)
+            if prepare is not None:
+                prepared = prepare(self, q, k, v, positions, forward_batch)
+        if prepared is not None:
+            q, k = prepared
+        elif self.use_qk_norm:
             if _USE_FUSED_QK_NORM and qk_norm_supported(q, k, self.head_dim):
                 q, k = fused_qk_norm(
                     q, k, self.head_dim, self.norm_eps, self.scale_query_by
@@ -461,9 +478,9 @@ class MuseSpark1xAttention(nn.Module):
                 + 1.0
             ).clamp_min(1.0)
             q = (q * temperature.unsqueeze(-1)).to(q.dtype)
-        if self.rotary_emb is not None:
+        if self.rotary_emb is not None and prepared is None:
             q, k = self.rotary_emb(positions, q, k)
-        output = self.attn(q, k, v, forward_batch)
+        output = self.attn(q, k, v, forward_batch, save_kv_cache=prepared is None)
         output = self._fused_o_norm_gate.forward(output, o_gate)
         output, _ = self.o_proj(output)
         return output
@@ -702,6 +719,7 @@ class MuseSpark1xMoE(nn.Module):
             raise ValueError("num_experts must be divisible by expert parallel size")
         self.layer_idx = layer_idx
         self.tp_size = parallel.tp_size
+        self.use_token_sharded_pooler = envs.SGLANG_MUSE_TOKEN_SHARDED_POOLER.get()
         self.ep_size = parallel.moe_ep_size
         self.ep_rank = parallel.moe_ep_rank
         self.num_experts = config.num_local_experts
@@ -795,7 +813,40 @@ class MuseSpark1xMoE(nn.Module):
             object.__setattr__(self, "_fused_routing_op", op)
         return op
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _pool_inputs(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch | None = None
+    ) -> torch.Tensor:
+        if (
+            forward_batch is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and self.use_token_sharded_pooler
+            and self.pre_expert_proj is not None
+            and get_parallel().attn_tp_size == self.tp_size
+        ):
+            from sglang.kernels.ops.muse_spark.pooler import (
+                try_token_sharded_pooler,
+            )
+
+            pooled = try_token_sharded_pooler(
+                hidden_states,
+                self.pre_expert_proj,
+                self.pre_expert_norm,
+                get_parallel().tp_group,
+            )
+            if pooled is not None:
+                return pooled
+        expert_input = (
+            _dense_linear(hidden_states, self.pre_expert_proj, max_m=128)
+            if self.pre_expert_proj is not None
+            else hidden_states
+        )
+        if self.pre_expert_norm is not None:
+            expert_input = self.pre_expert_norm(expert_input)
+        return expert_input
+
+    def forward(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch | None = None
+    ) -> torch.Tensor:
         if (
             _USE_ROUTER_GEMV
             and self.router_in_fp32
@@ -812,13 +863,7 @@ class MuseSpark1xMoE(nn.Module):
             None, router_logits, self.top_k, True
         )
 
-        expert_input = (
-            _dense_linear(hidden_states, self.pre_expert_proj, max_m=128)
-            if self.pre_expert_proj is not None
-            else hidden_states
-        )
-        if self.pre_expert_norm is not None:
-            expert_input = self.pre_expert_norm(expert_input)
+        expert_input = self._pool_inputs(hidden_states, forward_batch)
         if self.nvfp4_checkpoint:
             output = self.experts(
                 expert_input, topk_scores, topk_ids, self.post_expert_norm
@@ -926,7 +971,11 @@ class MuseSpark1xDecoderLayer(nn.Module):
         ffn_input, stream, _ = self._fused_attn_boundary.forward(
             stream, attn_output, branch_dtype=torch.bfloat16
         )
-        ffn_output = self.mlp(ffn_input)
+        ffn_output = (
+            self.mlp(ffn_input, forward_batch=forward_batch)
+            if self.is_moe_layer
+            else self.mlp(ffn_input)
+        )
         if ffn_boundary is None:
             return self.post_feedforward_residual_gate(
                 stream, self.post_feedforward_layernorm(ffn_output)
