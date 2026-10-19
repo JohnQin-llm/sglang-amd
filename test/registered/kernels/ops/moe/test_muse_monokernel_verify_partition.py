@@ -46,12 +46,15 @@ def test_verify_partition_boundary_graph_replay():
         start = 1152 + 64 * head
         weight[start : start + 32, 0] = 1
         weight[start + 32 : start + 64, 1] = 1
-    cache = torch.zeros(16, 2, 16, 128, device=device, dtype=torch.bfloat16)
-    table = ((torch.arange(16, device=device, dtype=torch.int32) * 5) % 16)[None, :]
+    pages = 80
+    cache = torch.zeros(pages, 2, 16, 128, device=device, dtype=torch.bfloat16)
+    table = ((torch.arange(pages, device=device, dtype=torch.int32) * 7) % pages)[
+        None, :
+    ]
     lengths = torch.empty(1, device=device, dtype=torch.int32)
     positions = torch.empty(8, device=device, dtype=torch.int64)
     slots = torch.empty_like(positions)
-    rotary = torch.zeros(256, 64, device=device)
+    rotary = torch.zeros(pages * 16, 64, device=device)
     rotary[:, :32] = 1
     output = torch.empty(8, 1024, device=device, dtype=torch.bfloat16)
     residual = torch.empty_like(stream)
@@ -101,9 +104,10 @@ def test_verify_partition_boundary_graph_replay():
 
     values = torch.ones(8, 64, device=device)
     values[-1, :32] = -1
-    # 184 ends immediately before the partition boundary; 185 and 191
-    # straddle it; 192 starts the new partition. Reuse one captured graph.
-    for prefix in (184, 185, 191, 192):
+    # Cover an empty prefix, 64-key segments, the previous 192-key boundary,
+    # and the transition to 128-key segments at total length 1025. The same
+    # graph must observe the live lengths and insert every verification token.
+    for prefix in (0, 56, 57, 63, 64, 184, 185, 191, 192, 1016, 1017, 1023, 1024):
         expected = (
             (
                 values.cumsum(0)

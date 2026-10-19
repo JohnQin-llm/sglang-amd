@@ -30,7 +30,6 @@ import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu
 from flydsl.expr.typing import Int32, Int64
-
 from sglang.srt.rocm_muse_spark.mono.ops.common.debug import (
     region_ids,
     stamp,
@@ -62,8 +61,7 @@ from sglang.srt.rocm_muse_spark.mono.ops.common.plan import (
     source_digest,
 )
 from sglang.srt.rocm_muse_spark.mono.ops.common.sync import Mailbox, sreg, stall
-from sglang.srt.rocm_muse_spark.mono.ops.stages import attn, seam
-from sglang.srt.rocm_muse_spark.mono.ops.stages import gemv as gemv
+from sglang.srt.rocm_muse_spark.mono.ops.stages import attn, gemv, seam
 
 HIDDEN = seam.HIDDEN  # 8192
 CORE = attn.CORE  # 1024: o_proj's input width a rank
@@ -285,9 +283,7 @@ def stage_qkv(c, rg, ops, tensile_split=False):
     QKV pairs (t * 2304 + row)."""
     s, tid, lane, wave, red = c["T"], c["tid"], c["lane"], c["wave"], c["red"]
     if const_expr(tensile_split):
-        first = gemv.load_tensile_chunk(
-            lane, wave, ops, rg * ROWS, HIDDEN, 0
-        )
+        first = gemv.load_tensile_chunk(lane, wave, ops, rg * ROWS, HIDDEN, 0)
     if tid < seam.NS:
         c["poll"]([(c["xrdy"], tid, 1)])
     gpu.barrier()
@@ -338,7 +334,7 @@ def build(key: K1Build):
     nch = key.chunks
     nu = key.units
     nqt = attn.q_tiles(L)
-    pm = attn.per_max(key.max_len, nch)
+    pm = attn.per_max(key.max_len, nch, key.q_len)
     lay = scratch_layout(key)
 
     @fx.struct
@@ -484,9 +480,7 @@ def build(key: K1Build):
             },
         }
         for region in REGIONS:
-            c[region] = sreg(
-                scratch, lay[region][0], region, lay[region][1]
-            )
+            c[region] = sreg(scratch, lay[region][0], region, lay[region][1])
         stamp_begin(on, tls, tid, TL_POINTS)
         # ---- 1b QKV GEMV: the weights in flight first, then the x rows
         if bid < GEMV0 + GEMV_TASKS:
@@ -495,9 +489,7 @@ def build(key: K1Build):
             if const_expr(key.tokens > 4):
                 stage_qkv(c, rg, w_qkv, tensile_split=True)
             else:
-                ops = gemv.loads(
-                    c["lane"], c["wave"], w_qkv, rg * ROWS, HIDDEN
-                )
+                ops = gemv.loads(c["lane"], c["wave"], w_qkv, rg * ROWS, HIDDEN)
                 stage_qkv(c, rg, ops)
             stamp(on, tls, tid, 3)
         # ---- 1a seam A
@@ -588,7 +580,7 @@ def build(key: K1Build):
 def lds_bytes(key: K1Build) -> int:
     """The LDS a build's CTA takes (static), from the layout above."""
     s, L = key.tokens, key.q_len
-    pm = attn.per_max(key.max_len, key.chunks)
+    pm = attn.per_max(key.max_len, key.chunks, key.q_len)
     gemv_b = s * XROW * 2
     unit_b = (attn.GQA * L * attn.QROW + 2 * pm + 4) * 4 + WAVES * 64 * 18 * 4
     comb_b = (2 * WAVES + WAVES * 64) * 4
@@ -596,8 +588,7 @@ def lds_bytes(key: K1Build) -> int:
 
 
 assert (
-    lds_bytes(K1Build(tokens=8, q_len=8, window=0, rope=False, scale=1.0))
-    < LDS_BYTES
+    lds_bytes(K1Build(tokens=8, q_len=8, window=0, rope=False, scale=1.0)) < LDS_BYTES
 )
 
 
@@ -644,12 +635,12 @@ def _elf_resources(elf: bytes) -> dict:
 
     import msgpack
 
-    shoff, = struct.unpack_from("<Q", elf, 0x28)
+    (shoff,) = struct.unpack_from("<Q", elf, 0x28)
     shentsize, shnum = struct.unpack_from("<HH", elf, 0x3A)
     out = {}
     for i in range(shnum):
         sh = shoff + i * shentsize
-        sh_type, = struct.unpack_from("<I", elf, sh + 4)
+        (sh_type,) = struct.unpack_from("<I", elf, sh + 4)
         if sh_type != 7:  # SHT_NOTE
             continue
         off, size = struct.unpack_from("<QQ", elf, sh + 0x18)

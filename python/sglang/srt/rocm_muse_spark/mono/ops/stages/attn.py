@@ -12,8 +12,8 @@ head), numbered chunk-major (unit = ch * 2R + 2 j + g). The request's context
 keys are cut into 32-key tiles.  Single-row AITER attention starts at the first
 whole 16-key cache block in the sliding window and uses at least 256 keys per
 partition.  Multi-row Triton attention starts at the first whole 64-key tile
-selected by its query-aware window bound and uses at least 192 keys per
-segment.  Runs are derived on device from seq_lens (a short context fills only
+selected by its query-aware window bound and divides that range into
+whole 64-key segments (including short contexts).  Runs are derived on device from seq_lens (a short context fills only
 the first chunks); the step's L new keys [seq - L, seq) belong to their
 production partition. A unit:
 
@@ -100,8 +100,11 @@ def q_tiles(qlen: int) -> int:
 MIN_PER = 8  # tiles a unit takes at least (one a wave)
 
 
-def per_max(max_len: int, nch: int) -> int:
+def per_max(max_len: int, nch: int, q_len: int = 1) -> int:
     """The most tiles a unit can own at a context of ``max_len``."""
+    if q_len > 1:
+        blocks = (max_len + 63) // 64
+        return max(2 * ((blocks + nch - 1) // nch), MIN_PER)
     tiles = (max_len + TILE - 1) // TILE
     return max((tiles + nch - 1) // nch, MIN_PER)
 
@@ -211,9 +214,8 @@ def unit_insert(c, j, g, kvh, token_start=None, token_end=None, n_old=0):
         if const_expr(token_start is not None):
             owns = owns & (n_old + i >= token_start) & (n_old + i < token_end)
         if owns:
-            off = (
-                fx.Int64(slot // BLK) * fx.Int64(a["kv_sb"])
-                + fx.Int64((slot % BLK) * a["kv_st"] + kvs * HD + 8 * li)
+            off = fx.Int64(slot // BLK) * fx.Int64(a["kv_sb"]) + fx.Int64(
+                (slot % BLK) * a["kv_st"] + kvs * HD + 8 * li
             )
             gstore(kvh + off * 2, words)
     rocdl.s_waitcnt(vmcnt=0)
@@ -373,8 +375,10 @@ def tile_stats(c, st, kv, kb, khi, n_old):
     ms2, ls2 = [], []
     for n in range(nqt):
         sv, ok = _tile_scores(c, kv[:4], kb, khi, n_old, n)
-        tmax = fx.max(fx.max(fx.max(sv[0], sv[1]), fx.max(sv[2], sv[3])),
-                      fx.max(fx.max(sv[4], sv[5]), fx.max(sv[6], sv[7])))
+        tmax = fx.max(
+            fx.max(fx.max(sv[0], sv[1]), fx.max(sv[2], sv[3])),
+            fx.max(fx.max(sv[4], sv[5]), fx.max(sv[6], sv[7])),
+        )
         tmax = butterfly(tmax, (16, 32), fx.max)
         m_new = fx.max(ms[n], tmax)
         alpha = hw_exp(ms[n] - m_new)
@@ -397,10 +401,7 @@ def tile_output(c, out, kv, kb, khi, n_old):
         mm = fx.ptr_load(c["mb"] + qvec)
         ll = fx.ptr_load(c["lb"] + qvec)
         den = ll + fx.Float32(1.0e-6)
-        p = [
-            ok[e].select(hw_exp(sv[e] - mm) / den, fx.Float32(0.0))
-            for e in range(8)
-        ]
+        p = [ok[e].select(hw_exp(sv[e] - mm) / den, fx.Float32(0.0)) for e in range(8)]
         pb = fx.Vector.from_elements(p, fx.Float32).to(fx.BFloat16)
         for cc in range(4):
             out2.append(mfma_bf16(av[cc], pb, out[4 * n + cc]))
@@ -421,21 +422,42 @@ def tile_maxima(c, kv, kb, khi, n_old):
     return maxima
 
 
+def _natural_pv_order(c, values):
+    """Map [4g:4g+4,16+4g:20+4g] keys to native [8g:8g+8].
+
+    Both MFMA operands receive the identical permutation. This preserves
+    the mathematical dot while matching native's FP32 accumulation order.
+    """
+    words = values.bitcast(fx.Int32)
+    lane = c["lane"]
+    group = lane // 16
+    out = []
+    for e in range(4):
+        src = (2 * (group % 2) + e // 2) * 16 + lane % 16
+        lo = fx.Int32(rocdl.ds_bpermute(T.i32, src * 4, words[e % 2].ir_value()))
+        hi = fx.Int32(rocdl.ds_bpermute(T.i32, src * 4, words[2 + e % 2].ir_value()))
+        out.append((group < 2).select(lo, hi))
+    return fx.Vector.from_elements(out, fx.Int32).bitcast(fx.BFloat16)
+
+
 def tile_online_output(c, out, kv, kb, khi, n_old, maxima):
     """One 32-key half of Triton's BF16-P, fp32-accumulator PV update."""
-    av = _vt_operands(kv[4:])
+    av = [_natural_pv_order(c, v) for v in _vt_operands(kv[4:])]
     out2, sums = [], []
     for n in range(c["NQT"]):
         sv, ok = _tile_scores(c, kv[:4], kb, khi, n_old, n)
-        p = [
-            ok[e].select(hw_exp(sv[e] - maxima[n]), fx.Float32(0.0))
-            for e in range(8)
-        ]
+        p = [ok[e].select(hw_exp(sv[e] - maxima[n]), fx.Float32(0.0)) for e in range(8)]
+        # Original Triton MFMA-transposed reduction: register XOR2,1,
+        # lane XOR32,16 (keys8,4), then warp keys32,16.
         sums.append(
-            ((p[0] + p[1]) + (p[2] + p[3]))
-            + ((p[4] + p[5]) + (p[6] + p[7]))
+            [
+                butterfly((p[0] + p[2]) + (p[1] + p[3]), (32, 16)),
+                butterfly((p[4] + p[6]) + (p[5] + p[7]), (32, 16)),
+            ]
         )
-        pb = fx.Vector.from_elements(p, fx.Float32).to(fx.BFloat16)
+        pb = _natural_pv_order(
+            c, fx.Vector.from_elements(p, fx.Float32).to(fx.BFloat16)
+        )
         for cc in range(4):
             out2.append(mfma_bf16(av[cc], pb, out[4 * n + cc]))
     return out2, sums
@@ -466,9 +488,7 @@ def unit_stats(c, st):
         for w in range_constexpr(1, WAVES):
             mm = fx.max(mm, fx.ptr_load(mb + w * 64 + qvec))
         if g4 == 0:
-            fx.ptr_store(
-                ls[n] * hw_exp(ms[n] - mm), lb + wave * 64 + qvec
-            )
+            fx.ptr_store(ls[n] * hw_exp(ms[n] - mm), lb + wave * 64 + qvec)
     gpu.barrier()
     if (wave == 0) & (g4 == 0):
         for n in range_constexpr(nqt):
@@ -493,9 +513,7 @@ def unit_finish(c, out, u):
     dp = tid % 32
     for n in range_constexpr(nqt):
         for cc in range_constexpr(4):
-            fx.ptr_store(
-                out[4 * n + cc], ob + ((wave * 64 + lane) * 16 + 4 * cc)
-            )
+            fx.ptr_store(out[4 * n + cc], ob + ((wave * 64 + lane) * 16 + 4 * cc))
         gpu.barrier()
         qvec = 16 * n + qv
         vals = []
@@ -533,7 +551,7 @@ def context_tiles(c, j):
     Returns ``(seq, n_old, origin, t_hi, per, new_ch)``. Tile indices are
     relative to ``origin``. Single-row AITER decode uses a shifted 16-key
     cache-block origin and a 256-key minimum run. Multi-row Triton verify uses
-    a query-aware, 64-key-aligned origin and a 192-key minimum run. ``t_hi``
+    a query-aware origin and segments aligned to 64 keys. ``t_hi``
     includes the newly inserted rows so every online-softmax block sees the
     same key extent as the production attention kernel.
     """
@@ -547,7 +565,7 @@ def context_tiles(c, j):
         # 64-key BLOCK_N.  Our internal attention tile remains 32 keys.
         first_tile = fx.max(seq - L - window + 1, 0) // 64
         origin = first_tile * 64
-        min_per = 6
+        min_per = MIN_PER  # unused by the multi-query partition rule
     elif const_expr(window > 0):
         first_block = fx.max(seq - window, 0) // BLK
         origin = first_block * BLK
@@ -560,7 +578,13 @@ def context_tiles(c, j):
     t_hi = (old_extent + TILE - 1) // TILE
     all_tiles = (all_extent + TILE - 1) // TILE
     t_hi = all_tiles
-    per = fx.min(fx.max((all_tiles + nch - 1) // nch, min_per), c["per_max"])
+    if const_expr(L > 1):
+        # Original Triton partitions in whole 64-key blocks, including
+        # short contexts. Express that count in our 32-key tile units.
+        blocks = (all_extent + 63) // 64
+        per = 2 * ((blocks + nch - 1) // nch)
+    else:
+        per = fx.min(fx.max((all_tiles + nch - 1) // nch, min_per), c["per_max"])
     new_tile = fx.max(nonneg - origin, 0) // TILE
     new_ch = fx.min(new_tile // per, nch - 1)
     return seq, n_old, origin, t_hi, per, new_ch
@@ -579,11 +603,9 @@ def stage_unit(c, u):
     tb = fx.min(ta + per, t_hi)
     if tb > ta:
         if const_expr(c["L"] == 1):
-            unit_body(c, u, j, grp % NKV, ch, seq, n_old, origin, ta, tb,
-                      new_ch)
+            unit_body(c, u, j, grp % NKV, ch, seq, n_old, origin, ta, tb, new_ch)
         else:
-            unit_body_triton(c, u, j, grp % NKV, ch, seq, n_old, origin, ta,
-                             tb, new_ch)
+            unit_body_triton(c, u, j, grp % NKV, ch, seq, n_old, origin, ta, tb, new_ch)
 
 
 @traced
@@ -623,11 +645,17 @@ def unit_body_triton(c, u, j, g, ch, seq, n_old, origin, ta, tb, new_ch):
     tc = dict(c)
     tc["NQT"] = 1
     tc["qtile"] = wave
-    ms = [fx.Float32(NEG)] * nqt
+    ms = [fx.Float32(float("-inf"))] * nqt
     ls = [fx.Float32(1.0)] * nqt
     out = init_output(nqt)
+    # Each query wave covers two tokens, as native BLOCK_M=16/GQA=8.
+    # Native pruning can skip an entirely masked leading or trailing block.
     ti = ta
-    limit = (wave < tiles).select(tb, ta)
+    if const_expr(c["window"] > 0):
+        first = fx.max(n_old + 2 * wave - c["window"] + 1, 0) // 64
+        ti = fx.max(ta, 2 * first - origin // TILE)
+    last = (fx.min(seq, n_old + 2 * wave + 2) + 63) // 64
+    limit = (wave < tiles).select(fx.min(tb, 2 * last - origin // TILE), ta)
     while ti < limit:
         # Production Triton updates online-softmax state once per 64 keys.
         # First find the block maximum, then reload the two halves for the
@@ -641,6 +669,7 @@ def unit_body_triton(c, u, j, g, ch, seq, n_old, origin, ta, tb, new_ch):
         for n in range_constexpr(nqt):
             block_max = butterfly(fx.max(mx0[n], mx1[n]), (16, 32), fx.max)
             mn = fx.max(ms[n], block_max)
+            mn = (mn > fx.Float32(NEG)).select(mn, fx.Float32(0.0))
             an = hw_exp(ms[n] - mn)
             mnew.append(mn)
             alpha.append(an)
@@ -655,8 +684,8 @@ def unit_body_triton(c, u, j, g, ch, seq, n_old, origin, ta, tb, new_ch):
             tc, out, kv1, origin + (ti + 1) * TILE, seq, n_old, mnew
         )
         for n in range_constexpr(nqt):
-            block_sum = butterfly(sum0[n] + sum1[n], (16, 32))
-            ls[n] = ls[n] * alpha[n] + block_sum
+            block_sum = (sum0[n][0] + sum1[n][0]) + (sum0[n][1] + sum1[n][1])
+            ls[n] = _fma(ls[n], alpha[n], block_sum)
             ms[n] = mnew[n]
         ti = ti + 2
 
@@ -666,8 +695,9 @@ def unit_body_triton(c, u, j, g, ch, seq, n_old, origin, ta, tb, new_ch):
     # No cross-wave sum is needed: query tiles have disjoint outputs.
     if wave < tiles:
         qvec = 16 * wave + lane % 16
-        inv = fx.Float32(1.0) / ls[0]
-        normalized = [out[cc] * inv for cc in range_constexpr(4)]
+        # Native multi-query attention publishes unnormalized PV accumulators.
+        # Dividing here and multiplying by the sum in combine loses FP32 bits.
+        partial = out
         if qvec < GQA * c["L"]:
             base = (u * (GQA * c["L"]) + qvec) * PART
             for r in range_constexpr(4):
@@ -677,13 +707,14 @@ def unit_body_triton(c, u, j, g, ch, seq, n_old, origin, ta, tb, new_ch):
                         c["apart"],
                         base + 2 + d,
                         [
-                            normalized[2 * pair][r].bitcast(fx.Int32),
-                            normalized[2 * pair + 1][r].bitcast(fx.Int32),
+                            partial[2 * pair][r].bitcast(fx.Int32),
+                            partial[2 * pair + 1][r].bitcast(fx.Int32),
                         ],
                     )
             if lane // 16 == 0:
                 c["put_words"](
-                    c["apart"], base,
+                    c["apart"],
+                    base,
                     [ms[0].bitcast(fx.Int32), ls[0].bitcast(fx.Int32)],
                 )
     gpu.barrier()
@@ -763,7 +794,10 @@ def poll_live(c, specs, lives):
         for b, (_, i, n) in zip(bases, specs):
             w = fx.Vector(
                 bo.buffer_load(
-                    rsrc(b), fx.Int32(i) * 2, vec_width=2 * n, dtype=T.i32,
+                    rsrc(b),
+                    fx.Int32(i) * 2,
+                    vec_width=2 * n,
+                    dtype=T.i32,
                     cache_modifier=CM_DEV,
                 )
             )
@@ -837,41 +871,100 @@ def stage_combine(c, task):
         ll.append(live.select(_f32(got[1 + 2 * k][1]), fx.Float32(0.0)))
         oo.append(live.select(_f32(got[2 + 2 * k][0]), fx.Float32(0.0)))
         mw = fx.max(mw, mk)
-    lw = fx.Float32(0.0)
-    ow = fx.Float32(0.0)
-    for k in range_constexpr(kpw):
-        wk = hw_exp(mm[k] - mw)
-        lw = lw + ll[k] * wk
-        ow = ow + oo[k] * ll[k] * wk
+    if const_expr(L > 1 and nch == 16):
+        combine_triton16(c, mm, ll, oo, mw, t, h, og)
+    else:
+        lw = fx.Float32(0.0)
+        ow = fx.Float32(0.0)
+        for k in range_constexpr(kpw):
+            wk = hw_exp(mm[k] - mw)
+            lw = lw + ll[k] * wk
+            if const_expr(L > 1):
+                ow = ow + oo[k] * wk
+            else:
+                ow = ow + oo[k] * ll[k] * wk
+        if lane == 0:
+            fx.ptr_store(mw, cb + 2 * wave)
+            fx.ptr_store(lw, cb + (2 * wave + 1))
+        fx.ptr_store(ow, cbo + (wave * 64 + lane))
+        gpu.barrier()
+        if wave == 0:
+            mt = fx.ptr_load(cb + 0)
+            for w in range_constexpr(1, WAVES):
+                mt = fx.max(mt, fx.ptr_load(cb + 2 * w))
+            lt = fx.Float32(0.0)
+            ot = fx.Float32(0.0)
+            for w in range_constexpr(WAVES):
+                sc = hw_exp(fx.ptr_load(cb + 2 * w) - mt)
+                lt = lt + fx.ptr_load(cb + (2 * w + 1)) * sc
+                ot = ot + fx.ptr_load(cbo + (w * 64 + lane)) * sc
+            live = lt > fx.Float32(0.0)
+            if const_expr(L > 1):
+                den = live.select(lt, fx.Float32(1.0))
+            else:
+                den = live.select(lt + fx.Float32(1.0e-6), fx.Float32(1.0))
+            o = bf16_round(live.select(ot / den, fx.Float32(0.0)))
+            # Triton's D=64 gated-RMS kernel packs adjacent bf16 features into
+            # one lane, adds their squares first, then reduces the 32 pair sums
+            # with logical XOR offsets 16,8,4,2,1.  This wave holds one feature
+            # per lane, so the equivalent physical-lane tree is 1 first and then
+            # 32,16,8,4,2.  The older generic wave_sum paired i with i+32 first;
+            # it has the same real sum but can move a bf16 output by one ULP.
+            var = butterfly(o * o, (1, 32, 16, 8, 4, 2)) * fx.Float32(1.0 / HD)
+            rstd = fx.Float32(1.0) / fx.Float32(
+                fmath.sqrt(var + fx.Float32(c["qk_eps"]))
+            )
+            sig = fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(og * fx.Float32(-LOG2E)))
+            y = (o * rstd) * sig
+            bo.buffer_store(
+                y.to(fx.BFloat16), rsrc(a["core"]), t * CORE + h * HD + lane
+            )
+        gpu.barrier()
+
+
+def _segment_sum(values, strides):
+    # Native reduce_segments: scalar sums use XOR 8,4,2,1. The [16,64]
+    # output layout first reduces four segments per wave (2,1), then waves
+    # (8,4). Keep these distinct FP32 addition trees.
+    remaining = dict(enumerate(values))
+    for stride in strides:
+        remaining = {
+            i: remaining[i] + remaining[i + stride] for i in remaining if not i & stride
+        }
+    return remaining[0]
+
+
+@traced
+def combine_triton16(c, mm, ll, oo, mw, t, h, og):
+    """Native 16-segment reduction: one global maximum, raw PV, one divide."""
+    lane, wave = c["lane"], c["wave"]
+    red, cb = c["red"], c["cb"]
     if lane == 0:
-        fx.ptr_store(mw, cb + 2 * wave)
-        fx.ptr_store(lw, cb + (2 * wave + 1))
-    fx.ptr_store(ow, cbo + (wave * 64 + lane))
+        fx.ptr_store(mw, cb + wave)
+    gpu.barrier()
+    mt = fx.ptr_load(cb)
+    for w in range_constexpr(1, WAVES):
+        mt = fx.max(mt, fx.ptr_load(cb + w))
+    for k in range_constexpr(2):
+        ch = wave + WAVES * k
+        scale = hw_exp(mm[k] - mt)
+        fx.ptr_store(oo[k] * scale, red + ch * HD + lane)
+        if lane == 0:
+            fx.ptr_store(ll[k] * scale, red + 16 * HD + ch)
     gpu.barrier()
     if wave == 0:
-        mt = fx.ptr_load(cb + 0)
-        for w in range_constexpr(1, WAVES):
-            mt = fx.max(mt, fx.ptr_load(cb + 2 * w))
-        lt = fx.Float32(0.0)
-        ot = fx.Float32(0.0)
-        for w in range_constexpr(WAVES):
-            sc = hw_exp(fx.ptr_load(cb + 2 * w) - mt)
-            lt = lt + fx.ptr_load(cb + (2 * w + 1)) * sc
-            ot = ot + fx.ptr_load(cbo + (w * 64 + lane)) * sc
+        sums = [fx.ptr_load(red + 16 * HD + ch) for ch in range_constexpr(16)]
+        outputs = [fx.ptr_load(red + ch * HD + lane) for ch in range_constexpr(16)]
+        lt = _segment_sum(sums, (8, 4, 2, 1))
+        ot = _segment_sum(outputs, (2, 1, 8, 4))
         live = lt > fx.Float32(0.0)
-        den = live.select(lt + fx.Float32(1.0e-6), fx.Float32(1.0))
+        den = live.select(lt, fx.Float32(1.0))
         o = bf16_round(live.select(ot / den, fx.Float32(0.0)))
-        # Triton's D=64 gated-RMS kernel packs adjacent bf16 features into
-        # one lane, adds their squares first, then reduces the 32 pair sums
-        # with logical XOR offsets 16,8,4,2,1.  This wave holds one feature
-        # per lane, so the equivalent physical-lane tree is 1 first and then
-        # 32,16,8,4,2.  The older generic wave_sum paired i with i+32 first;
-        # it has the same real sum but can move a bf16 output by one ULP.
         var = butterfly(o * o, (1, 32, 16, 8, 4, 2)) * fx.Float32(1.0 / HD)
         rstd = fx.Float32(1.0) / fx.Float32(fmath.sqrt(var + fx.Float32(c["qk_eps"])))
         sig = fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(og * fx.Float32(-LOG2E)))
         y = (o * rstd) * sig
         bo.buffer_store(
-            y.to(fx.BFloat16), rsrc(a["core"]), t * CORE + h * HD + lane
+            y.to(fx.BFloat16), rsrc(c["args"]["core"]), t * CORE + h * HD + lane
         )
     gpu.barrier()

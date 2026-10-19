@@ -141,7 +141,7 @@ def validate_k1(key: k1.K1Build) -> dict[str, int]:
     # sliding build the 2K window is the actual maximum even at long positions.
     context = key.window or key.max_len
     tiles = (context + attn.TILE - 1) // attn.TILE
-    assert key.chunks * attn.per_max(key.max_len, key.chunks) >= tiles
+    assert key.chunks * attn.per_max(key.max_len, key.chunks, key.q_len) >= tiles
 
     nodes = (
         "seam_p1_put",

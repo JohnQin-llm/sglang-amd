@@ -82,7 +82,11 @@ def layer_keys(
 def compile_checked(key) -> list[str]:
     """Compiles one build without launching it, then the residency proof: the
     runtime's occupancy of its kernel must hold the whole grid (one CTA a CU,
-    all resident) with no spills. Returns the problems (empty: launchable)."""
+    all resident) with no private scratch. Returns problems (empty: launchable).
+
+    SGPR-to-VGPR spills can still occur and are reported separately in the
+    compiled kernel resources.
+    """
     from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
     from sglang.srt.rocm_muse_spark.mono.ops.common.plan import BLOCKS, THREADS
     from sglang.srt.rocm_muse_spark.mono.ops.common.residency import residency
