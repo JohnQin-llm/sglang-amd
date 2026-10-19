@@ -21,8 +21,9 @@ its eighth of each and the results are all-gathered over the peer buffer.
             silu(g) u; MXFP4 a 32-group -> INTER / ISC of each picking token
     down    (256 x 16 MH rows, one a CTA): every expert of U against its
             picks' INTER, one fp32 chain over the rank's K = 512 -> bf16 per
-            route (unweighted) -> every rank's YR (AR#3, push-all)
-    fin     (32 x 128 MH columns): YR summed over ranks in order -> bf16 y;
+            route (unweighted) -> column owner's YR at q8 (otherwise push-all)
+    fin     (32 x 128 MH columns, 4 owned slices per rank at q8):
+            YR summed over ranks in order -> bf16 y;
             x = y (w_post + 1); per-route sums of squares through FMSQ;
             fin = bf16(sum_k x_k rsqrt(mean(x_k^2) + eps) w_k) -> FIN rows
     unpool  (64 x 16 rows of this rank's 1024 branch columns): bf16 GEMV of
@@ -38,7 +39,6 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
-
 from sglang.srt.rocm_muse_spark.mono.ops.common.mx import (
     FP4,
     UNIT_SCALE,
@@ -85,6 +85,8 @@ REGIONS = (
     "pool",
     "yr",
     "br",
+    "owned_fmsq",
+    "owned_fin",
 )
 
 TP = 8
@@ -124,6 +126,7 @@ DOWN_TASKS = MH // ROWS  # 256
 DOWN_BATCH = 4  # maximum experts a wave keeps in flight together
 FIN_COLS = 128
 FIN_TASKS = MH // FIN_COLS  # 32
+OWNED_FIN_TASKS = FIN_TASKS // TP  # q8: four 128-column slices per rank
 UP_N = H // TP  # 1024 branch columns a rank
 UP_TASKS = UP_N // ROWS  # 64
 GATHER_COLS = 128
@@ -143,6 +146,8 @@ def peer_pairs(s):
         "pool": s * MH // 2,  # [t][4096] bf16 pairs
         "yr": TP * s * TOPK * MH // 2,  # [src][t][k][4096] bf16 pairs
         "br": s * H // 2,  # [t][8192] bf16 pairs
+        "owned_fmsq": FIN_TASKS * s * TOPK,  # [slice][t][k] fp32
+        "owned_fin": s * MH // 2,  # [t][4096] bf16 pairs; distinct from POOL
     }
 
 
@@ -283,10 +288,7 @@ def router_compute(c, i, q, ops):
             c["put"](c["rpart"], at, v)
         if q == 0:
             got = c["poll"](
-                [
-                    (c["rpart"], at + qq * s * WAVES, 1)
-                    for qq in range(1, R_PARTS)
-                ]
+                [(c["rpart"], at + qq * s * WAVES, 1) for qq in range(1, R_PARTS)]
             )
             for qq in range_constexpr(R_PARTS - 1):
                 v = v + f32_of(got[qq][0])
@@ -331,10 +333,7 @@ def pool_compute(c, i, q, ops):
             c["put"](c["ppart"], at, v)
         if q == 0:
             got = c["poll"](
-                [
-                    (c["ppart"], at + qq * s * ROWS, 1)
-                    for qq in range(1, P_PARTS)
-                ]
+                [(c["ppart"], at + qq * s * ROWS, 1) for qq in range(1, P_PARTS)]
             )
             for qq in range_constexpr(P_PARTS - 1):
                 v = v + f32_of(got[qq][0])
@@ -383,13 +382,11 @@ def stage_route(c, t):
         keys, sigs = [], []
         for i in range_constexpr(per):
             lg = f32_of(got[i][0])
-            sg = fx.Float32(1.0) / (
-                fx.Float32(1.0) + hw_exp2(lg * fx.Float32(-LOG2E))
-            )
+            sg = fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(lg * fx.Float32(-LOG2E)))
             sc = sg + bias[i]
             # a NaN logit (a warmup's garbage row) ranks last
-            keys.append(_okey((sc == sc).select(sc, fx.Float32(-3.0e38))))
-            sigs.append((sg == sg).select(sg, fx.Float32(0.0)))
+            keys.append(_okey((sc == sc).select(sc, fx.Float32(-3.0e38))))  # noqa: PLR0124
+            sigs.append((sg == sg).select(sg, fx.Float32(0.0)))  # noqa: PLR0124
 
         def count_ge(th):
             n = fx.Int32(0)
@@ -507,9 +504,7 @@ def stage_xq(c, t):
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
     c0 = tid * 8
-    wv = fx.Vector(
-        bo.buffer_load(rsrc(a["w_pre"]), c0 // 2, vec_width=4, dtype=T.i32)
-    )
+    wv = fx.Vector(bo.buffer_load(rsrc(a["w_pre"]), c0 // 2, vec_width=4, dtype=T.i32))
     base = (t * MH + c0) // 2
     got = c["poll"](
         [(c["peer"]["pool_own"], base, 2), (c["peer"]["pool_own"], base + 2, 2)]
@@ -584,7 +579,7 @@ def ug_loads(c, task, units=UG_UNITS):
     dwords (one a step pair)."""
     lane = c["lane"]
     a, rt = c["args"], c["rt"]
-    slot, g, rg = ug_tile(c, task, units)
+    slot, _g, rg = ug_tile(c, task, units)
     active = c["wave"] < 4 * units
     e = uniform(fx.ptr_load(rt["expert"] + slot))
     r_w = rsrc(a["w13"])
@@ -626,7 +621,7 @@ def stage_ug(c, task, ops, units=UG_UNITS):
     ISC of each picking token."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     rt = c["rt"]
-    slot, g, rg = ug_tile(c, task, units)
+    _slot, _g, rg = ug_tile(c, task, units)
     av = ops[:W13_STEPS]
     sw = ops[W13_STEPS:]
     t = fx.min(lane % 16, s - 1)
@@ -743,7 +738,8 @@ def down_loads(c, rgd, nu, b0, batch=DOWN_BATCH):
 def stage_down(c, rgd, nu, ops0, batch=DOWN_BATCH, prefetch_next=True):
     """MH rows 16 rgd ..: every slot's w2 against its picks (wave w the slots
     w, w + 8, ...; a batch of ``batch`` in flight, the next issued under this
-    one's MFMAs) -> bf16(acc) a (token, k) in LDS -> every rank's YR."""
+    one's MFMAs) -> bf16(acc) a (token, k) in LDS -> YR (only the column
+    owner at q8, every rank otherwise)."""
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     rt = c["rt"]
     t = fx.min(lane % 16, s - 1)
@@ -774,9 +770,7 @@ def stage_down(c, rgd, nu, ops0, batch=DOWN_BATCH, prefetch_next=True):
                         result_type=fx.Vector.make_type(4, fx.Int32),
                     )
                 )
-                scode = fx.ptr_load(
-                    c["intsc"] + (pick * UG_GROUPS + st * 4 + kb)
-                )
+                scode = fx.ptr_load(c["intsc"] + (pick * UG_GROUPS + st * 4 + kb))
                 bw = fx.Vector.from_elements(
                     [picked.select(bw[d], fx.Int32(0)) for d in range(4)],
                     fx.Int32,
@@ -802,12 +796,21 @@ def stage_down(c, rgd, nu, ops0, batch=DOWN_BATCH, prefetch_next=True):
         rq = tid % (ROWS // 4)
         route = tid // (ROWS // 4)  # t TOPK + k
         ys = [fx.ptr_load(c["contrib"] + (route * ROWS + 4 * rq + d)) for d in range(4)]
-        for p in range_constexpr(TP):
+        if const_expr(s == 8):
+            # This CTA's 16 columns belong to rank rgd // 32. The owner
+            # address is loaded before the expert work; no replicated sends.
             c["put_bf"](
-                c["peer"]["yr"][p],
+                c["yr_owner"],
                 (c["rank"] * s * TOPK + route) * MH + rgd * ROWS + 4 * rq,
                 ys,
             )
+        else:
+            for p in range_constexpr(TP):
+                c["put_bf"](
+                    c["peer"]["yr"][p],
+                    (c["rank"] * s * TOPK + route) * MH + rgd * ROWS + 4 * rq,
+                    ys,
+                )
     gpu.barrier()
 
 
@@ -817,9 +820,7 @@ def _stage_fin_wave(c, j, t, col, live):
     """Collect and finalize one token wave; the caller owns CTA publication."""
     s, lane = c["S"], c["lane"]
     a, rt = c["args"], c["rt"]
-    wp = fx.Int32(
-        bo.buffer_load(rsrc(a["w_post"]), col // 2, vec_width=1, dtype=T.i32)
-    )
+    wp = fx.Int32(bo.buffer_load(rsrc(a["w_post"]), col // 2, vec_width=1, dtype=T.i32))
     w0 = bf_lo(wp) + fx.Float32(1.0)
     w1 = bf_hi(wp) + fx.Float32(1.0)
     specs = [
@@ -840,37 +841,44 @@ def _stage_fin_wave(c, j, t, col, live):
         xs.append((x0, x1))
         sq = wave_sum(x0 * x0 + x1 * x1)
         if live & (lane == 0):
-            c["put"](c["fmsq"], (j * s + t) * TOPK + k, sq)
+            if const_expr(s == 8):
+                for p in range_constexpr(TP):
+                    c["put"](c["peer"]["owned_fmsq"][p], (j * s + t) * TOPK + k, sq)
+            else:
+                c["put"](c["fmsq"], (j * s + t) * TOPK + k, sq)
     q = lane % FIN_TASKS
-    got = c["poll"]([(c["fmsq"], (q * s + t) * TOPK + k, 1) for k in range(TOPK)])
+    means = c["peer"]["owned_fmsq_own"] if s == 8 else c["fmsq"]
+    got = c["poll"]([(means, (q * s + t) * TOPK + k, 1) for k in range(TOPK)])
     c["stamp"](15)
     f0 = fx.Float32(0.0)
     f1 = fx.Float32(0.0)
     for k in range_constexpr(TOPK):
         v = (lane < FIN_TASKS).select(f32_of(got[k][0]), fx.Float32(0.0))
         tot = wave_sum(v)
-        tw = fx.ptr_load(rt["route"] + (t * 2 * TOPK + TOPK + k)).bitcast(
-            fx.Float32
-        )
+        tw = fx.ptr_load(rt["route"] + (t * 2 * TOPK + TOPK + k)).bitcast(fx.Float32)
         sc = hw_rsq(tot * fx.Float32(1.0 / MH) + fx.Float32(c["eps_post"])) * tw
         f0 = f0 + xs[k][0] * sc
         f1 = f1 + xs[k][1] * sc
-    fw = (
-        fx.Vector.from_elements([f0, f1], fx.Float32)
-        .to(fx.BFloat16)
-        .bitcast(fx.Int32)
-    )
+    fw = fx.Vector.from_elements([f0, f1], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
     if live:
-        bo.buffer_store(
-            fw[0], rsrc(c["fin"]), (t * MH + col) // 2, cache_modifier=CM_DEV
-        )
+        if const_expr(s == 8):
+            for p in range_constexpr(TP):
+                c["put_words"](c["peer"]["owned_fin"][p], (t * MH + col) // 2, [fw[0]])
+        else:
+            bo.buffer_store(
+                fw[0], rsrc(c["fin"]), (t * MH + col) // 2, cache_modifier=CM_DEV
+            )
 
 
 @traced
 def stage_fin(c, j):
     """MH columns 128 j ..: each route's 8 ranks' YR in rank order (fp32 ->
     bf16 y), x = y (w_post + 1), its sum of squares -> FMSQ; every task's ->
-    rstd; fin = bf16(sum_k x_k rstd_k w_k) -> FIN rows, FRDY.
+    rstd; fin = bf16(sum_k x_k rstd_k w_k).
+
+    At eight token rows (independent of query length), only the column owner
+    runs this stage. FMSQ and FIN go to distinct tagged peer regions; the local
+    receive stage publishes FRDY. Other widths use local FMSQ and FIN/FRDY.
 
     Rows=2 has only two live token waves. Keep its other six waves out of the
     tagged YR/FMSQ polls: clamping them to token 1 issued four copies of every
@@ -885,6 +893,23 @@ def stage_fin(c, j):
             _stage_fin_wave(c, j, t, col, live)
     else:
         _stage_fin_wave(c, j, t, col, live)
+    if const_expr(s != 8):
+        publish(c["put"], c["frdy"], j, fx.Int32(1), c["tid"] == 0)
+    gpu.barrier()
+
+
+@traced
+def stage_fin_gather(c, j):
+    """Materialize one tagged all-gather slice into local FIN, then FRDY.
+
+    Only 32 CTAs poll the peer payload, rather than every unpool CTA loading
+    every tagged word. Device-scope publication retains the original unpool
+    loads and MFMA arithmetic. No plain remote store/flag hand-off is used.
+    """
+    t, col = c["wave"], j * FIN_COLS + 2 * c["lane"]
+    at = (t * MH + col) // 2
+    word = c["poll"]([(c["peer"]["owned_fin_own"], at, 1)])[0][0]
+    bo.buffer_store(word, rsrc(c["fin"]), at, cache_modifier=CM_DEV)
     publish(c["put"], c["frdy"], j, fx.Int32(1), c["tid"] == 0)
     gpu.barrier()
 

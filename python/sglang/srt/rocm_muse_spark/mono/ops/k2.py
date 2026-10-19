@@ -15,7 +15,9 @@ TP rank, every TP collective inside the kernel. Adapted from Kimi-K3's K2
     CTAs 80 .. 207    pooler (128 tasks, likewise)
     every CTA         xe quant, the route table, ug, down (one 16-row task each)
     CTAs 0 .. 31      finalize (AR#3's rank-ordered sum, post_expert_norm,
-                      the weighted top-k sum) -> FIN rows + FRDY
+                      the weighted top-k sum) -> FIN rows + FRDY; at q8 only
+                      CTAs 0 .. 3 finalize owned columns, then CTAs 0 .. 31
+                      receive the tagged FIN all-gather and publish FRDY
     CTAs 192 .. 255   unpooler (64 x 16 of this rank's 1024 columns) -> AG#4
     CTAs 128 .. 191   gather: AG#4 -> ``branch_out``
 
@@ -35,8 +37,6 @@ import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, rocdl
 from flydsl.expr.typing import Int32, Int64
-
-from sglang.srt.rocm_muse_spark.mono.runtime.abi import K2_DONE_BYTES, K2_DONE_OFFSET
 from sglang.srt.rocm_muse_spark.mono.ops.common.debug import (
     region_ids,
     stamp,
@@ -76,6 +76,7 @@ from sglang.srt.rocm_muse_spark.mono.ops.common.sync import (
 )
 from sglang.srt.rocm_muse_spark.mono.ops.stages import gemv, moe, oproj
 from sglang.srt.rocm_muse_spark.mono.ops.stages import seam_b as seam
+from sglang.srt.rocm_muse_spark.mono.runtime.abi import K2_DONE_BYTES, K2_DONE_OFFSET
 
 TP = 8
 MAX_TOKENS = 8
@@ -100,10 +101,8 @@ REGIONS = ("ar", "msq1", "msq2", "xrdy", "finish", "done") + moe.REGIONS
 FINISH_FANIN = 8
 FINISH_GROUPS = (BLOCKS + FINISH_FANIN - 1) // FINISH_FANIN
 FINISH_ROOTS = (FINISH_GROUPS + FINISH_FANIN - 1) // FINISH_FANIN
-_PEER_REGIONS = ("ar", "rlog", "pool", "yr", "br")
-_SCRATCH_REGIONS = ("msq1", "msq2", "xrdy", "finish") + tuple(
-    moe.scratch_pairs(1)
-)
+_PEER_REGIONS = ("ar", "rlog", "pool", "yr", "br", "owned_fmsq", "owned_fin")
+_SCRATCH_REGIONS = ("msq1", "msq2", "xrdy", "finish") + tuple(moe.scratch_pairs(1))
 _SCRATCH_PLAIN = tuple(moe.scratch_plain(1))
 
 # the K2 sources (and the shared helpers): in every build's JIT cache key
@@ -216,22 +215,15 @@ def finish_consensus(c, done, health, alarm):
     publish(c["put"], c["finish"], bid, 1, tid == 0)
     if (bid < FINISH_GROUPS) & (tid == 0):
         lo = bid * FINISH_FANIN
-        c["poll_terminal"](
-            [(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)]
-        )
+        c["poll_terminal"]([(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)])
         c["put"](c["finish"], BLOCKS + bid, 1)
     if (bid < FINISH_ROOTS) & (tid == 0):
         lo = BLOCKS + bid * FINISH_FANIN
-        c["poll_terminal"](
-            [(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)]
-        )
+        c["poll_terminal"]([(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)])
         c["put"](c["finish"], BLOCKS + FINISH_GROUPS + bid, 1)
     if (bid == 0) & (tid == 0):
         c["poll_terminal"](
-            [
-                (c["finish"], BLOCKS + FINISH_GROUPS + i, 1)
-                for i in range(FINISH_ROOTS)
-            ]
+            [(c["finish"], BLOCKS + FINISH_GROUPS + i, 1) for i in range(FINISH_ROOTS)]
         )
         c["put"](done, c["rank"], 1)
         rocdl.s_waitcnt(vmcnt=0)
@@ -303,6 +295,7 @@ def _make(key: K2Build):
     # task exposes 256 independent tasks while preserving the exact bytes and
     # arithmetic of each expert group.  Wider builds retain two groups/CTA.
     ug_units = 1 if s == 2 else moe.UG_UNITS
+    fin_tasks = moe.OWNED_FIN_TASKS if s == 8 else moe.FIN_TASKS
     lay = scratch_layout(s)
     play = peer_layout()
     half = _half()
@@ -412,8 +405,7 @@ def _make(key: K2Build):
         for region in _PEER_REGIONS:
             off, extent = play[region]
             peer[region] = [
-                shift(preg(b, off, region, extent), fx.Int64(par) * half)
-                for b in bases
+                shift(preg(b, off, region, extent), fx.Int64(par) * half) for b in bases
             ]
             peer[region + "_own"] = shift(
                 preg(own, off, region, extent), fx.Int64(par) * half
@@ -475,10 +467,15 @@ def _make(key: K2Build):
                 "branch_out": branch_out,
             },
         }
-        for region in _SCRATCH_REGIONS:
-            c[region] = sreg(
-                scratch, lay[region][0], region, lay[region][1]
+        if const_expr(s == 8):
+            # Each down CTA owns 16 contiguous columns, 32 CTAs per owner.
+            owner_base = load_ptr64(peers, bid // (moe.DOWN_TASKS // TP))
+            off, extent = play["yr"]
+            c["yr_owner"] = shift(
+                preg(owner_base, off, "yr", extent), fx.Int64(par) * half
             )
+        for region in _SCRATCH_REGIONS:
+            c[region] = sreg(scratch, lay[region][0], region, lay[region][1])
         for name in _SCRATCH_PLAIN:
             c[name] = scratch + fx.Int64(lay[name][0])
         on, tls = key.timeline, lds.tls.ptr
@@ -532,9 +529,15 @@ def _make(key: K2Build):
         enter_stage("down")
         moe.stage_down(c, bid, nu, dops, down_batch, prefetch_next=s != 2)
         stamp(on, tls, tid, 8)
-        if bid < FIN0 + moe.FIN_TASKS:
+        if bid < FIN0 + fin_tasks:
             enter_stage("finalize")
-            moe.stage_fin(c, bid - FIN0)
+            j = rank * fin_tasks + bid - FIN0 if s == 8 else bid - FIN0
+            moe.stage_fin(c, j)
+        # Keep the compile-time gate outside the traced device branch.
+        if const_expr(s == 8):  # noqa: SIM102
+            if bid < FIN0 + moe.FIN_TASKS:
+                enter_stage("fin_gather")
+                moe.stage_fin_gather(c, bid - FIN0)
         stamp(on, tls, tid, 9)
         if bid >= U0:
             enter_stage("up")
