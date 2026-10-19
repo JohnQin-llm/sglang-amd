@@ -73,9 +73,9 @@ def config_disable_reasons(cfg: Any, config: Any) -> list[str]:
             "SGLANG_MUSE_ORIGINAL_NATIVE_ONLY=1 selects the baseline; unset it "
             "to launch K1/K2"
         )
-    # The frozen source fails the rows=8 qualification gate. Generic enablement
-    # therefore remains decode-only; the explicit validation driver can still
-    # build and compare its unmodified q8 source.
+    # Kernel-level rows=8 numerical checks pass, but full-model quality
+    # qualification is still pending. Generic enablement remains decode-only;
+    # explicit validation drivers can continue to exercise target verification.
     algorithm = getattr(cfg, "speculative_algorithm", None)
     if algorithm is not None:
         if algorithm != "DFLASH" or cfg.speculative_num_draft_tokens != 8:
