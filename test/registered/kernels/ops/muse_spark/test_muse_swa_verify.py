@@ -1,7 +1,6 @@
 import unittest
 
 import torch
-
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -9,9 +8,8 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
-def _check_window(length_list, heads):
+def _check_window(length_list, heads, softmax_scale=64**-0.5):
     from aiter.ops.triton.attention.unified_attention import unified_attention
-
     from sglang.kernels.ops.muse_spark.swa_verify import (
         muse_swa_verify_attention,
         prepare_muse_swa_verify,
@@ -43,7 +41,7 @@ def _check_window(length_list, heads):
         "seqused_k": lengths,
         "max_seqlen_q": m,
         "max_seqlen_k": max(length_list),
-        "softmax_scale": dim**-0.5,
+        "softmax_scale": softmax_scale,
         "causal": True,
         "window_size": (2046, 0),
         "block_table": table,
@@ -57,7 +55,17 @@ def _check_window(length_list, heads):
         prepared = prepare_muse_swa_verify(lengths, table)
         for _ in range(2):
             muse_swa_verify_attention(
-                q, k, v, out, cu, lengths, table, dim**-0.5, ks, vs, prepared=prepared
+                q,
+                k,
+                v,
+                out,
+                cu,
+                lengths,
+                table,
+                softmax_scale,
+                ks,
+                vs,
+                prepared=prepared,
             )
 
     def baseline():
@@ -74,7 +82,7 @@ def _check_window(length_list, heads):
                 kk = k[pages, pos % 16].float().repeat_interleave(8, 1) * ks
                 vv = v[pages, pos % 16].float().repeat_interleave(8, 1) * vs
                 scores = (
-                    torch.einsum("hd,lhd->hl", q[b * m + i].float(), kk) * dim**-0.5
+                    torch.einsum("hd,lhd->hl", q[b * m + i].float(), kk) * softmax_scale
                 )
                 answers.append(torch.einsum("hl,lhd->hd", scores.softmax(-1), vv))
         return torch.stack(answers)
@@ -102,6 +110,12 @@ def _check_window(length_list, heads):
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "Requires MI355X")
 class TestMuseSWAVerify(CustomTestCase):
+    @torch.no_grad()
+    def test_original_tp_score_scale(self):
+        # Original TP moves the model's query multiplier after the QK product.
+        torch.manual_seed(123)
+        _check_window([1024, 3008], 16, softmax_scale=64**-0.5 * 5.4730064863875)
+
     @torch.no_grad()
     def test_backend_dispatch_boundaries(self):
         from types import SimpleNamespace
@@ -145,7 +159,7 @@ class TestMuseSWAVerify(CustomTestCase):
                     16, 2, 64, device="cuda", dtype=backend.kv_cache_dtype
                 )
                 backend.token_to_kv_pool = SimpleNamespace(
-                    get_kv_buffer=lambda _: (cache, cache)
+                    get_kv_buffer=lambda _, cache=cache: (cache, cache)
                 )
                 backend.forward_metadata = SimpleNamespace(
                     max_q_len=8,

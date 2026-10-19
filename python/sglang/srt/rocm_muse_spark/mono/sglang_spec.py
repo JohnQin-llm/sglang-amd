@@ -38,12 +38,26 @@ from sglang.srt.rocm_muse_spark.mono.spec import (
     TP,
     WINDOW,
     kernel_layers,
+    native_attention_enabled,
+    native_attention_layers,
 )
 from sglang.srt.runtime_context import get_parallel, get_spec
 
 
 def _text_config(config):
     return getattr(config, "text_config", config)
+
+
+def _layer_selection(config) -> tuple[list[int], set[int]]:
+    native = (
+        set(native_attention_layers(config))
+        if os.getenv("SGLANG_MUSE_ORIGINAL_FULL_K2", "0") == "1"
+        else set()
+    )
+    selected = sorted(set(kernel_layers(config)) | native)
+    if native_attention_enabled():
+        native = set(selected)
+    return selected, native
 
 
 def config_disable_reasons(cfg: Any, config: Any) -> list[str]:
@@ -66,17 +80,31 @@ def config_disable_reasons(cfg: Any, config: Any) -> list[str]:
             reasons.append(f"config.{name} {got!r} is not {want!r}")
     if getattr(cfg, "page_size", None) != KV_BLOCK:
         reasons.append(f"page_size must be {KV_BLOCK}")
-    if getattr(cfg, "kv_cache_dtype", None) not in ("bf16", "bfloat16", "auto"):
-        reasons.append("KV cache must be BF16")
+    kv_dtype = getattr(cfg, "kv_cache_dtype", None)
+    if kv_dtype not in ("bf16", "bfloat16", "auto") and not (
+        native_attention_enabled() and kv_dtype == "fp8_e4m3"
+    ):
+        reasons.append("K1 requires BF16 KV; FP8 E4M3 requires native attention")
     if os.getenv("SGLANG_MUSE_ORIGINAL_NATIVE_ONLY", "0") == "1":
         reasons.append(
             "SGLANG_MUSE_ORIGINAL_NATIVE_ONLY=1 selects the baseline; unset it "
             "to launch K1/K2"
         )
-    # The frozen source fails the rows=8 qualification gate. Generic enablement
-    # therefore remains decode-only; the explicit validation driver can still
-    # build and compare its unmodified q8 source.
+    # Kernel-level rows=8 numerical checks pass, but full-model quality
+    # qualification is still pending. Target verification requires an explicit
+    # experimental flag until that qualification is complete.
     algorithm = getattr(cfg, "speculative_algorithm", None)
+    native_probe = any(
+        os.getenv(name, "0") == "1"
+        for name in (
+            "SGLANG_MUSE_ORIGINAL_FULL_K2",
+            "SGLANG_MUSE_ORIGINAL_NATIVE_ATTENTION",
+        )
+    )
+    if native_probe and (
+        algorithm != "DFLASH" or cfg.speculative_num_draft_tokens != 8
+    ):
+        reasons.append("native-attention K2 is an explicit DFlash block8 timing probe")
     if algorithm is not None:
         if algorithm != "DFLASH" or cfg.speculative_num_draft_tokens != 8:
             reasons.append("the timing probe supports only DFlash block8")
@@ -93,7 +121,7 @@ def model_disable_reasons(model, config, copies: dict) -> list[str]:
     if not getattr(model, "mxfp4_checkpoint", False):
         reasons.append("experts are not Quark MXFP4 W4A4")
     decoder = model.model.language_model
-    selected = kernel_layers(config)
+    selected, _ = _layer_selection(config)
     if not selected:
         reasons.append("no eligible sparse sliding layers")
     for i in selected:
@@ -238,7 +266,7 @@ class BuiltMuseOriginal:
 
 def build(model, config, context: BuildContext) -> BuiltMuseOriginal:
     decoder = model.model.language_model
-    indices = kernel_layers(config)
+    indices, native_layers = _layer_selection(config)
     spec_config = get_spec()
     q_len = (
         1
@@ -255,9 +283,10 @@ def build(model, config, context: BuildContext) -> BuiltMuseOriginal:
     for i in indices:
         previous_eps = decoder.layers[i - 1].post_ffn_norm.variance_epsilon
         for width in context.widths:
-            for key in layer_keys(
-                decoder.layers[i], width, q_len, post_eps=previous_eps
-            ):
+            keys = layer_keys(decoder.layers[i], width, q_len, post_eps=previous_eps)
+            if i in native_layers:
+                keys = keys[1:]
+            for key in keys:
                 if key in built_keys:
                     continue
                 built_keys.add(key)
@@ -281,7 +310,9 @@ def build(model, config, context: BuildContext) -> BuiltMuseOriginal:
         )
         runner.layer_names[i] = f"model.layers.{i}"
         for width in context.widths:
-            kernels[i, width] = MuseLayerKernel(decoder.layers[i], runner, width)
+            kernels[i, width] = MuseLayerKernel(
+                decoder.layers[i], runner, width, native_attention=i in native_layers
+            )
     built = BuiltMuseOriginal(model, runner, kernels)
     # Keep an explicit owner for deterministic, idempotent server teardown.
     model._muse_original_monokernels = built
@@ -299,7 +330,7 @@ MONO_SPEC = MonoSpec(
         attention_backends=frozenset({"aiter"}),
         server_args={
             "page_size": frozenset({KV_BLOCK}),
-            "kv_cache_dtype": frozenset({"auto", "bf16", "bfloat16"}),
+            "kv_cache_dtype": frozenset({"auto", "bf16", "bfloat16", "fp8_e4m3"}),
         },
     ),
     numerics=Numerics(

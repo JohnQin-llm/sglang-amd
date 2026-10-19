@@ -9,6 +9,7 @@ or specialization must update and re-prove both sides before it can launch.
 """
 
 from collections.abc import Iterable
+from itertools import pairwise
 
 from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
 from sglang.srt.rocm_muse_spark.mono.ops.common.plan import (
@@ -27,13 +28,11 @@ def _assert_layout(layout: dict[str, tuple[int, int]], total: int) -> None:
         assert offset + size <= total, (name, offset, size, total)
         spans.append((offset, offset + size, name))
     spans.sort()
-    for (_, end, left), (start, _, right) in zip(spans, spans[1:]):
+    for (_, end, left), (start, _, right) in pairwise(spans):
         assert end <= start, (left, right, end, start)
 
 
-def _assert_pairs(
-    layout: dict[str, tuple[int, int]], expected: dict[str, int]
-) -> None:
+def _assert_pairs(layout: dict[str, tuple[int, int]], expected: dict[str, int]) -> None:
     for name, pairs in expected.items():
         assert layout[name][1] == pairs * PAIR_BYTES, (
             name,
@@ -142,7 +141,7 @@ def validate_k1(key: k1.K1Build) -> dict[str, int]:
     # sliding build the 2K window is the actual maximum even at long positions.
     context = key.window or key.max_len
     tiles = (context + attn.TILE - 1) // attn.TILE
-    assert key.chunks * attn.per_max(key.max_len, key.chunks) >= tiles
+    assert key.chunks * attn.per_max(key.max_len, key.chunks, key.q_len) >= tiles
 
     nodes = (
         "seam_p1_put",
@@ -224,9 +223,47 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
     _assert_owned(k2.NSL)
     _assert_owned(s)
     _assert_owned(s, moe.XQ0)
-    _assert_owned(moe.UG_TASKS_MAX, reverse=True)
+    max_unique = min(moe.MAX_U, s * moe.TOPK)
+    ug_cases = (
+        (
+            (1, min(max_unique, moe.UG_Q8_ONE_GROUP_MAX_U)),
+            (moe.UG_UNITS, max_unique),
+        )
+        if s == 8
+        else ((moe.ug_units(s), max_unique),)
+    )
+    for units, route_bound in ug_cases:
+        ug_tasks = route_bound * moe.UG_GROUPS // units
+        _assert_owned(ug_tasks, reverse=True)
+        assert ug_tasks <= moe.ug_task_capacity(s) <= moe.UG_TASKS_MAX
     _assert_owned(moe.DOWN_TASKS)
-    _assert_owned(moe.FIN_TASKS, k2.FIN0)
+    if s == 8:
+        # Every global slice has exactly one owner rank; every down tile targets
+        # the same rank as the finalizer of its containing 128-column slice.
+        slices = [
+            rank * moe.OWNED_FIN_TASKS + local
+            for rank in range(k2.TP)
+            for local in range(moe.OWNED_FIN_TASKS)
+        ]
+        assert sorted(slices) == list(range(moe.FIN_TASKS))
+        assert len(set(slices)) == moe.FIN_TASKS
+        owner_work = [
+            (rank * moe.OWNED_FIN_TASKS + local // s, local % s)
+            for rank in range(k2.TP)
+            for local in range(moe.OWNER_FIN_CTAS)
+        ]
+        expected_work = [
+            (j, t) for j in range(moe.FIN_TASKS) for t in range(s)
+        ]
+        assert sorted(owner_work) == expected_work
+        assert len(set(owner_work)) == moe.FIN_TASKS * s
+        for tile in range(moe.DOWN_TASKS):
+            assert (
+                tile // (moe.DOWN_TASKS // k2.TP)
+                == (tile * moe.ROWS // moe.FIN_COLS) // moe.OWNED_FIN_TASKS
+            )
+        _assert_owned(moe.OWNER_FIN_CTAS, k2.FIN0)
+    _assert_owned(moe.FIN_TASKS, k2.FIN0)  # local FIN gather/materialization
     _assert_owned(moe.UP_TASKS, k2.U0)
     _assert_owned(moe.GATHER_TASKS, k2.G0)
     assert moe.MAX_U * moe.UG_GROUPS // moe.UG_UNITS == moe.UG_TASKS_MAX
@@ -247,6 +284,7 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
         "down_publish",
         "fin_msq_put",
         "fin_publish",
+        *(("fin_receive",) if s == 8 else ()),
         "branch_publish",
         "gather",
     )
@@ -268,7 +306,14 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
             ("ug_publish", "down_publish"),
             ("down_publish", "fin_msq_put"),
             ("fin_msq_put", "fin_publish"),
-            ("fin_publish", "branch_publish"),
+            *(
+                (
+                    ("fin_publish", "fin_receive"),
+                    ("fin_receive", "branch_publish"),
+                )
+                if s == 8
+                else (("fin_publish", "branch_publish"),)
+            ),
             ("branch_publish", "gather"),
         ),
     )
@@ -321,6 +366,7 @@ def validate_k2_trace(key: k2.K2Build, trace: Record) -> bool:
             "inter_wait",
             "down",
             "finalize",
+            *(("fin_gather",) if key.tokens == 8 else ()),
             "up",
             "gather",
             "finish",
@@ -356,9 +402,21 @@ def validate_k2_trace(key: k2.K2Build, trace: Record) -> bool:
             ("inter_wait", "ugrdy", Space.SCRATCH, "poll"),
             ("down", "yr", Space.PEER, "put"),
             ("finalize", "yr", Space.PEER, "poll"),
-            ("finalize", "fmsq", Space.SCRATCH, "put"),
-            ("finalize", "fmsq", Space.SCRATCH, "poll"),
-            ("finalize", "frdy", Space.SCRATCH, "put"),
+            *(
+                {
+                    ("finalize", "owned_fmsq", Space.PEER, "put"),
+                    ("finalize", "owned_fmsq", Space.PEER, "poll"),
+                    ("finalize", "owned_fin", Space.PEER, "put"),
+                    ("fin_gather", "owned_fin", Space.PEER, "poll"),
+                    ("fin_gather", "frdy", Space.SCRATCH, "put"),
+                }
+                if key.tokens == 8
+                else {
+                    ("finalize", "fmsq", Space.SCRATCH, "put"),
+                    ("finalize", "fmsq", Space.SCRATCH, "poll"),
+                    ("finalize", "frdy", Space.SCRATCH, "put"),
+                }
+            ),
             ("up", "frdy", Space.SCRATCH, "poll"),
             ("up", "br", Space.PEER, "put"),
             ("gather", "br", Space.PEER, "poll"),
@@ -394,7 +452,6 @@ def validate_all() -> dict[str, int]:
                 builds += 1
     assert max_scratch <= k1.max_scratch_bytes(k1.MAX_TOKENS)
     assert k2.max_scratch_bytes() >= max(
-        k2.scratch_bytes(k2.K2Build(tokens=s))
-        for s in range(1, k2.MAX_TOKENS + 1)
+        k2.scratch_bytes(k2.K2Build(tokens=s)) for s in range(1, k2.MAX_TOKENS + 1)
     )
     return {"builds": builds, "max_k1_scratch_bytes": max_scratch}

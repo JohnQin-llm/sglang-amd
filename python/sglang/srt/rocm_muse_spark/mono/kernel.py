@@ -29,7 +29,6 @@ from typing import Any
 import torch
 from sglang.srt.monokernels.spec import Plan
 from sglang.srt.rocm_muse_spark.mono.runner import MonoRunner
-from sglang.srt.rocm_muse_spark.mono.spec import WINDOW
 
 
 def _ptr_checked(t: torch.Tensor, name: str) -> torch.Tensor:
@@ -55,7 +54,7 @@ def layer_keys(
     k1_key = k1.make_key(
         tokens=width,
         q_len=q_len,
-        window=WINDOW if a.attn.sliding_window_size > 0 else 0,
+        window=max(0, int(a.attn.sliding_window_size)),
         rope=bool(a.use_rope),
         scale=float(a.scaling),
         eps=a.pre_qkv_proj_norm.variance_epsilon,
@@ -74,6 +73,13 @@ def layer_keys(
         eps_ffn=layer.pre_ffn_norm.variance_epsilon,
         eps_pre_expert=m.pre_expert_norm.variance_epsilon,
         eps_post_expert=m.post_expert_norm.variance_epsilon,
+        # The original adapter folds this scale into its router weights;
+        # SGLang keeps it as a separate operation before sigmoid.
+        router_output_multiplier=(
+            1.0
+            if getattr(m, "router_multiplier", None) is None
+            else float(m.router_multiplier)
+        ),
         **fault,
     )
     return k1_key, k2_key
@@ -82,7 +88,11 @@ def layer_keys(
 def compile_checked(key) -> list[str]:
     """Compiles one build without launching it, then the residency proof: the
     runtime's occupancy of its kernel must hold the whole grid (one CTA a CU,
-    all resident) with no spills. Returns the problems (empty: launchable)."""
+    all resident) with no private scratch. Returns problems (empty: launchable).
+
+    SGPR-to-VGPR spills can still occur and are reported separately in the
+    compiled kernel resources.
+    """
     from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
     from sglang.srt.rocm_muse_spark.mono.ops.common.plan import BLOCKS, THREADS
     from sglang.srt.rocm_muse_spark.mono.ops.common.residency import residency
@@ -99,12 +109,17 @@ def compile_checked(key) -> list[str]:
 class MuseLayerKernel:
     """One sparse layer at one width (rows a launch)."""
 
-    def __init__(self, layer, runner: MonoRunner, width: int):
+    def __init__(
+        self, layer, runner: MonoRunner, width: int, *, native_attention: bool = False
+    ):
         self.layer = layer
         self.runner = runner
         self.width = width
+        # Full attention keeps its native cache and attention implementation.
+        # Only its output projection and MoE use the fused K2 kernel.
+        self.native_attention = native_attention
         self.name = f"layer.{layer.layer_idx}.attn"
-        self.cache_layers = (self.name,)
+        self.cache_layers = () if native_attention else (self.name,)
         # the step's first launch bumps the epoch (a graph captures it)
         self.first = layer.layer_idx == runner.first_layer
         self.k1_key, self.k2_key = layer_keys(
@@ -122,7 +137,7 @@ class MuseLayerKernel:
         return self.runner.flags
 
     def warmup_keys(self) -> list:
-        return [self.k1_key, self.k2_key]
+        return [self.k2_key] if self.native_attention else [self.k1_key, self.k2_key]
 
     def compile(self, key) -> None:
         from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
@@ -152,7 +167,6 @@ class MuseLayerKernel:
         seq_lens = runner.seq_lens[: lengths.numel()]
         if new_step:
             seq_lens = prepare_seq_lens(forward_batch, runner.seq_lens, runner.q_len)
-        cache = attention_inputs(layer, forward_batch, seq_lens=seq_lens)
         stream, branch = x.stream, x.branch
         if stream.shape[0] != t or branch.shape[0] != t:
             raise ValueError(f"MonoKernel width {t}: got {stream.shape[0]} rows")
@@ -165,27 +179,34 @@ class MuseLayerKernel:
             runner.step_begin()
         stream_a = runner.stream_a[:t]
         core = runner.core[:t]
-        k1.k1_launch(
-            self.k1_key,
-            stream_in=_ptr_checked(stream, "stream"),
-            branch_in=_ptr_checked(branch, "branch"),
-            w_pf=x.post_norm.weight,
-            alpha_f=x.connection.alpha,
-            beta_f=x.connection.beta,
-            w_qn=a.pre_qkv_proj_norm.weight,
-            w_qkv=a.qkv_proj.weight,
-            positions=positions,
-            cos_sin=a.rotary_emb.cos_sin_cache if a.use_rope else None,
-            slot_mapping=cache.slot_mapping,
-            kv_cache=cache.kv_cache,
-            block_table=cache.block_table,
-            seq_lens=cache.seq_lens,
-            stream_a=stream_a,
-            core=core,
-            layer=layer.layer_idx,
-            rank=runner.rank,
-            **runner.launch_args(),
-        )
+        if self.native_attention:
+            from sglang.srt.rocm_muse_spark.model import _original_boundary
+
+            attn_input, stream_a = _original_boundary(x, a.pre_qkv_proj_norm)
+            core = a.forward_attention_core(positions, attn_input, forward_batch)
+        else:
+            cache = attention_inputs(layer, forward_batch, seq_lens=seq_lens)
+            k1.k1_launch(
+                self.k1_key,
+                stream_in=_ptr_checked(stream, "stream"),
+                branch_in=_ptr_checked(branch, "branch"),
+                w_pf=x.post_norm.weight,
+                alpha_f=x.connection.alpha,
+                beta_f=x.connection.beta,
+                w_qn=a.pre_qkv_proj_norm.weight,
+                w_qkv=a.qkv_proj.weight,
+                positions=positions,
+                cos_sin=a.rotary_emb.cos_sin_cache if a.use_rope else None,
+                slot_mapping=cache.slot_mapping,
+                kv_cache=cache.kv_cache,
+                block_table=cache.block_table,
+                seq_lens=cache.seq_lens,
+                stream_a=stream_a,
+                core=core,
+                layer=layer.layer_idx,
+                rank=runner.rank,
+                **runner.launch_args(),
+            )
         stream_out = torch.empty_like(stream)
         branch_out = torch.empty_like(branch)
         k2.k2_launch(

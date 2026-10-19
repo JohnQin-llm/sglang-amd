@@ -15,7 +15,10 @@ TP rank, every TP collective inside the kernel. Adapted from Kimi-K3's K2
     CTAs 80 .. 207    pooler (128 tasks, likewise)
     every CTA         xe quant, the route table, ug, down (one 16-row task each)
     CTAs 0 .. 31      finalize (AR#3's rank-ordered sum, post_expert_norm,
-                      the weighted top-k sum) -> FIN rows + FRDY
+                      the weighted top-k sum) -> FIN rows + FRDY; at q8 these
+                      CTAs each finalize one owned (128-column slice, token),
+                      then the same CTAs 0 .. 31
+                      receive the tagged FIN all-gather and publish FRDY
     CTAs 192 .. 255   unpooler (64 x 16 of this rank's 1024 columns) -> AG#4
     CTAs 128 .. 191   gather: AG#4 -> ``branch_out``
 
@@ -35,8 +38,6 @@ import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, rocdl
 from flydsl.expr.typing import Int32, Int64
-
-from sglang.srt.rocm_muse_spark.mono.runtime.abi import K2_DONE_BYTES, K2_DONE_OFFSET
 from sglang.srt.rocm_muse_spark.mono.ops.common.debug import (
     region_ids,
     stamp,
@@ -76,6 +77,7 @@ from sglang.srt.rocm_muse_spark.mono.ops.common.sync import (
 )
 from sglang.srt.rocm_muse_spark.mono.ops.stages import gemv, moe, oproj
 from sglang.srt.rocm_muse_spark.mono.ops.stages import seam_b as seam
+from sglang.srt.rocm_muse_spark.mono.runtime.abi import K2_DONE_BYTES, K2_DONE_OFFSET
 
 TP = 8
 MAX_TOKENS = 8
@@ -100,10 +102,8 @@ REGIONS = ("ar", "msq1", "msq2", "xrdy", "finish", "done") + moe.REGIONS
 FINISH_FANIN = 8
 FINISH_GROUPS = (BLOCKS + FINISH_FANIN - 1) // FINISH_FANIN
 FINISH_ROOTS = (FINISH_GROUPS + FINISH_FANIN - 1) // FINISH_FANIN
-_PEER_REGIONS = ("ar", "rlog", "pool", "yr", "br")
-_SCRATCH_REGIONS = ("msq1", "msq2", "xrdy", "finish") + tuple(
-    moe.scratch_pairs(1)
-)
+_PEER_REGIONS = ("ar", "rlog", "pool", "yr", "br", "owned_fmsq", "owned_fin")
+_SCRATCH_REGIONS = ("msq1", "msq2", "xrdy", "finish") + tuple(moe.scratch_pairs(1))
 _SCRATCH_PLAIN = tuple(moe.scratch_plain(1))
 
 # the K2 sources (and the shared helpers): in every build's JIT cache key
@@ -127,6 +127,10 @@ class K2Build:
     eps_ffn: float = 1e-5  # pre_ffn_norm
     eps_pre_expert: float = 1e-5  # feed_forward.pre_expert_norm
     eps_post_expert: float = 1e-8  # feed_forward.post_expert_norm (weight first)
+    # Applied to the raw router logits before sigmoid, matching
+    # FusedMuseSparkRouting's router_output_multiplier.  Original-vLLM
+    # fixtures have this folded into their weights and retain the default.
+    router_output_multiplier: float = 1.0
     # the fault hook (sync.stall): rank fault_rank stalls fault_ticks once, in
     # slot fault_layer's launch of the step at epoch fault_epoch
     fault_rank: int = -1
@@ -143,6 +147,7 @@ def make_key(
     eps_ffn: float,
     eps_pre_expert: float,
     eps_post_expert: float,
+    router_output_multiplier: float = 1.0,
     **fault,
 ) -> K2Build:
     return K2Build(
@@ -151,6 +156,7 @@ def make_key(
         eps_ffn=float(eps_ffn),
         eps_pre_expert=float(eps_pre_expert),
         eps_post_expert=float(eps_post_expert),
+        router_output_multiplier=float(router_output_multiplier),
         **fault,
     )
 
@@ -216,22 +222,15 @@ def finish_consensus(c, done, health, alarm):
     publish(c["put"], c["finish"], bid, 1, tid == 0)
     if (bid < FINISH_GROUPS) & (tid == 0):
         lo = bid * FINISH_FANIN
-        c["poll_terminal"](
-            [(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)]
-        )
+        c["poll_terminal"]([(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)])
         c["put"](c["finish"], BLOCKS + bid, 1)
     if (bid < FINISH_ROOTS) & (tid == 0):
         lo = BLOCKS + bid * FINISH_FANIN
-        c["poll_terminal"](
-            [(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)]
-        )
+        c["poll_terminal"]([(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)])
         c["put"](c["finish"], BLOCKS + FINISH_GROUPS + bid, 1)
     if (bid == 0) & (tid == 0):
         c["poll_terminal"](
-            [
-                (c["finish"], BLOCKS + FINISH_GROUPS + i, 1)
-                for i in range(FINISH_ROOTS)
-            ]
+            [(c["finish"], BLOCKS + FINISH_GROUPS + i, 1) for i in range(FINISH_ROOTS)]
         )
         c["put"](done, c["rank"], 1)
         rocdl.s_waitcnt(vmcnt=0)
@@ -302,7 +301,8 @@ def _make(key: K2Build):
     # leaving half of gfx950's 256-CU persistent grid idle.  One group per
     # task exposes 256 independent tasks while preserving the exact bytes and
     # arithmetic of each expert group.  Wider builds retain two groups/CTA.
-    ug_units = 1 if s == 2 else moe.UG_UNITS
+    ug_units = moe.ug_units(s)
+    fin_tasks = moe.OWNER_FIN_CTAS if s == 8 else moe.FIN_TASKS
     lay = scratch_layout(s)
     play = peer_layout()
     half = _half()
@@ -412,8 +412,7 @@ def _make(key: K2Build):
         for region in _PEER_REGIONS:
             off, extent = play[region]
             peer[region] = [
-                shift(preg(b, off, region, extent), fx.Int64(par) * half)
-                for b in bases
+                shift(preg(b, off, region, extent), fx.Int64(par) * half) for b in bases
             ]
             peer[region + "_own"] = shift(
                 preg(own, off, region, extent), fx.Int64(par) * half
@@ -430,6 +429,7 @@ def _make(key: K2Build):
             "eps_ffn": key.eps_ffn,
             "eps_pre": key.eps_pre_expert,
             "eps_post": key.eps_post_expert,
+            "router_output_multiplier": key.router_output_multiplier,
             "put": mb.put,
             "put_bf": mb.put_bf,
             "put_words": mb.put_words,
@@ -475,10 +475,15 @@ def _make(key: K2Build):
                 "branch_out": branch_out,
             },
         }
-        for region in _SCRATCH_REGIONS:
-            c[region] = sreg(
-                scratch, lay[region][0], region, lay[region][1]
+        if const_expr(s == 8):
+            # Each down CTA owns 16 contiguous columns, 32 CTAs per owner.
+            owner_base = load_ptr64(peers, bid // (moe.DOWN_TASKS // TP))
+            off, extent = play["yr"]
+            c["yr_owner"] = shift(
+                preg(owner_base, off, "yr", extent), fx.Int64(par) * half
             )
+        for region in _SCRATCH_REGIONS:
+            c[region] = sreg(scratch, lay[region][0], region, lay[region][1])
         for name in _SCRATCH_PLAIN:
             c[name] = scratch + fx.Int64(lay[name][0])
         on, tls = key.timeline, lds.tls.ptr
@@ -523,18 +528,34 @@ def _make(key: K2Build):
         nu = moe.load_route(c)
         stamp(on, tls, tid, 6)
         enter_stage("ug")
-        moe.run_ug(c, nu, ug_units)
+        if const_expr(s == 8):
+            moe.run_ug_q8(c, nu)
+        else:
+            moe.run_ug(c, nu, ug_units)
         stamp(on, tls, tid, 7)
         dops = moe.down_loads(c, bid, nu, fx.min(c["wave"], nu - 1), down_batch)
         enter_stage("inter_wait")
-        moe.load_inter(c, nu, ug_units)
+        if const_expr(s == 8):
+            moe.load_inter_q8(c, nu)
+        else:
+            moe.load_inter(c, nu, ug_units)
         stamp(on, tls, tid, 16)
         enter_stage("down")
         moe.stage_down(c, bid, nu, dops, down_batch, prefetch_next=s != 2)
         stamp(on, tls, tid, 8)
-        if bid < FIN0 + moe.FIN_TASKS:
+        if bid < FIN0 + fin_tasks:
             enter_stage("finalize")
-            moe.stage_fin(c, bid - FIN0)
+            if const_expr(s == 8):
+                owner = bid - FIN0
+                j = rank * moe.OWNED_FIN_TASKS + owner // s
+                moe.stage_fin_token(c, j, owner % s)
+            else:
+                moe.stage_fin(c, bid - FIN0)
+        # Keep the compile-time gate outside the traced device branch.
+        if const_expr(s == 8):  # noqa: SIM102
+            if bid < FIN0 + moe.FIN_TASKS:
+                enter_stage("fin_gather")
+                moe.stage_fin_gather(c, bid - FIN0)
         stamp(on, tls, tid, 9)
         if bid >= U0:
             enter_stage("up")
