@@ -8,10 +8,10 @@ layer's pre-QKV norm, as ``fused_norm_residual_norm_fwd`` computes them::
     attn_in  = bf16(stream_a * rsqrt(mean(stream_a^2) + eps) * (w_qn + 1))
 
 Each of the 64 slice tasks owns 128 contiguous columns.  For the post norm, the
-lower 32 tasks also load their corresponding upper-half slice and reproduce
-Triton's 16-wave ownership: eight adjacent values per lane, two 32-lane halves
-per wave, then 16 wave partials.  ``stream_a`` is stored (fp32, the layer's
-residual_state input to K2); the bf16 ``attn_in`` columns go to the scratch x
+lower 32 tasks additionally load 256 contiguous columns each and reproduce
+Triton's gfx950 16-wave ownership: eight adjacent values per lane, two
+32-lane halves per wave, then 16 wave partials. ``stream_a`` is stored in fp32
+(the layer's residual_state input to K2); the bf16 ``attn_in`` columns go to the scratch x
 rows at device scope, followed by the slice's XRDY flag.
 
 Rounding follows the Triton kernel elementwise (fp32 math, the weight added in
@@ -24,7 +24,6 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import gpu
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
-
 from sglang.srt.rocm_muse_spark.mono.ops.common.ops import (
     CM_DEV,
     bf_hi,
@@ -33,6 +32,7 @@ from sglang.srt.rocm_muse_spark.mono.ops.common.ops import (
     hw_rsq,
     rsrc,
     traced,
+    xshfl,
 )
 from sglang.srt.rocm_muse_spark.mono.ops.common.sync import publish
 
@@ -60,13 +60,15 @@ def _fma(a, b, c):
 
 @traced
 def _row_rstd(c, region, eps, red):
+    # Each mailbox holds 16 native lanes (128 columns). Combine adjacent
+    # quarters into native waves before the 16-wave XOR reduction.
     s_rows, tid, lane = c["T"], c["tid"], c["lane"]
     if tid < 64 * s_rows:
         tt = tid // 64
         v = c["poll"]([(region, lane * s_rows + tt, 1)])[0][0].bitcast(
             fx.Float32
         )
-        tot = butterfly(v, (32, 16, 8, 4, 2, 1))
+        tot = butterfly(v, (1, 2, 32, 16, 8, 4))
         if lane == 0:
             fx.ptr_store(tot, red + tt)
     gpu.barrier()
@@ -120,23 +122,23 @@ def stage_seam(c, s):
     wqn = ld_bf4(a["w_qn"], col)
     xh = [br[k] * (wpf[k] + fx.Float32(1.0)) for k in range(4)]
     if s < NS // 2:
-        br_hi = ld_bf4(a["branch_in"], e + HIDDEN // 2)
-        wpf_hi = ld_bf4(a["w_pf"], col + HIDDEN // 2)
-        xh_hi = [
-            br_hi[k] * (wpf_hi[k] + fx.Float32(1.0)) for k in range(4)
-        ]
-        # Match Triton's per-lane accumulator and DPP row-reduction order.
-        sq = xh[0] * xh[0]
-        sq = _fma(xh[1], xh[1], sq)
-        sq = _fma(xh[2], xh[2], sq)
-        sq = _fma(xh[3], xh[3], sq)
-        sq = _fma(xh_hi[0], xh_hi[0], sq)
-        sq = _fma(xh_hi[1], xh_hi[1], sq)
-        sq = _fma(xh_hi[2], xh_hi[2], sq)
-        sq = _fma(xh_hi[3], xh_hi[3], sq)
-        # Triton's tl.sum lowers to SWAP16, bidirectional row shifts at 8/4,
-        # then quad swaps at 2/1.  ``butterfly`` emits that exact sequence.
-        sq = butterfly(sq, (16, 8, 4, 2, 1))
+        # Native gfx950 Triton owns eight CONTIGUOUS columns per lane.
+        # Its packed reduction pairs (0,2), (1,3), (4,6), (5,7),
+        # then combines the even and odd sums before the wave reduction.
+        pc = s * 256 + (tid % QC) * 8
+        pb0 = ld_bf4(a["branch_in"], t * HIDDEN + pc)
+        pb1 = ld_bf4(a["branch_in"], t * HIDDEN + pc + 4)
+        pw0 = ld_bf4(a["w_pf"], pc)
+        pw1 = ld_bf4(a["w_pf"], pc + 4)
+        px = [pb0[k] * (pw0[k] + fx.Float32(1.0)) for k in range(4)]
+        pxh = [pb1[k] * (pw1[k] + fx.Float32(1.0)) for k in range(4)]
+        even = _fma(px[0], px[0], px[2] * px[2]) + _fma(
+            pxh[0], pxh[0], pxh[2] * pxh[2]
+        )
+        odd = _fma(px[1], px[1], px[3] * px[3]) + _fma(
+            pxh[1], pxh[1], pxh[3] * pxh[3]
+        )
+        sq = butterfly(even + odd, (8, 4, 2, 1, 16))
         if mine & (lane % 32 == 0):
             c["put"](c["p1"], s * s_rows + t, sq)
     r1 = _post_row_rstd(c, c["p1"], c["post_eps"], red)
@@ -145,10 +147,12 @@ def stage_seam(c, s):
         bo.buffer_store(
             fx.Vector.from_elements(sv, fx.Float32), rsrc(a["stream_a"]), e
         )
-    sq2 = (sv[0] * sv[0] + sv[1] * sv[1]) + (
-        sv[2] * sv[2] + sv[3] * sv[3]
-    )
-    sq2 = butterfly(sq2, (16, 8, 4, 2, 1))
+    # Adjacent four-column owners jointly reproduce one native eight-column
+    # lane. Keep even/odd sums separate until both halves have been combined.
+    even = _fma(sv[0], sv[0], sv[2] * sv[2])
+    odd = _fma(sv[1], sv[1], sv[3] * sv[3])
+    sq2 = (even + xshfl(even, 1)) + (odd + xshfl(odd, 1))
+    sq2 = butterfly(sq2, (16, 8, 4, 2))
     if mine & (lane % 32 == 0):
         c["put"](c["p2"], s * s_rows + t, sq2)
     r2 = _row_rstd(c, c["p2"], c["eps"], red + 16)
