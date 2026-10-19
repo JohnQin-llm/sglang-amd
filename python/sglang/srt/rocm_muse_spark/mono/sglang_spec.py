@@ -38,6 +38,7 @@ from sglang.srt.rocm_muse_spark.mono.spec import (
     TP,
     WINDOW,
     kernel_layers,
+    native_attention_enabled,
     native_attention_layers,
 )
 from sglang.srt.runtime_context import get_parallel, get_spec
@@ -54,7 +55,7 @@ def _layer_selection(config) -> tuple[list[int], set[int]]:
         else set()
     )
     selected = sorted(set(kernel_layers(config)) | native)
-    if os.getenv("SGLANG_MUSE_ORIGINAL_NATIVE_ATTENTION", "0") == "1":
+    if native_attention_enabled():
         native = set(selected)
     return selected, native
 
@@ -79,8 +80,11 @@ def config_disable_reasons(cfg: Any, config: Any) -> list[str]:
             reasons.append(f"config.{name} {got!r} is not {want!r}")
     if getattr(cfg, "page_size", None) != KV_BLOCK:
         reasons.append(f"page_size must be {KV_BLOCK}")
-    if getattr(cfg, "kv_cache_dtype", None) not in ("bf16", "bfloat16", "auto"):
-        reasons.append("KV cache must be BF16")
+    kv_dtype = getattr(cfg, "kv_cache_dtype", None)
+    if kv_dtype not in ("bf16", "bfloat16", "auto") and not (
+        native_attention_enabled() and kv_dtype == "fp8_e4m3"
+    ):
+        reasons.append("K1 requires BF16 KV; FP8 E4M3 requires native attention")
     if os.getenv("SGLANG_MUSE_ORIGINAL_NATIVE_ONLY", "0") == "1":
         reasons.append(
             "SGLANG_MUSE_ORIGINAL_NATIVE_ONLY=1 selects the baseline; unset it "
@@ -326,7 +330,7 @@ MONO_SPEC = MonoSpec(
         attention_backends=frozenset({"aiter"}),
         server_args={
             "page_size": frozenset({KV_BLOCK}),
-            "kv_cache_dtype": frozenset({"auto", "bf16", "bfloat16"}),
+            "kv_cache_dtype": frozenset({"auto", "bf16", "bfloat16", "fp8_e4m3"}),
         },
     ),
     numerics=Numerics(

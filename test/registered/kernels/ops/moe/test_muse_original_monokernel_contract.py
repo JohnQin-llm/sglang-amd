@@ -352,3 +352,96 @@ def test_layer_keys_preserve_native_router_multiplier(multiplier, rows):
     del layer.feed_forward.router_multiplier
     _, original_key = layer_keys(layer, width=rows, q_len=rows)
     assert original_key.router_output_multiplier == 1.0
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("kv_dtype", ["bf16", "fp8_e4m3", "fp8_e5m2"])
+def test_native_attention_k2_kv_dtype_gate(monkeypatch, native, kv_dtype):
+    from sglang.srt.rocm_muse_spark.mono.sglang_spec import MONO_SPEC
+
+    monkeypatch.setenv("SGLANG_MUSE_ORIGINAL_NATIVE_ATTENTION", str(int(native)))
+    monkeypatch.setenv("SGLANG_MUSE_ORIGINAL_UNQUALIFIED_DFLASH", "1")
+    monkeypatch.delenv("SGLANG_MUSE_ORIGINAL_NATIVE_ONLY", raising=False)
+    text = SimpleNamespace(
+        hidden_size=8192,
+        num_attention_heads=128,
+        num_key_value_heads=16,
+        head_dim=64,
+        num_local_experts=256,
+        num_experts_per_tok=8,
+        moe_hidden_size=4096,
+        moe_intermediate_size=4096,
+        sliding_window=2048,
+    )
+    cfg = SimpleNamespace(
+        page_size=16,
+        kv_cache_dtype=kv_dtype,
+        speculative_algorithm="DFLASH",
+        speculative_num_draft_tokens=8,
+    )
+    accepted = kv_dtype == "bf16" or (native and kv_dtype == "fp8_e4m3")
+    reasons = config_disable_reasons(cfg, text)
+    assert (not reasons) == accepted
+    if accepted:
+        assert kv_dtype in MONO_SPEC.requires.server_args["kv_cache_dtype"]
+    else:
+        assert any("KV" in reason for reason in reasons)
+    monkeypatch.delenv("SGLANG_MUSE_ORIGINAL_UNQUALIFIED_DFLASH")
+    assert "rows=8 target-verify is not production-qualified" in config_disable_reasons(
+        cfg, text
+    )
+
+
+@pytest.mark.parametrize(
+    "architecture,draft,native,page_major,expected",
+    [
+        (
+            "MuseSparkForConditionalGeneration",
+            False,
+            False,
+            False,
+            "MuseMonoMHATokenToKVPool",
+        ),
+        ("MuseSparkForConditionalGeneration", False, True, False, "MHATokenToKVPool"),
+        (
+            "MuseSparkForConditionalGeneration",
+            False,
+            True,
+            True,
+            "PageMajorMHATokenToKVPool",
+        ),
+        ("MuseSparkForConditionalGeneration", True, False, False, "MHATokenToKVPool"),
+        ("OtherModel", False, False, False, "MHATokenToKVPool"),
+        ("OtherModel", False, True, False, "MHATokenToKVPool"),
+    ],
+)
+def test_native_attention_uses_native_kv_pool(
+    monkeypatch, architecture, draft, native, page_major, expected
+):
+    from sglang.srt.mem_cache import kv_cache_configurator as module
+
+    monkeypatch.setenv("SGLANG_MUSE_ORIGINAL_NATIVE_ATTENTION", str(int(native)))
+    monkeypatch.setenv("SGLANG_MUSE_ORIGINAL_NATIVE_ONLY", "1")
+    configurator = object.__new__(module.KVCacheConfigurator)
+    configurator.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=[architecture])
+    )
+    configurator.is_draft_worker = draft
+    monkeypatch.setattr(
+        module.KVCacheConfigurator, "_page_major_enabled", lambda self: page_major
+    )
+
+    class PoolSelected(Exception):
+        pass
+
+    def resolve(self, *, kind, default):
+        assert kind == "mha"
+        assert default.__name__ == expected
+        raise PoolSelected
+
+    monkeypatch.setattr(module.KVCacheConfigurator, "_resolve_kv_pool_class", resolve)
+    # Stop after the real dispatch chooses its class, before any GPU allocation.
+    with pytest.raises(PoolSelected):
+        configurator._build_token_to_kv_pool(
+            sizes=None, is_dsa_model=False, is_dsv4_model=False, req_to_token_pool=None
+        )

@@ -1625,10 +1625,13 @@ class KVCacheConfigurator:
         # selected by swapping in the PageMajorMHATokenToKVPool subclass. The
         # default keeps upstream's per-layer layout. The Mamba state pool is routed
         # separately via `mamba_envelope_layout` on the req-to-token pool above.
+        from sglang.srt.rocm_muse_spark.mono.spec import native_attention_enabled
+
         enable_page_major = self._page_major_enabled()
         architectures = set(self.model_config.hf_config.architectures or ())
         use_muse_mono = (
-            not self.is_draft_worker
+            not native_attention_enabled()
+            and not self.is_draft_worker
             and bool(
                 architectures
                 & {"MuseSparkForConditionalGeneration", "MuseSpark1xForCausalLM"}

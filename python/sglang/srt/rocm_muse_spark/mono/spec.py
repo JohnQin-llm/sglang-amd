@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 TP = 8
 MAX_TOKENS = 8
 BLOCKS = 256
@@ -16,6 +18,11 @@ INTER = 512
 WINDOW = 2048
 KV_BLOCK = 16
 MAX_FULL_CONTEXT = 32768
+
+
+def native_attention_enabled() -> bool:
+    """All selected K2 layers retain the native attention and cache backend."""
+    return os.getenv("SGLANG_MUSE_ORIGINAL_NATIVE_ATTENTION", "0") == "1"
 
 
 def kernel_layers(config) -> list[int]:
