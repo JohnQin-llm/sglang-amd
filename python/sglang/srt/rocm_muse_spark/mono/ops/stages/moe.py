@@ -16,13 +16,14 @@ its eighth of each and the results are all-gathered over the peer buffer.
     route   (token t on CTA t): sigmoid, + bias, top-8 (ties: lower id), slot
             order by biased score, weights s_k / (sum + 1e-15) -> ROUTE
     xq      (every CTA): POOL -> pre_expert_norm -> bf16 xe -> MXFP4 (``mxq``)
-    ug      (|U| x 16 groups of 32 intermediate columns, two a CTA): a wave a
-            16-row gate / up tile, one scaled-MFMA chain over K = 4096;
+    ug      (|U| x 16 groups of 32 intermediate columns, one a CTA at q8 when
+            |U| <= 32 and two otherwise): a wave a 16-row gate / up tile, one
+            scaled-MFMA chain over K = 4096;
             silu(g) u; MXFP4 a 32-group -> INTER / ISC of each picking token
     down    (256 x 16 MH rows, one a CTA): every expert of U against its
             picks' INTER, one fp32 chain over the rank's K = 512 -> bf16 per
             route (unweighted) -> column owner's YR at q8 (otherwise push-all)
-    fin     (32 x 128 MH columns, 4 owned slices per rank at q8):
+    fin     (32 x 128 MH columns, 4 owned slices x 8 token CTAs per rank at q8):
             YR summed over ranks in order -> bf16 y;
             x = y (w_post + 1); per-route sums of squares through FMSQ;
             fin = bf16(sum_k x_k rsqrt(mean(x_k^2) + eps) w_k) -> FIN rows
@@ -120,6 +121,8 @@ W2_STEPS = RI // 128  # 4
 W2_SCALE_G = RI // 32  # 16
 UG_GROUPS = RI // 32  # 16 32-column groups a picked expert
 UG_UNITS = 2  # 32-column groups a CTA task (4 waves each)
+UG_SINGLE_GROUP_ROWS = (2,)
+UG_Q8_ONE_GROUP_MAX_U = 32
 INTER_W = RI // 8  # 64 E2M1 words a route
 MAX_U = 8 * TOPK  # 64: the union of a step's picks
 DOWN_TASKS = MH // ROWS  # 256
@@ -127,6 +130,7 @@ DOWN_BATCH = 4  # maximum experts a wave keeps in flight together
 FIN_COLS = 128
 FIN_TASKS = MH // FIN_COLS  # 32
 OWNED_FIN_TASKS = FIN_TASKS // TP  # q8: four 128-column slices per rank
+OWNER_FIN_CTAS = OWNED_FIN_TASKS * 8  # q8: one CTA per owned slice and token
 UP_N = H // TP  # 1024 branch columns a rank
 UP_TASKS = UP_N // ROWS  # 64
 GATHER_COLS = 128
@@ -134,9 +138,20 @@ GATHER_TASKS = H // GATHER_COLS  # 64
 XQ_W = MH // 8  # 512 E2M1 words an xe row
 XQ_G = MH // 32  # 128 scale codes an xe row
 XQ0 = 8  # the xe quantizing CTAs: XQ0 + t for token t
-UG_TASKS_MAX = MAX_U * UG_GROUPS // UG_UNITS  # 512: one flag a thread
+UG_TASKS_BASE = MAX_U * UG_GROUPS // UG_UNITS  # 512
+UG_TASKS_MAX = UG_TASKS_BASE  # both adaptive q8 branches are bounded by 512
 FIN_BATCH = 32  # YR pairs a fin poll round
 assert UG_TASKS_MAX <= THREADS
+
+
+def ug_units(s):
+    """Number of 32-column groups assigned to one UG task at width ``s``."""
+    return 1 if s in UG_SINGLE_GROUP_ROWS else UG_UNITS
+
+
+def ug_task_capacity(s):
+    """UGRDY capacity; the adaptive q8 threshold keeps every path <= 512."""
+    return UG_TASKS_BASE
 
 
 def peer_pairs(s):
@@ -157,7 +172,7 @@ def scratch_pairs(s):
         "ppart": P_TASKS * s * ROWS,
         "route": s * 2 * TOPK,
         "xqrdy": s,
-        "ugrdy": UG_TASKS_MAX,
+        "ugrdy": ug_task_capacity(s),
         "fmsq": FIN_TASKS * s * TOPK,
         "frdy": FIN_TASKS,
     }
@@ -381,7 +396,10 @@ def stage_route(c, t):
         got = c["poll"](specs)
         keys, sigs = [], []
         for i in range_constexpr(per):
-            lg = f32_of(got[i][0])
+            # Current SGLang applies the model's output multiplier to the raw
+            # router logits before sigmoid.  It is a compile-time scalar here;
+            # frozen original-vLLM fixtures use the default 1.0.
+            lg = f32_of(got[i][0]) * fx.Float32(c["router_output_multiplier"])
             sg = fx.Float32(1.0) / (fx.Float32(1.0) + hw_exp2(lg * fx.Float32(-LOG2E)))
             sc = sg + bias[i]
             # a NaN logit (a warmup's garbage row) ranks last
@@ -616,8 +634,8 @@ def ug_loads(c, task, units=UG_UNITS):
 
 @traced
 def stage_ug(c, task, ops, units=UG_UNITS):
-    """Task ``task``: two 32-column groups, a wave a 16-row tile against the
-    MXFP4 xe (one MFMA chain over K); silu(g) u; MXFP4 a 32-group -> INTER /
+    """Task ``task``: one or two 32-column groups, a wave a 16-row tile against
+    the MXFP4 xe (one MFMA chain over K); silu(g) u; MXFP4 a 32-group -> INTER /
     ISC of each picking token."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     rt = c["rt"]
@@ -652,6 +670,13 @@ def stage_ug(c, task, ops, units=UG_UNITS):
     gv = fx.ptr_load(red + (((4 * u + half) * 64 + 16 * (r // 4) + tt) * 4 + r % 4))
     uv = fx.ptr_load(red + (((4 * u + 2 + half) * 64 + 16 * (r // 4) + tt) * 4 + r % 4))
     v = mxq.silu_mul(gv, uv)
+    # Current serving AITER uses a two-stage q8 expert path: stage 1 stores
+    # SiLU(gate) * up as BF16, then a separate kernel derives the MXFP4
+    # scale/codes from that BF16 tensor.  The frozen original flat kernel
+    # quantizes its FP32 epilogue directly; keep that arithmetic for one-row
+    # decode.  This width guard intentionally also changes a q1C8 batch.
+    if s == 8:
+        v = bf16_round(v)
     amax = butterfly(abs(v), (16, 8, 4, 2, 1), fx.max)
     code = mxq.inter_code(amax)
     gpu.barrier()
@@ -689,6 +714,15 @@ def run_ug(c, nu, units=UG_UNITS):
         task = task + BLOCKS
 
 
+@traced
+def run_ug_q8(c, nu):
+    """Use one group per task only for the profiled low-union q8 regime."""
+    if nu <= UG_Q8_ONE_GROUP_MAX_U:
+        run_ug(c, nu, 1)
+    else:
+        run_ug(c, nu, UG_UNITS)
+
+
 # ---------------------------------------------------------------- down
 @traced
 def load_inter(c, nu, units=UG_UNITS):
@@ -701,6 +735,15 @@ def load_inter(c, nu, units=UG_UNITS):
     dev_copy(tid, c["interb"], c["interq"], s * TOPK * INTER_W)
     dev_copy(tid, c["iscb"], c["intsc"], s * TOPK * UG_GROUPS)
     gpu.barrier()
+
+
+@traced
+def load_inter_q8(c, nu):
+    """Wait for the same route-count-selected q8 UG schedule as ``run_ug_q8``."""
+    if nu <= UG_Q8_ONE_GROUP_MAX_U:
+        load_inter(c, nu, 1)
+    else:
+        load_inter(c, nu, UG_UNITS)
 
 
 def down_loads(c, rgd, nu, b0, batch=DOWN_BATCH):
@@ -895,6 +938,19 @@ def stage_fin(c, j):
         _stage_fin_wave(c, j, t, col, live)
     if const_expr(s != 8):
         publish(c["put"], c["frdy"], j, fx.Int32(1), c["tid"] == 0)
+    gpu.barrier()
+
+
+@traced
+def stage_fin_token(c, j, t):
+    """Finalize one q8 ``(128-column slice, token)`` on this CTA's wave 0.
+
+    The other waves issue no tagged polls. All threads still reach the CTA
+    barrier before this CTA proceeds to the unchanged FIN gather stage.
+    """
+    lane, wave = c["lane"], c["wave"]
+    if wave == 0:
+        _stage_fin_wave(c, j, t, j * FIN_COLS + 2 * lane, True)
     gpu.barrier()
 
 

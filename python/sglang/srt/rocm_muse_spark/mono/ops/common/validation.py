@@ -223,10 +223,22 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
     _assert_owned(k2.NSL)
     _assert_owned(s)
     _assert_owned(s, moe.XQ0)
-    _assert_owned(moe.UG_TASKS_MAX, reverse=True)
+    max_unique = min(moe.MAX_U, s * moe.TOPK)
+    ug_cases = (
+        (
+            (1, min(max_unique, moe.UG_Q8_ONE_GROUP_MAX_U)),
+            (moe.UG_UNITS, max_unique),
+        )
+        if s == 8
+        else ((moe.ug_units(s), max_unique),)
+    )
+    for units, route_bound in ug_cases:
+        ug_tasks = route_bound * moe.UG_GROUPS // units
+        _assert_owned(ug_tasks, reverse=True)
+        assert ug_tasks <= moe.ug_task_capacity(s) <= moe.UG_TASKS_MAX
     _assert_owned(moe.DOWN_TASKS)
     if s == 8:
-        # Every global slice has exactly one owner; every down tile targets
+        # Every global slice has exactly one owner rank; every down tile targets
         # the same rank as the finalizer of its containing 128-column slice.
         slices = [
             rank * moe.OWNED_FIN_TASKS + local
@@ -235,13 +247,23 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
         ]
         assert sorted(slices) == list(range(moe.FIN_TASKS))
         assert len(set(slices)) == moe.FIN_TASKS
+        owner_work = [
+            (rank * moe.OWNED_FIN_TASKS + local // s, local % s)
+            for rank in range(k2.TP)
+            for local in range(moe.OWNER_FIN_CTAS)
+        ]
+        expected_work = [
+            (j, t) for j in range(moe.FIN_TASKS) for t in range(s)
+        ]
+        assert sorted(owner_work) == expected_work
+        assert len(set(owner_work)) == moe.FIN_TASKS * s
         for tile in range(moe.DOWN_TASKS):
             assert (
                 tile // (moe.DOWN_TASKS // k2.TP)
                 == (tile * moe.ROWS // moe.FIN_COLS) // moe.OWNED_FIN_TASKS
             )
-        _assert_owned(moe.OWNED_FIN_TASKS, k2.FIN0)
-    _assert_owned(moe.FIN_TASKS, k2.FIN0)  # local FIN materialization at q8
+        _assert_owned(moe.OWNER_FIN_CTAS, k2.FIN0)
+    _assert_owned(moe.FIN_TASKS, k2.FIN0)  # local FIN gather/materialization
     _assert_owned(moe.UP_TASKS, k2.U0)
     _assert_owned(moe.GATHER_TASKS, k2.G0)
     assert moe.MAX_U * moe.UG_GROUPS // moe.UG_UNITS == moe.UG_TASKS_MAX

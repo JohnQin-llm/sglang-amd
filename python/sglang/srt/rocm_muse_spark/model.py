@@ -454,9 +454,7 @@ class MuseSpark1xRouter(nn.Module):
             if self.original_layout
             else (hidden_size, num_experts)
         )
-        self.weight = nn.Parameter(
-            torch.empty(shape, dtype=dtype), requires_grad=False
-        )
+        self.weight = nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.original_layout:
@@ -600,6 +598,19 @@ class MuseSpark1xAttention(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
+        output = self.forward_attention_core(positions, hidden_states, forward_batch)
+        output, _ = self.o_proj(output)
+        return output
+
+    def forward_attention_core(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Compute the local attention result before the output projection."""
+        if hidden_states.shape[0] == 0:
+            return hidden_states.new_empty((0, self.q_size))
         qkv, _ = self.qkv_proj(hidden_states)
         split_sizes = [self.q_size, self.kv_size, self.kv_size]
         if self.use_o_gate:
@@ -632,9 +643,7 @@ class MuseSpark1xAttention(nn.Module):
         if self.rotary_emb is not None and prepared is None:
             q, k = self.rotary_emb(positions, q, k)
         output = self.attn(q, k, v, forward_batch, save_kv_cache=prepared is None)
-        output = self._fused_o_norm_gate.forward(output, o_gate)
-        output, _ = self.o_proj(output)
-        return output
+        return self._fused_o_norm_gate.forward(output, o_gate)
 
 
 class MuseSpark1xMLP(nn.Module):

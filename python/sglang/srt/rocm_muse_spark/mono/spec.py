@@ -33,6 +33,25 @@ def kernel_layers(config) -> list[int]:
     ]
 
 
+def native_attention_layers(config) -> list[int]:
+    """Interior sparse full-attention layers whose native core can feed K2.
+
+    The released checkpoint leaves the first and last experts in BF16.
+    Keep those boundary layers on their native path, as for fused K1+K2.
+    """
+    config = getattr(config, "text_config", config)
+    mlp = getattr(config, "mlp_layer_types", ())
+    attention = getattr(config, "layer_types", ())
+    return [
+        i
+        for i in range(1, int(config.num_hidden_layers) - 1)
+        if i < len(mlp)
+        and mlp[i] == "sparse"
+        and i < len(attention)
+        and attention[i] == "full_attention"
+    ]
+
+
 def step_disable_reason(forward_batch, rows: int) -> str | None:
     mode = forward_batch.forward_mode
     if not (mode.is_decode() or mode.is_target_verify()):
@@ -46,4 +65,3 @@ def step_disable_reason(forward_batch, rows: int) -> str | None:
     if mode.is_decode() and q_len != 1:
         return "decode query length is not one"
     return None
-
