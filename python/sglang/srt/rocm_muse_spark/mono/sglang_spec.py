@@ -81,6 +81,7 @@ def config_disable_reasons(cfg: Any, config: Any) -> list[str]:
 
 
 def model_disable_reasons(model, config, copies: dict) -> list[str]:
+    config = _text_config(config)
     reasons: list[str] = []
     if copies:
         reasons.append("the original port does not retain checkpoint copies")
