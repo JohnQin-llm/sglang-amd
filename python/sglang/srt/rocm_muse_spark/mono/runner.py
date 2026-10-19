@@ -78,6 +78,7 @@ class MonoRunner:
             self.scratch = self._scratch_storage[guard : guard + self._scratch_bytes]
             self.scratch.zero_()
             self.epoch = torch.zeros(1, dtype=torch.int32, device=device)
+            self.seq_lens = torch.zeros(MAX_TOKENS, dtype=torch.int32, device=device)
             self.health = torch.zeros(HEALTH_WORDS, dtype=torch.int32, device=device)
             self.stream_a = torch.empty(
                 MAX_TOKENS, HIDDEN, dtype=torch.float32, device=device

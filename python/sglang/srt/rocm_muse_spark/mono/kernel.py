@@ -143,7 +143,13 @@ class MuseLayerKernel:
         a = layer.self_attn
         m = layer.feed_forward
         ex = m.experts.routed_experts
-        cache = attention_inputs(layer, forward_batch)
+        lengths = forward_batch.seq_lens
+        if lengths.numel() > runner.seq_lens.numel():
+            raise ValueError("MonoKernel sequence-length buffer capacity exceeded")
+        seq_lens = runner.seq_lens[: lengths.numel()]
+        if new_step:
+            seq_lens.copy_(lengths)
+        cache = attention_inputs(layer, forward_batch, seq_lens=seq_lens)
         stream, branch = x.stream, x.branch
         if stream.shape[0] != t or branch.shape[0] != t:
             raise ValueError(f"MonoKernel width {t}: got {stream.shape[0]} rows")

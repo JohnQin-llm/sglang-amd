@@ -17,13 +17,16 @@ class MonoAttentionInputs:
     slot_mapping: torch.Tensor
 
 
-def attention_inputs(layer, forward_batch) -> MonoAttentionInputs:
+def attention_inputs(
+    layer, forward_batch, *, seq_lens: torch.Tensor
+) -> MonoAttentionInputs:
     """Return graph-live cache pointers and metadata without copying KV data.
 
     The monokernel cache pool exposes one combined BF16 page tensor per layer;
     the ordinary attention backend reads K/V views of that same allocation.
-    Metadata remains owned by the backend/ForwardBatch so graph replay updates
-    the existing device tensors rather than allocating or synchronizing here.
+    Tables and slots remain owned by the backend/ForwardBatch. The runner
+    converts SGLang's int64 lengths once per model step into a stable int32
+    buffer, shared by every K1 launch in that step.
     """
 
     backend = get_attn_backend()
@@ -54,7 +57,7 @@ def attention_inputs(layer, forward_batch) -> MonoAttentionInputs:
     values = MonoAttentionInputs(
         kv_cache=kv_cache,
         block_table=block_table,
-        seq_lens=forward_batch.seq_lens,
+        seq_lens=seq_lens,
         slot_mapping=slot_mapping,
     )
     validate_attention_inputs(values)
