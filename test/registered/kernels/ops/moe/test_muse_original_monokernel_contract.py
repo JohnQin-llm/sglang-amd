@@ -3,13 +3,19 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from sglang.srt.mem_cache.memory_pool import MuseMonoMHATokenToKVPool
 from sglang.srt.rocm_muse_spark.layers import (
+    MuseSpark1xResidualStream,
     MuseSpark1xRMSNorm,
     MuseSpark1xRMSNormWithInputScale,
 )
-from sglang.srt.rocm_muse_spark.model import MuseSpark1xRouter, _tp_expert_stack_slice
+from sglang.srt.rocm_muse_spark.model import (
+    MuseSpark1xRouter,
+    _original_boundary,
+    _tp_expert_stack_slice,
+)
 from sglang.srt.rocm_muse_spark.mono.cache import (
     MonoAttentionInputs,
     validate_attention_inputs,
@@ -31,10 +37,38 @@ def test_original_router_layout_matches_k2_and_native_math(monkeypatch):
     torch.testing.assert_close(router(x), x @ weight.t(), rtol=0, atol=0)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires GPU native boundary"
+)
+def test_weightless_post_norm_gpu_boundary():
+    post = MuseSpark1xRMSNorm(
+        8192, eps=1e-8, has_weight=False, zero_centered_gamma=True
+    )
+    pre = MuseSpark1xRMSNorm(8192, eps=1e-5).cuda().to(torch.bfloat16)
+    pre.weight.data.fill_(1.0)
+    branch = torch.randn(32, 8192, device="cuda", dtype=torch.bfloat16)
+    stream = torch.randn(32, 8192, device="cuda", dtype=torch.float32)
+    connection = SimpleNamespace(
+        _coefficients_ready=True,
+        alpha=torch.full((8192,), 0.6, device="cuda"),
+        beta=torch.full((8192,), 0.8, device="cuda"),
+    )
+    got, got_stream = _original_boundary(
+        MuseSpark1xResidualStream(stream, branch, post, connection), pre
+    )
+    post_ref = torch.nn.functional.rms_norm(branch.float(), (8192,), None, 1e-8)
+    expected_stream = 0.6 * stream + 0.8 * post_ref
+    expected = torch.nn.functional.rms_norm(expected_stream, (8192,), None, 1e-5)
+    torch.testing.assert_close(got_stream, expected_stream, atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(got.float(), expected, atol=0.032, rtol=0.004)
+
+
 def test_tp8_gate_up_and_down_sharding():
     experts, tp = 2, 8
     w13 = torch.arange(experts * 32 * 3).reshape(experts, 32, 3)
-    shard = _tp_expert_stack_slice(w13, torch.Size((experts, 4, 3)), "w13_weight", 3, tp)
+    shard = _tp_expert_stack_slice(
+        w13, torch.Size((experts, 4, 3)), "w13_weight", 3, tp
+    )
     expected = torch.cat((w13[:, 6:8], w13[:, 22:24]), dim=1)
     torch.testing.assert_close(shard, expected, rtol=0, atol=0)
 
@@ -54,9 +88,7 @@ def test_original_norms_keep_fp32_arithmetic_until_store():
     expected = expected * (norm.weight.float() + 1.0)
     torch.testing.assert_close(got, expected, rtol=0, atol=0)
 
-    post = MuseSpark1xRMSNormWithInputScale(
-        4, eps=1e-8, zero_centered_gamma=True
-    )
+    post = MuseSpark1xRMSNormWithInputScale(4, eps=1e-8, zero_centered_gamma=True)
     post.original_precision = True
     post.weight.data.copy_(norm.weight)
     got = post(x, out_dtype=torch.float32)
@@ -66,9 +98,7 @@ def test_original_norms_keep_fp32_arithmetic_until_store():
 
 
 def test_combined_cache_native_views_share_kv_storage():
-    backing = torch.arange(3 * 2 * 16 * 128, dtype=torch.float32).reshape(
-        3, 2, 16, 128
-    )
+    backing = torch.arange(3 * 2 * 16 * 128, dtype=torch.float32).reshape(3, 2, 16, 128)
     pool = object.__new__(MuseMonoMHATokenToKVPool)
     pool.start_layer = 0
     pool._muse_kv_buffer = [backing]

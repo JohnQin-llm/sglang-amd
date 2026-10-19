@@ -136,10 +136,14 @@ def _original_boundary(
                 alpha=boundary.connection.alpha,
                 beta=boundary.connection.beta,
                 post_gain_center=(
-                    post.gain_center if post.zero_centered_gamma else 0.0
+                    post.gain_center
+                    if post.weight is not None and post.zero_centered_gamma
+                    else 0.0
                 ),
                 pre_gain_center=(
-                    pre_norm.gain_center if pre_norm.zero_centered_gamma else 0.0
+                    pre_norm.gain_center
+                    if pre_norm.weight is not None and pre_norm.zero_centered_gamma
+                    else 0.0
                 ),
                 post_input_scale=isinstance(post, MuseSpark1xRMSNormWithInputScale),
                 pre_input_scale=isinstance(pre_norm, MuseSpark1xRMSNormWithInputScale),

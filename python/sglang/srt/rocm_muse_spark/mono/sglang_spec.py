@@ -104,7 +104,9 @@ def model_disable_reasons(model, config, copies: dict) -> list[str]:
             or router.dtype != torch.float32
             or not router.is_contiguous()
         ):
-            reasons.append(f"layer {i}: router must be contiguous FP32 [experts,hidden]")
+            reasons.append(
+                f"layer {i}: router must be contiguous FP32 [experts,hidden]"
+            )
         expert = getattr(getattr(layer.mlp, "experts", None), "routed_experts", None)
         if expert is None:
             reasons.append(f"layer {i}: missing routed MXFP4 experts")
@@ -166,11 +168,15 @@ class BuiltMuseOriginal:
                 f"routed width {plan.key.rows} does not match {positions.numel()} rows"
             )
         decoder = self.decoder
-        hidden = (
-            decoder.embed_tokens(input_ids) if input_embeds is None else input_embeds
-        )
-        if input_embeds is None and decoder.embed_norm is not None:
-            hidden = decoder.embed_norm(hidden, out_dtype=torch.float32)
+        if input_embeds is None:
+            embedding = self.model.get_input_embeddings()
+            hidden = embedding(input_ids)
+            # The multimodal wrapper returns already-normalized embeddings.
+            # Match its native forward, including its BF16 output boundary.
+            if embedding is decoder.embed_tokens and decoder.embed_norm is not None:
+                hidden = decoder.embed_norm(hidden, out_dtype=torch.float32)
+        else:
+            hidden = input_embeds
         stream = hidden.to(decoder.residual_dtype)
         attn_input = decoder.layers[0].self_attn_input_norm(stream)
         boundary = None
