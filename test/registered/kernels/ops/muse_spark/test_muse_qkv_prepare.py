@@ -1,7 +1,6 @@
 import unittest
 
 import torch
-
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -9,7 +8,7 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
-def _check_prepare(m, use_rope, swa, scaled):
+def _check_prepare(m, use_rope, swa, scaled, q_scale=5.4730064863875):
     from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
     from sglang.kernels.ops.muse_spark.qkv_prepare import fused_qkv_prepare
     from sglang.srt.layers.rotary_embedding import get_rope
@@ -36,7 +35,7 @@ def _check_prepare(m, use_rope, swa, scaled):
     ]
 
     def baseline():
-        qo, ko = fused_qk_norm(q, k, 64, 1e-5, 5.4730064863875)
+        qo, ko = fused_qk_norm(q, k, 64, 1e-5, q_scale)
         if use_rope:
             qo, ko = rope(pos, qo, ko)
         launch_reshape_and_cache_flash(
@@ -62,7 +61,7 @@ def _check_prepare(m, use_rope, swa, scaled):
             caches[3],
             loc,
             eps=1e-5,
-            q_scale=5.4730064863875,
+            q_scale=q_scale,
             swa_mapping=mapping,
             k_scale=ks,
             v_scale=vs,
@@ -94,7 +93,7 @@ def _check_prepare(m, use_rope, swa, scaled):
             torch.testing.assert_close(actual.float(), expected.float(), atol=0, rtol=0)
 
 
-def _check_integration():
+def _check_integration(q_scale=5.4730064863875):
     from types import SimpleNamespace
     from unittest.mock import patch
 
@@ -136,7 +135,7 @@ def _check_integration():
     attention.use_fused_qkv_prepare = True
     attention.use_attn_temperature_tuning = False
     attention.norm_eps = 1e-5
-    attention.scale_query_by = 5.4730064863875
+    attention.scale_query_by = q_scale
     attention.rotary_emb = get_rope(
         64,
         rotary_dim=64,
@@ -189,6 +188,16 @@ def _check_integration():
 
 @unittest.skipUnless(is_hip() and is_gfx95_supported(), "Requires MI355X")
 class TestMuseQKVPrepare(CustomTestCase):
+    @torch.no_grad()
+    def test_original_tp_query_scale(self):
+        # Original TP folds the query multiplier into the attention score scale.
+        # Q and the FP8 KV writes must still match the unfused native path.
+        torch.manual_seed(123)
+        for rope, swa in ((True, True), (False, False)):
+            with self.subTest(rope=rope, swa=swa):
+                _check_prepare(8, rope, swa, True, q_scale=1.0)
+        _check_integration(q_scale=1.0)
+
     @torch.no_grad()
     def test_changed_graph_inputs(self):
         torch.manual_seed(123)
