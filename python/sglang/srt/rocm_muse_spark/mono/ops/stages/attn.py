@@ -58,7 +58,6 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
-
 from sglang.srt.rocm_muse_spark.mono.ops.common.debug import stamp
 from sglang.srt.rocm_muse_spark.mono.ops.common.ops import (
     CM_DEV,
@@ -72,7 +71,6 @@ from sglang.srt.rocm_muse_spark.mono.ops.common.ops import (
     rsrc,
     traced,
     uniform,
-    wave_sum,
 )
 from sglang.srt.rocm_muse_spark.mono.ops.common.plan import THREADS, WAVES, note
 from sglang.srt.rocm_muse_spark.mono.ops.common.sync import _spin
@@ -190,7 +188,7 @@ def unit_q(c, j, g):
 
 
 @traced
-def unit_insert(c, j, g, kvh):
+def unit_insert(c, j, g, kvh, token_start=None, token_end=None, n_old=0):
     """KV head g's k (normed, rotated) and v (raw) of request j's L rows ->
     the cache at their slots (slot < 0: a pad row, skipped); drained before
     the CTA reads them back."""
@@ -209,7 +207,10 @@ def unit_insert(c, j, g, kvh):
         y = qk_norm_rope(c, x, cs, sn)
         is_v = kvs == 1
         words = pack8([is_v.select(x[e], y[e]) for e in range(8)])
-        if slot >= 0:
+        owns = slot >= 0
+        if const_expr(token_start is not None):
+            owns = owns & (n_old + i >= token_start) & (n_old + i < token_end)
+        if owns:
             off = (
                 fx.Int64(slot // BLK) * fx.Int64(a["kv_sb"])
                 + fx.Int64((slot % BLK) * a["kv_st"] + kvs * HD + 8 * li)
@@ -336,7 +337,7 @@ def _tile_scores(c, ks, kb, khi, n_old, n):
     n16 = lane % 16
     keys = [kb + 16 * s + 4 * g4 + i for s in range(2) for i in range(4)]
     kok = [(k >= 0) & (k < khi) for k in keys]
-    qvec = 16 * n + n16
+    qvec = 16 * (n + c.get("qtile", 0)) + n16
     qv = fx.min(qvec, GQA * L - 1)
     qb = c["ql"] + qv * QROW + 4 * g4
     q0 = fx.Vector(
@@ -589,11 +590,12 @@ def stage_unit(c, u):
 def unit_body_triton(c, u, j, g, ch, seq, n_old, origin, ta, tb, new_ch):
     """Unit matching production's sequential 64-key online softmax.
 
-    One wave owns the segment so the max/sum rescale and BF16 probability
-    rounding occur in the same fixed block order as the production kernel.
-    The other waves remain available to ``unit_finish`` and contribute zeros.
+    Each active wave owns one query tile and walks its segment in the same
+    fixed 64-key block order as production. Query tiles are independent, so
+    distributing them across waves preserves all arithmetic and rounding.
     """
-    nqt = c["NQT"]
+    tiles = c["NQT"]
+    nqt = 1
     tid, lane, wave = c["tid"], c["lane"], c["wave"]
     a = c["args"]
     pm = c["per_max"]
@@ -610,23 +612,30 @@ def unit_body_triton(c, u, j, g, ch, seq, n_old, origin, ta, tb, new_ch):
     kvh = a["kv_cache"] + fx.Int64(g * a["kv_sh"]) * 2
     stamp(c["tl_on"], c["tls"], tid, 4)
     unit_q(c, j, g)
-    if ch == new_ch:
-        unit_insert(c, j, g, kvh)
+    # A verification batch can straddle partition boundaries. Each partition
+    # inserts only its own new positions before reading its cache tiles.
+    token_start = origin + ta * TILE
+    token_end = origin + tb * TILE
+    if (token_start < seq) & (token_end > n_old):
+        unit_insert(c, j, g, kvh, token_start, token_end, n_old)
     stamp(c["tl_on"], c["tls"], tid, 5)
 
+    tc = dict(c)
+    tc["NQT"] = 1
+    tc["qtile"] = wave
     ms = [fx.Float32(NEG)] * nqt
     ls = [fx.Float32(1.0)] * nqt
     out = init_output(nqt)
     ti = ta
-    limit = (wave == 0).select(tb, ta)
+    limit = (wave < tiles).select(tb, ta)
     while ti < limit:
         # Production Triton updates online-softmax state once per 64 keys.
         # First find the block maximum, then reload the two halves for the
         # BF16 probability conversion and fp32 PV accumulation.
         kv0 = old_tile_loads(c, kvh, ti, ta, tb)
-        mx0 = tile_maxima(c, kv0, origin + ti * TILE, seq, n_old)
+        mx0 = tile_maxima(tc, kv0, origin + ti * TILE, seq, n_old)
         kv1 = old_tile_loads(c, kvh, ti + 1, ta, tb)
-        mx1 = tile_maxima(c, kv1, origin + (ti + 1) * TILE, seq, n_old)
+        mx1 = tile_maxima(tc, kv1, origin + (ti + 1) * TILE, seq, n_old)
         mnew, alpha = [], []
         scaled = []
         for n in range_constexpr(nqt):
@@ -639,11 +648,11 @@ def unit_body_triton(c, u, j, g, ch, seq, n_old, origin, ta, tb, new_ch):
                 scaled.append(out[4 * n + cc] * an)
         kv0 = old_tile_loads(c, kvh, ti, ta, tb)
         out, sum0 = tile_online_output(
-            c, scaled, kv0, origin + ti * TILE, seq, n_old, mnew
+            tc, scaled, kv0, origin + ti * TILE, seq, n_old, mnew
         )
         kv1 = old_tile_loads(c, kvh, ti + 1, ta, tb)
         out, sum1 = tile_online_output(
-            c, out, kv1, origin + (ti + 1) * TILE, seq, n_old, mnew
+            tc, out, kv1, origin + (ti + 1) * TILE, seq, n_old, mnew
         )
         for n in range_constexpr(nqt):
             block_sum = butterfly(sum0[n] + sum1[n], (16, 32))
@@ -651,30 +660,34 @@ def unit_body_triton(c, u, j, g, ch, seq, n_old, origin, ta, tb, new_ch):
             ms[n] = mnew[n]
         ti = ti + 2
 
-    # The K1 partial ABI is (max, sum, normalized output). Only wave zero has
-    # arithmetic state; all other waves publish zero output to unit_finish.
-    normalized = []
-    for n in range_constexpr(nqt):
-        inv = fx.Float32(1.0) / ls[n]
-        for cc in range_constexpr(4):
-            value = out[4 * n + cc] * inv
-            if const_expr(c["L"] == 1):
-                # AITER's decode kernel materializes each partition output as
-                # BF16 before the fp32 partition combine.  Preserve that seam;
-                # otherwise small per-rank differences are amplified by K2's
-                # output projection on real checkpoint weights.
-                value = value.to(fx.BFloat16).to(fx.Float32)
-            normalized.append(value)
-    g4 = lane // 16
-    n16 = lane % 16
-    if (wave == 0) & (g4 == 0):
-        for n in range_constexpr(nqt):
-            qvec = 16 * n + n16
-            fx.ptr_store(ms[n], c["mb"] + qvec)
-            fx.ptr_store(ls[n], c["lb"] + qvec)
+    # Publish directly from each query owner's MFMA accumulators. In this
+    # layout lane%16 owns the query and lane//16 owns a 16-feature group;
+    # register r, accumulator cc correspond to feature 16*g4 + 4*r + cc.
+    # No cross-wave sum is needed: query tiles have disjoint outputs.
+    if wave < tiles:
+        qvec = 16 * wave + lane % 16
+        inv = fx.Float32(1.0) / ls[0]
+        normalized = [out[cc] * inv for cc in range_constexpr(4)]
+        if qvec < GQA * c["L"]:
+            base = (u * (GQA * c["L"]) + qvec) * PART
+            for r in range_constexpr(4):
+                for pair in range_constexpr(2):
+                    d = 16 * (lane // 16) + 4 * r + 2 * pair
+                    c["put_words"](
+                        c["apart"],
+                        base + 2 + d,
+                        [
+                            normalized[2 * pair][r].bitcast(fx.Int32),
+                            normalized[2 * pair + 1][r].bitcast(fx.Int32),
+                        ],
+                    )
+            if lane // 16 == 0:
+                c["put_words"](
+                    c["apart"], base,
+                    [ms[0].bitcast(fx.Int32), ls[0].bitcast(fx.Int32)],
+                )
     gpu.barrier()
     stamp(c["tl_on"], c["tls"], tid, 6)
-    unit_finish(c, normalized, u)
 
 
 @traced
@@ -797,8 +810,13 @@ def stage_combine(c, task):
     ngrp = NKV * c["R"]
     kpw = (nch + WAVES - 1) // WAVES
     # The new-key owner is the last live production-aligned partition.
-    _, _, _, _, _, new_ch = context_tiles(c, j)
-    nact = new_ch + 1
+    _, _, _, t_hi, per, new_ch = context_tiles(c, j)
+    if const_expr(L > 1):
+        # Count every partition through the LAST new token, not only the
+        # partition containing the first token of the verification batch.
+        nact = (t_hi + per - 1) // per
+    else:
+        nact = new_ch + 1
     specs = [(c["qkv"], t * QKV_ROWS + OG_ROW0 + h * HD + lane, 1)]
     lives = [None]
     for k in range_constexpr(kpw):
