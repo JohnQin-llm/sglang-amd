@@ -38,7 +38,7 @@ from sglang.srt.rocm_muse_spark.mono.spec import (
     WINDOW,
     kernel_layers,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 
 def _text_config(config):
@@ -167,6 +167,8 @@ class BuiltMuseOriginal:
             raise ValueError(
                 f"routed width {plan.key.rows} does not match {positions.numel()} rows"
             )
+        if plan.key.tokens_per_request != self.runner.q_len:
+            raise ValueError("MonoKernel query length differs from its compiled plan")
         decoder = self.decoder
         if input_embeds is None:
             embedding = self.model.get_input_embeddings()
@@ -201,12 +203,16 @@ class BuiltMuseOriginal:
                     defer_ffn_boundary=True,
                 )
             if i in decoder.layers_to_capture:
-                aux.append(
-                    boundary.connection(
-                        boundary.stream,
-                        boundary.post_norm(boundary.branch, out_dtype=torch.float32),
-                    ).to(torch.bfloat16)
+                next_norm = (
+                    decoder.norm
+                    if i == len(decoder.layers) - 1
+                    else decoder.layers[i + 1].self_attn.pre_attn_norm
                 )
+                # DFlash consumes the post-layer residual, before the next
+                # layer's input norm. Use the same fused boundary arithmetic
+                # as the native model, including its FP32 accumulation.
+                _, captured_stream = _original_boundary(boundary, next_norm)
+                aux.append(captured_stream.to(torch.bfloat16))
         hidden, _ = _original_boundary(
             boundary,
             decoder.norm,
@@ -228,12 +234,25 @@ class BuiltMuseOriginal:
 def build(model, config, context: BuildContext) -> BuiltMuseOriginal:
     decoder = model.model.language_model
     indices = kernel_layers(config)
+    spec_config = get_spec()
+    q_len = (
+        1
+        if spec_config.speculative_algorithm is None
+        else int(spec_config.speculative_num_draft_tokens)
+    )
+    expected_width = 8 if q_len == 8 else 1
+    if q_len not in (1, 8) or any(w != expected_width for w in context.widths):
+        raise ValueError(
+            "Original Muse kernels require one decode token or one DFlash8 block"
+        )
     compile_errors: list[str] = []
     built_keys = set()
     for i in indices:
         previous_eps = decoder.layers[i - 1].post_ffn_norm.variance_epsilon
         for width in context.widths:
-            for key in layer_keys(decoder.layers[i], width, 1, post_eps=previous_eps):
+            for key in layer_keys(
+                decoder.layers[i], width, q_len, post_eps=previous_eps
+            ):
                 if key in built_keys:
                     continue
                 built_keys.add(key)
@@ -248,7 +267,7 @@ def build(model, config, context: BuildContext) -> BuiltMuseOriginal:
         raise RuntimeError("K1/K2 compile/residency refusal: " + "; ".join(failures))
 
     runner = MonoRunner(torch.device("cuda", torch.cuda.current_device()))
-    runner.q_len = 1
+    runner.q_len = q_len
     runner.first_layer = min(indices)
     kernels: dict[tuple[int, int], MuseLayerKernel] = {}
     for i in indices:

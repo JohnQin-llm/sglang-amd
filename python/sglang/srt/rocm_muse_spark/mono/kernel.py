@@ -136,7 +136,10 @@ class MuseLayerKernel:
 
     def forward(self, positions: torch.Tensor, x: Any, forward_batch, new_step: bool):
         from sglang.srt.rocm_muse_spark.layers import MuseSpark1xResidualStream
-        from sglang.srt.rocm_muse_spark.mono.cache import attention_inputs
+        from sglang.srt.rocm_muse_spark.mono.cache import (
+            attention_inputs,
+            prepare_seq_lens,
+        )
         from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
 
         layer, runner, t = self.layer, self.runner, self.width
@@ -148,7 +151,7 @@ class MuseLayerKernel:
             raise ValueError("MonoKernel sequence-length buffer capacity exceeded")
         seq_lens = runner.seq_lens[: lengths.numel()]
         if new_step:
-            seq_lens.copy_(lengths)
+            seq_lens = prepare_seq_lens(forward_batch, runner.seq_lens, runner.q_len)
         cache = attention_inputs(layer, forward_batch, seq_lens=seq_lens)
         stream, branch = x.stream, x.branch
         if stream.shape[0] != t or branch.shape[0] != t:

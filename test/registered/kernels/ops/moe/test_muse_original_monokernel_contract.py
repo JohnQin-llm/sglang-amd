@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from sglang.srt.mem_cache.memory_pool import MuseMonoMHATokenToKVPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.rocm_muse_spark.layers import (
     MuseSpark1xResidualStream,
     MuseSpark1xRMSNorm,
@@ -18,6 +19,7 @@ from sglang.srt.rocm_muse_spark.model import (
 )
 from sglang.srt.rocm_muse_spark.mono.cache import (
     MonoAttentionInputs,
+    prepare_seq_lens,
     validate_attention_inputs,
 )
 from sglang.srt.rocm_muse_spark.mono.sglang_spec import config_disable_reasons
@@ -25,6 +27,46 @@ from sglang.srt.rocm_muse_spark.mono.spec import kernel_layers
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=10, stage="jit-kernel-unit", runner_config="amd")
+
+
+def test_dflash_kv_lengths_include_verify_block_and_reuse_storage():
+    # The block crosses a 16-token KV page. SGLang supplies the accepted
+    # prefix, whereas K1 derives query i's boundary as total - q_len + i.
+    batch = SimpleNamespace(
+        seq_lens=torch.tensor([15], dtype=torch.int64),
+        forward_mode=ForwardMode.TARGET_VERIFY,
+    )
+    storage = torch.zeros(8, dtype=torch.int32)
+    lengths = prepare_seq_lens(batch, storage, 8)
+    assert lengths.tolist() == [23]
+    assert lengths.data_ptr() == storage.data_ptr()
+    assert (lengths[0] - 8 + torch.arange(8)).tolist() == list(range(15, 23))
+    assert batch.seq_lens.tolist() == [15]
+    batch.seq_lens.fill_(31)
+    replay_lengths = prepare_seq_lens(batch, storage, 8)
+    assert replay_lengths.tolist() == [39]
+    assert replay_lengths.data_ptr() == lengths.data_ptr()
+
+    batch.forward_mode = ForwardMode.DECODE
+    assert prepare_seq_lens(batch, storage, 1).tolist() == [31]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA graph")
+def test_dflash_kv_lengths_read_live_prefix_during_graph_replay():
+    batch = SimpleNamespace(
+        seq_lens=torch.tensor([15], device="cuda", dtype=torch.int64),
+        forward_mode=ForwardMode.TARGET_VERIFY,
+    )
+    storage = torch.zeros(8, device="cuda", dtype=torch.int32)
+    prepare_seq_lens(batch, storage, 8)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = prepare_seq_lens(batch, storage, 8)
+    batch.seq_lens.fill_(31)
+    graph.replay()
+    assert result.tolist() == [39]
+    assert result.data_ptr() == storage.data_ptr()
+    graph.reset()
 
 
 def test_original_router_layout_matches_k2_and_native_math(monkeypatch):

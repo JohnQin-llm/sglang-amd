@@ -17,6 +17,22 @@ class MonoAttentionInputs:
     slot_mapping: torch.Tensor
 
 
+def prepare_seq_lens(forward_batch, buffer: torch.Tensor, q_len: int) -> torch.Tensor:
+    """Write total KV lengths once per step into graph-stable int32 storage.
+
+    Decode lengths already include the current token. DFlash target-verify
+    lengths describe only the accepted prefix; K1 needs the prefix plus the
+    complete draft block to derive each query's causal boundary.
+    """
+    lengths = forward_batch.seq_lens
+    if lengths.numel() > buffer.numel():
+        raise ValueError("MonoKernel sequence-length buffer capacity exceeded")
+    result = buffer[: lengths.numel()]
+    extra = q_len if forward_batch.forward_mode.is_target_verify() else 0
+    torch.add(lengths, extra, out=result)
+    return result
+
+
 def attention_inputs(
     layer, forward_batch, *, seq_lens: torch.Tensor
 ) -> MonoAttentionInputs:
@@ -71,10 +87,15 @@ def validate_attention_inputs(values: MonoAttentionInputs) -> None:
         values.seq_lens,
         values.slot_mapping,
     )
-    if kv.dtype != torch.bfloat16 or kv.dim() != 4 or tuple(kv.shape[1:]) != (
-        2,
-        16,
-        128,
+    if (
+        kv.dtype != torch.bfloat16
+        or kv.dim() != 4
+        or tuple(kv.shape[1:])
+        != (
+            2,
+            16,
+            128,
+        )
     ):
         raise ValueError(
             "Muse MonoKernel KV cache must be BF16 [blocks,2,16,128], got "
