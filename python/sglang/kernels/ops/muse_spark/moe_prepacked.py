@@ -14,6 +14,50 @@ from torch import nn
 from sglang.kernels.ops.muse_spark.moe_align import align_local
 
 
+@torch.no_grad()
+def repartition_tp_experts(weights, group):
+    """Convert unshuffled TP8 expert shards into this rank's 32 EP experts.
+
+    Called only during weight preparation, before graph capture. Every rank
+    contributes its intermediate slice of all experts; each destination keeps
+    a contiguous expert range. The temporary raw EP tensors can be released
+    after preparing the existing AITER layout.
+    """
+    import torch.distributed as dist
+
+    world = dist.get_world_size(group)
+    if world != 8 or len(weights) != 4:
+        raise ValueError("Muse TP-to-EP preparation requires TP8 and four tensors")
+    result = []
+    for index, weight in enumerate(weights):
+        if weight.ndim != 3 or weight.shape[0] != 256:
+            raise ValueError("Expected an unshuffled shard of all 256 experts")
+        if weight.dtype != torch.uint8 or not weight.is_contiguous():
+            raise ValueError("Expert weights and scales must be contiguous uint8")
+        received = torch.empty_like(weight)
+        dist.all_to_all_single(received, weight, group=group)
+        if index < 2:
+            # w13: source rank, expert, gate/up, intermediate slice, K.
+            if weight.shape[1] % 2:
+                raise ValueError("Gate and up shards must have equal size")
+            half, width = weight.shape[1] // 2, weight.shape[2]
+            joined = (
+                received.view(world, 32, 2, half, width)
+                .permute(1, 2, 0, 3, 4)
+                .reshape(32, 2 * world * half, width)
+            )
+        else:
+            # w2: source rank, expert, output column, intermediate slice.
+            height, width = weight.shape[1:]
+            joined = (
+                received.view(world, 32, height, width)
+                .permute(1, 2, 0, 3)
+                .reshape(32, height, world * width)
+            )
+        result.append(joined.contiguous())
+    return tuple(result)
+
+
 @triton.jit
 def _prepare_routes(
     Sorted,

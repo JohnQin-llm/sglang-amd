@@ -893,8 +893,8 @@ class MuseSpark1xMxfp4Experts(nn.Module):
 
     def prepare_prepacked_weights(self) -> None:
         if getattr(self, "original_tp", False):
+            self._prepare_ep_fallback()
             self._prepare_original_tp_weights()
-            self._prepacked_moe = None
             return
         if (
             not envs.SGLANG_MUSE_MOE_PREPACKED.get()
@@ -923,6 +923,62 @@ class MuseSpark1xMxfp4Experts(nn.Module):
             self._prepacked_moe = PrepackedMuseMoE(*weights)
         else:
             self._prepacked_moe.update_weights(*weights)
+
+    def _prepare_ep_fallback(self) -> None:
+        """Retain one EP layout for larger batches alongside the TP Mono layout."""
+        if not envs.SGLANG_MUSE_MONO_EP_FALLBACK.get():
+            self._prepacked_moe = None
+            return
+        parallel = get_parallel()
+        if (
+            not envs.SGLANG_MUSE_MOE_PREPACKED.get()
+            or _moe_backend() != "flydsl"
+            or not self.w13_weight.is_cuda
+            or not getattr(
+                torch.cuda.get_device_properties(self.w13_weight.device),
+                "gcnArchName",
+                "",
+            ).startswith("gfx950")
+            or parallel.tp_size != 8
+            or parallel.moe_ep_size != 1
+            or (self.num_local_experts, self.expert_hidden_size, self.intermediate_size)
+            != (256, 4096, 512)
+        ):
+            raise ValueError("Muse Mono EP fallback requires MI355X TP8 prepacked MoE")
+        if not getattr(self, "original_layout_dirty", True):
+            if self._prepacked_moe is None:
+                raise RuntimeError("Reload raw weights before enabling EP fallback")
+            return
+        from sglang.kernels.ops.muse_spark.moe_prepacked import (
+            PrepackedMuseMoE,
+            repartition_tp_experts,
+        )
+
+        weights = repartition_tp_experts(
+            (
+                self.w13_weight,
+                self.w13_weight_scale,
+                self.w2_weight,
+                self.w2_weight_scale,
+            ),
+            parallel.tp_group.device_group,
+        )
+        if self._prepacked_moe is None:
+            self._prepacked_moe = PrepackedMuseMoE(*weights)
+        else:
+            self._prepacked_moe.update_weights(*weights)
+        self._prepacked_expert_start = parallel.tp_rank * 32
+
+    def uses_prepacked_batch(self, hidden_states: torch.Tensor) -> bool:
+        return (
+            self._prepacked_moe is not None
+            and _moe_backend() == "flydsl"
+            and 16 <= hidden_states.shape[0] <= 256
+            and hidden_states.shape[0] % 8 == 0
+            and hidden_states.shape[1] == 4096
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+        )
 
     @torch.no_grad()
     def _prepare_original_tp_weights(self) -> None:
@@ -1012,25 +1068,13 @@ class MuseSpark1xMxfp4Experts(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
-        if getattr(self, "original_tp", False):
-            return self._forward_original_tp(
-                hidden_states, topk_scores, topk_ids, post_expert_norm
-            )
-        if not _want_fused_moe():
-            raise RuntimeError(
-                "Quark MXFP4 experts require MUSE_MOE_BACKEND=triton or flydsl"
-            )
-        if self._prepacked_moe is not None and _moe_backend() == "flydsl":
+        original_tp = getattr(self, "original_tp", False)
+        if self.uses_prepacked_batch(hidden_states):
             weight, gain, has_norm = _post_expert_norm_args(post_expert_norm)
             # Match the released Muse post-expert norm: zero-centered gamma
             # with unit gain and epsilon 1e-8. Other contracts keep the fallback.
             if (
-                16 <= hidden_states.shape[0] <= 256
-                and hidden_states.shape[0] % 8 == 0
-                and hidden_states.shape[1] == 4096
-                and hidden_states.dtype == torch.bfloat16
-                and hidden_states.is_contiguous()
-                and topk_ids.shape == topk_scores.shape == (hidden_states.shape[0], 8)
+                topk_ids.shape == topk_scores.shape == (hidden_states.shape[0], 8)
                 and has_norm
                 and weight is not None
                 and weight.shape == (4096,)
@@ -1039,13 +1083,28 @@ class MuseSpark1xMxfp4Experts(nn.Module):
                 and gain == 1.0
                 and float(post_expert_norm.eps) == 1e-8
             ):
-                return self._prepacked_moe(
+                output = self._prepacked_moe(
                     hidden_states,
                     topk_scores,
                     topk_ids,
-                    int(local_expert_start),
+                    self._prepacked_expert_start
+                    if original_tp
+                    else int(local_expert_start),
                     weight,
                 )
+                # EP experts finalize their local routes before the single
+                # token-sized reduction. The TP fallback reduces full routes.
+                return (
+                    tensor_model_parallel_all_reduce(output) if original_tp else output
+                )
+        if original_tp:
+            return self._forward_original_tp(
+                hidden_states, topk_scores, topk_ids, post_expert_norm
+            )
+        if not _want_fused_moe():
+            raise RuntimeError(
+                "Quark MXFP4 experts require MUSE_MOE_BACKEND=triton or flydsl"
+            )
         return _run_fused_moe(
             hidden_states,
             topk_scores,
@@ -1236,7 +1295,14 @@ class MuseSpark1xMoE(nn.Module):
             else hidden_states
         )
         if self.pre_expert_norm is not None:
-            if self.original_mono_tp and expert_input.is_cuda:
+            if (
+                self.original_mono_tp
+                and expert_input.is_cuda
+                and not (
+                    isinstance(self.experts, MuseSpark1xMxfp4Experts)
+                    and self.experts.uses_prepacked_batch(expert_input)
+                )
+            ):
                 from sglang.srt.rocm_muse_spark.native_ops.fused_norm_expand import (
                     fused_rmsnorm_expand,
                 )
