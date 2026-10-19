@@ -107,7 +107,7 @@ def default_nch(tokens: int, q_len: int) -> int:
 class K1Build:
     tokens: int  # T rows
     q_len: int  # L rows a request (T = R L)
-    window: int  # 0: full attention; 2048: sliding window
+    window: int  # 0: full attention; 2047/2048: visible causal keys
     rope: bool  # GPT-J RoPE (sliding layers); False: NoPE
     scale: float  # softmax scale: 64 ** -0.5 * qk_scale_factor
     eps: float = 1e-5  # pre_qkv_proj_norm
@@ -166,8 +166,10 @@ def _check_key(key: K1Build) -> None:
         raise ValueError(f"K1: tokens {key.tokens} outside 1..{MAX_TOKENS}")
     if key.tokens % key.q_len:
         raise ValueError(f"K1: q_len {key.q_len} does not divide {key.tokens} rows")
-    if key.window not in (0, WINDOW):
-        raise ValueError(f"K1: window {key.window} (0 or {WINDOW})")
+    # Current SGLang passes an effective 2047-key window; the original
+    # adapter uses 2048. The per-query mask handles either left boundary.
+    if key.window not in (0, WINDOW - 1, WINDOW):
+        raise ValueError(f"K1: window {key.window} (0, {WINDOW - 1}, or {WINDOW})")
     if not (1 <= key.max_len <= MAX_LEN):
         raise ValueError(f"K1: max_len {key.max_len} outside 1..{MAX_LEN}")
     if key.units > BLOCKS:

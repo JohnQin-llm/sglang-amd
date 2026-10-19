@@ -8,7 +8,8 @@ from sglang.test.ci.ci_register import register_amd_ci
 register_amd_ci(est_time=45, stage="jit-kernel-unit", runner_config="amd")
 
 
-def test_verify_partition_boundary_graph_replay():
+@pytest.mark.parametrize("window", [2047, 2048])
+def test_verify_partition_boundary_graph_replay(window):
     if not torch.cuda.is_available() or not torch.version.hip:
         pytest.skip("requires MI355X")
     properties = torch.cuda.get_device_properties(0)
@@ -23,7 +24,7 @@ def test_verify_partition_boundary_graph_replay():
     key = k1.make_key(
         tokens=8,
         q_len=8,
-        window=2048,
+        window=window,
         rope=True,
         scale=0.125,
         eps=1e-5,
@@ -46,7 +47,7 @@ def test_verify_partition_boundary_graph_replay():
         start = 1152 + 64 * head
         weight[start : start + 32, 0] = 1
         weight[start + 32 : start + 64, 1] = 1
-    pages = 80
+    pages = 160
     cache = torch.zeros(pages, 2, 16, 128, device=device, dtype=torch.bfloat16)
     table = ((torch.arange(pages, device=device, dtype=torch.int32) * 7) % pages)[
         None, :
@@ -68,6 +69,10 @@ def test_verify_partition_boundary_graph_replay():
         slots.copy_(table[0, positions // 16].long() * 16 + positions % 16)
         lengths.fill_(prefix + 8)
         cache.zero_()
+        if prefix >= 2040:
+            # A strong value at key zero makes the left-window cutoff observable.
+            # The final query at prefix2040 drops it only for the 2047 window.
+            cache[0, :, 0, 64:96] = 64
 
     def launch():
         advance_epoch_(epoch)
@@ -107,15 +112,33 @@ def test_verify_partition_boundary_graph_replay():
     # Cover an empty prefix, 64-key segments, the previous 192-key boundary,
     # and the transition to 128-key segments at total length 1025. The same
     # graph must observe the live lengths and insert every verification token.
-    for prefix in (0, 56, 57, 63, 64, 184, 185, 191, 192, 1016, 1017, 1023, 1024):
-        expected = (
-            (
-                values.cumsum(0)
-                / torch.arange(prefix + 1, prefix + 9, device=device)[:, None]
-            )
-            .to(torch.bfloat16)
-            .float()
-        )
+    for prefix in (
+        0,
+        56,
+        57,
+        63,
+        64,
+        184,
+        185,
+        191,
+        192,
+        1016,
+        1017,
+        1023,
+        1024,
+        2040,
+        2041,
+        2046,
+        2047,
+        2048,
+        2050,
+    ):
+        numerator = values.cumsum(0)
+        if prefix >= 2040:
+            includes_key_zero = torch.arange(prefix, prefix + 8, device=device) < window
+            numerator[:, :32] += includes_key_zero[:, None] * 64
+        count = torch.arange(prefix + 1, prefix + 9, device=device).clamp_max(window)
+        expected = (numerator / count[:, None]).to(torch.bfloat16).float()
         expected = (
             0.5
             * expected

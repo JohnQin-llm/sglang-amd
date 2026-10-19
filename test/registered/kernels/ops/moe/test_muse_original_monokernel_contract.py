@@ -345,7 +345,8 @@ def test_layer_keys_preserve_native_router_multiplier(multiplier, rows):
         post_attn_norm=norm,
         pre_ffn_norm=norm,
     )
-    _, key = layer_keys(layer, width=rows, q_len=rows)
+    attention_key, key = layer_keys(layer, width=rows, q_len=rows)
+    assert attention_key.window == 2047
     assert key.router_output_multiplier == (1.0 if multiplier is None else multiplier)
     # The original vLLM adapter uses already-scaled router weights.
     del layer.feed_forward.router_multiplier

@@ -29,7 +29,6 @@ from typing import Any
 import torch
 from sglang.srt.monokernels.spec import Plan
 from sglang.srt.rocm_muse_spark.mono.runner import MonoRunner
-from sglang.srt.rocm_muse_spark.mono.spec import WINDOW
 
 
 def _ptr_checked(t: torch.Tensor, name: str) -> torch.Tensor:
@@ -55,7 +54,7 @@ def layer_keys(
     k1_key = k1.make_key(
         tokens=width,
         q_len=q_len,
-        window=WINDOW if a.attn.sliding_window_size > 0 else 0,
+        window=max(0, int(a.attn.sliding_window_size)),
         rope=bool(a.use_rope),
         scale=float(a.scaling),
         eps=a.pre_qkv_proj_norm.variance_epsilon,
