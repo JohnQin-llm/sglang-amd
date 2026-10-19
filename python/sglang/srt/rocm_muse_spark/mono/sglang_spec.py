@@ -12,6 +12,7 @@ from sglang.srt.monokernels.spec import (
     MONOKERNEL_API_VERSION,
     BuildContext,
     DeviceLimits,
+    Feature,
     MonoSpec,
     Numerics,
     NumericsKind,
@@ -75,8 +76,12 @@ def config_disable_reasons(cfg: Any, config: Any) -> list[str]:
     # The frozen source fails the rows=8 qualification gate. Generic enablement
     # therefore remains decode-only; the explicit validation driver can still
     # build and compare its unmodified q8 source.
-    if getattr(cfg, "speculative_algorithm", None) is not None:
-        reasons.append("rows=8 target-verify is not production-qualified")
+    algorithm = getattr(cfg, "speculative_algorithm", None)
+    if algorithm is not None:
+        if algorithm != "DFLASH" or cfg.speculative_num_draft_tokens != 8:
+            reasons.append("the timing probe supports only DFlash block8")
+        if os.getenv("SGLANG_MUSE_ORIGINAL_UNQUALIFIED_DFLASH", "0") != "1":
+            reasons.append("rows=8 target-verify is not production-qualified")
     return reasons
 
 
@@ -286,9 +291,9 @@ def build(model, config, context: BuildContext) -> BuiltMuseOriginal:
 MONO_SPEC = MonoSpec(
     name="Muse original TP8 W4A4 K1+K2",
     devices={
-        "gfx950": DeviceLimits(widths=(1,), tp_sizes=(TP,), resident_blocks=BLOCKS)
+        "gfx950": DeviceLimits(widths=(1, 8), tp_sizes=(TP,), resident_blocks=BLOCKS)
     },
-    features=frozenset(),
+    features=frozenset({Feature.SPECULATIVE_DECODING}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"aiter"}),
