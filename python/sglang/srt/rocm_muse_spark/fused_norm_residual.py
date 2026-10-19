@@ -17,7 +17,6 @@ import logging
 import torch
 import triton
 import triton.language as tl
-
 from sglang.srt.rocm_muse_spark import fused_op_tuning
 from sglang.srt.rocm_muse_spark.base_fused_op import BaseFusedOp
 from sglang.srt.rocm_muse_spark.layers import (
@@ -267,6 +266,24 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
             self._cc_beta = torch.empty(0, dtype=torch.float32, device=device)
         self._cc_empty_fp32 = torch.empty(0, dtype=torch.float32, device=device)
         self._weights_cached = True
+
+    @torch.no_grad()
+    def refresh_cached_weights(self, branch_dtype: torch.dtype) -> None:
+        """Refresh derived values without changing graph-captured addresses."""
+        if not hasattr(self, "_weights_cached"):
+            self._ensure_cached_weights(branch_dtype)
+            return
+        if self._post_norm.has_weight:
+            self._cc_post_weight.copy_(
+                self._post_norm._get_effective_weight().to(branch_dtype)
+            )
+        if self._pre_norm.has_weight:
+            self._cc_pre_weight.copy_(
+                self._pre_norm._get_effective_weight().to(branch_dtype)
+            )
+        if self._use_residual_gate:
+            self._cc_alpha.copy_(self._residual_add.alpha.reshape(-1).float())
+            self._cc_beta.copy_(self._residual_add.beta.reshape(-1).float())
 
     def forward_triton(
         self,

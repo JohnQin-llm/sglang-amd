@@ -3778,6 +3778,76 @@ class PageMajorMHATokenToKVPool(MHATokenToKVPool):
         )
 
 
+class MuseMonoMHATokenToKVPool(MHATokenToKVPool):
+    """Single-allocation BF16 K|V pages shared by native attention and K1.
+
+    Each layer owns ``[block, kv_head, token, K|V]``.  The ordinary backend
+    receives page-major K and V views; K1 receives the combined tensor.  No
+    shadow cache or per-step cache copy exists.
+    """
+
+    def __init__(self, *args, enable_kv_cache_copy: bool = False, **kwargs):
+        super().__init__(*args, enable_kv_cache_copy=False, **kwargs)
+
+    def _create_buffers(self):
+        if self.dtype != torch.bfloat16 or self.store_dtype != torch.bfloat16:
+            raise ValueError("Muse MonoKernel KV pool requires BF16 storage")
+        if self.page_size != 16 or self.head_num != 2:
+            raise ValueError("Muse MonoKernel KV pool requires page16 and 2 KV heads")
+        if self.head_dim != 64 or self.v_head_dim != 64:
+            raise ValueError("Muse MonoKernel KV pool requires K/V head dimension 64")
+        if self.post_capture_active or self.is_quantized_kv_cache:
+            raise ValueError("Muse MonoKernel does not support deferred or quantized KV")
+        total_slots = self.size + self.page_size
+        if total_slots % self.page_size:
+            raise ValueError("Muse MonoKernel KV capacity must be page aligned")
+        self.use_hnd = True
+        self.num_pages = total_slots // self.page_size
+        self.kv_cache_layout = "muse_mono_kv128"
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            self._muse_kv_buffer = [
+                torch.zeros(
+                    (self.num_pages, self.head_num, self.page_size, 128),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+        self.k_buffer = [buf[..., :64] for buf in self._muse_kv_buffer]
+        self.v_buffer = [buf[..., 64:] for buf in self._muse_kv_buffer]
+        self.k_scale_buffer = self.v_scale_buffer = None
+        self.native_k_scale_buffer = self.native_v_scale_buffer = None
+        self.dq_k_buffer = self.dq_v_buffer = None
+        self._kv_buffer_descs = []
+        self._init_data_ptrs_and_strides()
+
+    def get_key_buffer(self, layer_id: int):
+        local = layer_id - self.start_layer
+        return self.k_buffer[local].permute(0, 2, 1, 3)
+
+    def get_value_buffer(self, layer_id: int):
+        local = layer_id - self.start_layer
+        return self.v_buffer[local].permute(0, 2, 1, 3)
+
+    def get_muse_mono_buffer(self, layer_id: int) -> torch.Tensor:
+        return self._muse_kv_buffer[layer_id - self.start_layer]
+
+    def get_kv_size_bytes(self):
+        total = get_tensor_size_bytes(self._muse_kv_buffer)
+        # Preserve the base API's (K bytes, V bytes) accounting without double
+        # counting the shared backing.
+        return total // 2, total - total // 2
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError("Muse MonoKernel KV does not support disaggregation")
+
+    def get_cpu_copy(self, *args, **kwargs):
+        raise NotImplementedError("Muse MonoKernel KV does not support CPU offload")
+
+    def load_cpu_copy(self, *args, **kwargs):
+        raise NotImplementedError("Muse MonoKernel KV does not support CPU offload")
+
+
 class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
     """MHA KV cache pool for MXFP8 block-scaled FP8.
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -73,6 +74,7 @@ from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MHATokenToKVPool,
     MHATokenToKVPoolMXFP8,
+    MuseMonoMHATokenToKVPool,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
@@ -1624,10 +1626,29 @@ class KVCacheConfigurator:
         # default keeps upstream's per-layer layout. The Mamba state pool is routed
         # separately via `mamba_envelope_layout` on the req-to-token pool above.
         enable_page_major = self._page_major_enabled()
+        architectures = set(self.model_config.hf_config.architectures or ())
+        use_muse_mono = (
+            not self.is_draft_worker
+            and bool(
+                architectures
+                & {"MuseSparkForConditionalGeneration", "MuseSpark1xForCausalLM"}
+            )
+            and (
+                os.getenv("SGLANG_MUSE_ORIGINAL_NATIVE_ONLY", "0") == "1"
+                or (
+                    get_context().is_config_namespace_published("exec")
+                    and get_exec().kernel.monokernel_backend == "flydsl"
+                )
+            )
+        )
         mha_pool_class = self._resolve_kv_pool_class(
             kind="mha",
             default=(
-                PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
+                MuseMonoMHATokenToKVPool
+                if use_muse_mono
+                else PageMajorMHATokenToKVPool
+                if enable_page_major
+                else MHATokenToKVPool
             ),
         )
         mla_pool_class = self._resolve_kv_pool_class(

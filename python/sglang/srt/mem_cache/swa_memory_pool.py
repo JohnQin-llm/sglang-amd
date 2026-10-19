@@ -230,6 +230,16 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
+    def get_muse_mono_buffer(self, layer_id: int) -> torch.Tensor:
+        """Return K1's shared K|V page tensor from the selected sub-pool."""
+        self._wait_for_layer(layer_id)
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        pool = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        getter = getattr(pool, "get_muse_mono_buffer", None)
+        if getter is None:
+            raise ValueError("Muse MonoKernel requires Muse pools on both SWA rails")
+        return getter(layer_id_pool)
+
     def get_kv_scale_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]

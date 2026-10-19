@@ -199,7 +199,8 @@ def install_monokernel_forward(
     _install_forward(
         model=model, built=built, served=served, spec=spec, backend=backend
     )
-    # Captured kernels retain weight copies that online updates cannot refresh.
+    # Captured kernels retain state that generic online updates cannot refresh
+    # safely without a spec-level update protocol.
     model._derived_weight_cache_error = (
         f"Online weight updates are not supported with --monokernel-backend {backend} "
         f"({spec.name})"
