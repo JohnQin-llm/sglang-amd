@@ -268,6 +268,24 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
     _assert_owned(moe.GATHER_TASKS, k2.G0)
     assert moe.MAX_U * moe.UG_GROUPS // moe.UG_UNITS == moe.UG_TASKS_MAX
 
+    # Global W13 descriptors are byte bounded.  The final vector/dword of the
+    # final expert reaches, but never crosses, its layout-derived extent.
+    assert moe.W13_BYTES == moe.E * (2 * moe.RI) * moe.W13_K // 2
+    last_w13_dword_end = (
+        (moe.E - 1) * (2 * moe.RI * moe.W13_K // 8)
+        + ((2 * moe.RI) // moe.ROWS - 1) * (2 * moe.W13_K)
+        + (moe.W13_STEPS - 1) * 256
+        + 63 * 4
+        + 4
+    )
+    assert last_w13_dword_end * 4 == moe.W13_BYTES
+    assert moe.W13_SCALE_BYTES == moe.E * (2 * moe.RI) * moe.W13_SCALE_G
+    last_scale_dword = moe.scale_dword(
+        moe.E * (2 * moe.RI) - 1, moe.W13_SCALE_G - 1, moe.W13_SCALE_G
+    )
+    assert (last_scale_dword + 1) * 4 == moe.W13_SCALE_BYTES
+    assert max(moe.W13_BYTES, moe.W13_SCALE_BYTES) <= 0x7FFFFFFF
+
     nodes = (
         "oproj_ar_publish",
         "seam_msq1_put",

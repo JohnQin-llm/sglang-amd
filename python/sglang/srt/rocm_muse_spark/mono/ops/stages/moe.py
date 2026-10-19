@@ -117,6 +117,8 @@ assert P_K == R_K
 W13_K = MH  # 4096
 W13_STEPS = W13_K // 128  # 32
 W13_SCALE_G = W13_K // 32  # 128 scale columns a w13 row
+W13_BYTES = E * (2 * RI) * W13_K // 2  # packed MXFP4 [E, 2RI, K]
+W13_SCALE_BYTES = E * (2 * RI) * W13_SCALE_G  # E8M0 [E, 2RI, K/32]
 W2_STEPS = RI // 128  # 4
 W2_SCALE_G = RI // 32  # 16
 UG_GROUPS = RI // 32  # 16 32-column groups a picked expert
@@ -600,7 +602,7 @@ def ug_loads(c, task, units=UG_UNITS):
     slot, _g, rg = ug_tile(c, task, units)
     active = c["wave"] < 4 * units
     e = uniform(fx.ptr_load(rt["expert"] + slot))
-    r_w = rsrc(a["w13"])
+    r_w = rsrc(a["w13"], W13_BYTES)
     base = e * (2 * RI * W13_K // 8)
     av = [
         fx.Vector(
@@ -615,7 +617,7 @@ def ug_loads(c, task, units=UG_UNITS):
         )
         for st in range(W13_STEPS)
     ]
-    r_s = rsrc(a["w13s"])
+    r_s = rsrc(a["w13s"], W13_SCALE_BYTES)
     m = e * (2 * RI) + rg * ROWS + lane % 16
     sw = [
         fx.Int32(
