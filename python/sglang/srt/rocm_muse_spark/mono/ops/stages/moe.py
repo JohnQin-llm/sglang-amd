@@ -40,6 +40,7 @@ import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
+
 from sglang.srt.rocm_muse_spark.mono.ops.common.mx import (
     FP4,
     UNIT_SCALE,
@@ -55,6 +56,7 @@ from sglang.srt.rocm_muse_spark.mono.ops.common.ops import (
     bf_lo,
     block_excl_scan,
     butterfly,
+    fresh,
     hw_exp2,
     hw_rsq,
     lanes_below,
@@ -69,6 +71,7 @@ from sglang.srt.rocm_muse_spark.mono.ops.common.plan import (
     BLOCKS,
     THREADS,
     WAVES,
+    enter_stage,
     pair_layout,
 )
 from sglang.srt.rocm_muse_spark.mono.ops.common.sync import publish
@@ -121,6 +124,8 @@ W13_BYTES = E * (2 * RI) * W13_K // 2  # packed MXFP4 [E, 2RI, K]
 W13_SCALE_BYTES = E * (2 * RI) * W13_SCALE_G  # E8M0 [E, 2RI, K/32]
 W2_STEPS = RI // 128  # 4
 W2_SCALE_G = RI // 32  # 16
+W2_BYTES = E * MH * RI // 2  # packed MXFP4 [E, MH, RI]
+W2_SCALE_BYTES = E * MH * W2_SCALE_G  # E8M0 [E, MH, RI/32]
 UG_GROUPS = RI // 32  # 16 32-column groups a picked expert
 UG_UNITS = 2  # 32-column groups a CTA task (4 waves each)
 UG_SINGLE_GROUP_ROWS = (2,)
@@ -141,9 +146,11 @@ XQ_W = MH // 8  # 512 E2M1 words an xe row
 XQ_G = MH // 32  # 128 scale codes an xe row
 XQ0 = 8  # the xe quantizing CTAs: XQ0 + t for token t
 UG_TASKS_BASE = MAX_U * UG_GROUPS // UG_UNITS  # 512
-UG_TASKS_MAX = UG_TASKS_BASE  # both adaptive q8 branches are bounded by 512
+UG_TASKS_MAX = UG_TASKS_BASE  # default builds retain the inherited 512 flags
+UG_TASKS_WAVE_SPLITK = MAX_U * UG_GROUPS  # opt-in q8: one group per task
 FIN_BATCH = 32  # YR pairs a fin poll round
 assert UG_TASKS_MAX <= THREADS
+assert UG_TASKS_WAVE_SPLITK == 2 * THREADS
 
 
 def ug_units(s):
@@ -151,8 +158,12 @@ def ug_units(s):
     return 1 if s in UG_SINGLE_GROUP_ROWS else UG_UNITS
 
 
-def ug_task_capacity(s):
-    """UGRDY capacity; the adaptive q8 threshold keeps every path <= 512."""
+def ug_task_capacity(s, *, wave_splitk=False):
+    """UGRDY capacity; only the opt-in q8 split-K build needs 1024 flags."""
+    if wave_splitk:
+        if s != 8:
+            raise ValueError("wave_splitk is restricted to tokens == 8")
+        return UG_TASKS_WAVE_SPLITK
     return UG_TASKS_BASE
 
 
@@ -168,13 +179,13 @@ def peer_pairs(s):
     }
 
 
-def scratch_pairs(s):
+def scratch_pairs(s, *, wave_splitk=False):
     return {
         "rpart": R_TASKS * s * WAVES,
         "ppart": P_TASKS * s * ROWS,
         "route": s * 2 * TOPK,
         "xqrdy": s,
-        "ugrdy": ug_task_capacity(s),
+        "ugrdy": ug_task_capacity(s, wave_splitk=wave_splitk),
         "fmsq": FIN_TASKS * s * TOPK,
         "frdy": FIN_TASKS,
     }
@@ -191,8 +202,8 @@ def scratch_plain(s):
     }
 
 
-def scratch_layout(s: int, start: int = 0) -> dict:
-    lay = pair_layout(scratch_pairs(s).items(), start=start)
+def scratch_layout(s: int, start: int = 0, *, wave_splitk=False) -> dict:
+    lay = pair_layout(scratch_pairs(s, wave_splitk=wave_splitk).items(), start=start)
     for name, n in scratch_plain(s).items():
         end = max(o + m for o, m in lay.values())
         lay[name] = ((end + 15) // 16 * 16, n)
@@ -239,8 +250,12 @@ def scale_shift(m, g):
 def early_x(c, q):
     """The x rows' K part q -> LDS after that part's slices are XRDY."""
     tid = c["tid"]
-    if tid < c["nsl"] // R_PARTS:
-        c["poll"]([(c["xrdy"], q * (c["nsl"] // R_PARTS) + tid, 1)])
+    if const_expr(c["quarter_seam"]):
+        if tid < c["S"]:
+            c["poll"]([(c["xrdy"], tid * R_PARTS + q, 1)])
+    else:
+        if tid < c["nsl"] // R_PARTS:
+            c["poll"]([(c["xrdy"], q * (c["nsl"] // R_PARTS) + tid, 1)])
     gpu.barrier()
     gemv.rows_to_lds(
         tid,
@@ -483,6 +498,9 @@ def load_route(c):
         j = tid + THREADS * i
         if j < MAX_U * 8:
             fx.ptr_store(fx.Int32(-1), rt["kof"] + j)
+    if const_expr(c["experimental_two_cta"]):  # noqa: SIM102
+        if tid < MAX_U:
+            fx.ptr_store(fx.Int32(0), rt["expert"] + tid)
     gpu.barrier()
     if tid < s * TOPK:
         t = tid // TOPK
@@ -634,33 +652,59 @@ def ug_loads(c, task, units=UG_UNITS):
     return av + sw
 
 
-@traced
-def stage_ug(c, task, ops, units=UG_UNITS):
-    """Task ``task``: one or two 32-column groups, a wave a 16-row tile against
-    the MXFP4 xe (one MFMA chain over K); silu(g) u; MXFP4 a 32-group -> INTER /
-    ISC of each picking token."""
-    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
-    rt = c["rt"]
-    _slot, _g, rg = ug_tile(c, task, units)
-    av = ops[:W13_STEPS]
-    sw = ops[W13_STEPS:]
-    t = fx.min(lane % 16, s - 1)
-    kb = lane // 16
-    if wave < 4 * units:
-        acc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for st in range_constexpr(W13_STEPS):
-            bw = fx.Vector(
-                fx.ptr_load(
-                    c["xq"] + (t * XQ_W + st * 16 + kb * 4),
-                    result_type=fx.Vector.make_type(4, fx.Int32),
-                )
+def ug_wave_splitk_loads(c, task):
+    """Candidate W13 operands with wave-uniform terms in scalar offsets."""
+    lane, wave = c["lane"], c["wave"]
+    a, rt = c["args"], c["rt"]
+    slot = task // UG_GROUPS
+    group = task % UG_GROUPS
+    tile = wave % 4
+    half = wave // 4
+    rg = (tile // 2) * (RI // ROWS) + 2 * group + tile % 2
+    e = uniform(fx.ptr_load(rt["expert"] + slot))
+    r_w = rsrc(a["w13"], W13_BYTES)
+    av = [
+        fx.Vector(
+            bo.buffer_load(
+                r_w,
+                lane * 4,
+                vec_width=4,
+                dtype=T.i32,
+                cache_modifier=CM_NT,
+                soffset_bytes=uniform(
+                    (
+                        e * (2 * RI * W13_K // 8)
+                        + rg * (2 * W13_K)
+                        + (half * 16 + i) * 256
+                    )
+                    * 4
+                ).ir_value(),
             )
-            sb = fx.ptr_load(c["xsc"] + (t * XQ_G + st * 4 + kb))
-            sa = (sw[st // 2] >> ((st % 2) * 16 + (rg % 2) * 8)) & 0xFF
-            acc = mfma_scaled(av[st], bw, acc, sa, sb, FP4, FP4, 0, 0)
-        fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+        )
+        for i in range(16)
+    ]
+    r_s = rsrc(a["w13s"], W13_SCALE_BYTES)
+    m = e * (2 * RI) + rg * ROWS + lane % 16
+    sw = [
+        fx.Int32(
+            bo.buffer_load(
+                r_s,
+                scale_dword(m, (half * 8 + sp) * 8 + lane // 16, W13_SCALE_G),
+                vec_width=1,
+                dtype=T.i32,
+            )
+        )
+        for sp in range(8)
+    ]
+    return av + sw
+
+
+@traced
+def _stage_ug_epilogue(c, task, units=UG_UNITS):
+    """Shared, bit-identical SiLU/BF16/MXFP4 epilogue for both W13 paths."""
+    s, tid, red = c["S"], c["tid"], c["red"]
+    rt = c["rt"]
     gpu.barrier()
-    # thread (unit, token, column): g / u of its tile row, silu(g) u
     active_thread = tid < 256 * units
     u = fx.min(tid // 256, units - 1)
     tt = (tid % 256) // 32
@@ -672,11 +716,8 @@ def stage_ug(c, task, ops, units=UG_UNITS):
     gv = fx.ptr_load(red + (((4 * u + half) * 64 + 16 * (r // 4) + tt) * 4 + r % 4))
     uv = fx.ptr_load(red + (((4 * u + 2 + half) * 64 + 16 * (r // 4) + tt) * 4 + r % 4))
     v = mxq.silu_mul(gv, uv)
-    # Current serving AITER uses a two-stage q8 expert path: stage 1 stores
-    # SiLU(gate) * up as BF16, then a separate kernel derives the MXFP4
-    # scale/codes from that BF16 tensor.  The frozen original flat kernel
-    # quantizes its FP32 epilogue directly; keep that arithmetic for one-row
-    # decode.  This width guard intentionally also changes a q1C8 batch.
+    # Match the native two-stage q8 BF16 boundary before MXFP4 quantization.
+    # Narrower widths preserve the original monokernel arithmetic.
     if s == 8:
         v = bf16_round(v)
     amax = butterfly(abs(v), (16, 8, 4, 2, 1), fx.max)
@@ -705,6 +746,72 @@ def stage_ug(c, task, ops, units=UG_UNITS):
 
 
 @traced
+def stage_ug(c, task, ops, units=UG_UNITS):
+    """Task ``task``: one or two 32-column groups, a wave a 16-row tile against
+    the MXFP4 xe (one MFMA chain over K); silu(g) u; MXFP4 a 32-group -> INTER /
+    ISC of each picking token."""
+    s, lane, wave, red = c["S"], c["lane"], c["wave"], c["red"]
+    _slot, _g, rg = ug_tile(c, task, units)
+    av = ops[:W13_STEPS]
+    sw = ops[W13_STEPS:]
+    t = fx.min(lane % 16, s - 1)
+    kb = lane // 16
+    if wave < 4 * units:
+        acc = fx.Vector.filled(4, 0.0, fx.Float32)
+        for st in range_constexpr(W13_STEPS):
+            bw = fx.Vector(
+                fx.ptr_load(
+                    c["xq"] + (t * XQ_W + st * 16 + kb * 4),
+                    result_type=fx.Vector.make_type(4, fx.Int32),
+                )
+            )
+            sb = fx.ptr_load(c["xsc"] + (t * XQ_G + st * 4 + kb))
+            sa = (sw[st // 2] >> ((st % 2) * 16 + (rg % 2) * 8)) & 0xFF
+            acc = mfma_scaled(av[st], bw, acc, sa, sb, FP4, FP4, 0, 0)
+        fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+    _stage_ug_epilogue(c, task, units)
+
+
+@traced
+def stage_ug_wave_splitk(c, task, ops):
+    """One group with two native-FP4 K halves combined in FP32 in LDS."""
+    s, lane, wave, red = c["S"], c["lane"], c["wave"], c["red"]
+    group = task % UG_GROUPS
+    tile = wave % 4
+    half = wave // 4
+    rg = (tile // 2) * (RI // ROWS) + 2 * group + tile % 2
+    t = fx.min(lane % 16, s - 1)
+    kb = lane // 16
+    av = ops[:16]
+    sw = ops[16:]
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    for i in range_constexpr(16):
+        st = half * 16 + i
+        bw = fx.Vector(
+            fx.ptr_load(
+                c["xq"] + (t * XQ_W + st * 16 + kb * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+        )
+        sb = fx.ptr_load(c["xsc"] + (t * XQ_G + st * 4 + kb))
+        sa = (sw[i // 2] >> ((st % 2) * 16 + (rg % 2) * 8)) & 0xFF
+        acc = mfma_scaled(av[i], bw, acc, sa, sb, FP4, FP4, 0, 0)
+    roff = (wave * 64 + lane) * 4
+    fx.ptr_store(acc, red + roff)
+    gpu.barrier()
+    if wave < 4:
+        other = fx.Vector(
+            fx.ptr_load(
+                red + ((wave + 4) * 64 + lane) * 4,
+                result_type=fx.Vector.make_type(4, fx.Float32),
+            )
+        )
+        fx.ptr_store(acc + other, red + roff)
+    # The epilogue's entry barrier completes the required post-combine fence.
+    _stage_ug_epilogue(c, task, 1)
+
+
+@traced
 def run_ug(c, nu, units=UG_UNITS):
     """Every ug task of this CTA: tasks 255 - bid, + 256, ...: the leftover
     tasks of a round go to the high CTAs, whose early work ends first."""
@@ -726,6 +833,164 @@ def run_ug_q8(c, nu):
 
 
 # ---------------------------------------------------------------- down
+@traced
+def load_expert_inter(c, slot):
+    """Wait for this expert's 16 one-group publications and stage its rows.
+
+    Only the current expert's picked-token INTER/ISC rows enter LDS.  Unpicked
+    rows use zero data and unit scale; bounded descriptors and masked loads
+    prevent reads from a different route or a future slot.
+    """
+    s, tid = c["S"], c["tid"]
+    if tid < UG_GROUPS:
+        c["poll"]([(c["ugrdy"], slot * UG_GROUPS + tid, 1)])
+    gpu.barrier()
+
+    t = tid // INTER_W
+    w = tid % INTER_W
+    k = fx.ptr_load(c["rt"]["kof"] + (slot * 8 + t))
+    picked = k >= 0
+    pick = t * TOPK + fx.max(k, 0)
+    iv = fx.Int32(
+        bo.buffer_load(
+            rsrc(c["interb"], s * TOPK * INTER_W * 4),
+            pick * INTER_W + w,
+            vec_width=1,
+            dtype=T.i32,
+            cache_modifier=CM_DEV,
+            mask=picked,
+        )
+    )
+    fx.ptr_store(picked.select(iv, fx.Int32(0)), c["interq"] + t * INTER_W + w)
+
+    if tid < s * UG_GROUPS:
+        st = tid // UG_GROUPS
+        g = tid % UG_GROUPS
+        sk = fx.ptr_load(c["rt"]["kof"] + (slot * 8 + st))
+        scaled = sk >= 0
+        spick = st * TOPK + fx.max(sk, 0)
+        sv = fx.Int32(
+            bo.buffer_load(
+                rsrc(c["iscb"], s * TOPK * UG_GROUPS * 4),
+                spick * UG_GROUPS + g,
+                vec_width=1,
+                dtype=T.i32,
+                cache_modifier=CM_DEV,
+                mask=scaled,
+            )
+        )
+        fx.ptr_store(
+            scaled.select(sv, fx.Int32(UNIT_SCALE)),
+            c["intsc"] + st * UG_GROUPS + g,
+        )
+    gpu.barrier()
+
+
+def expert_down_loads(c, slot, rgd):
+    """Candidate W2 operands with wave-uniform terms in scalar offsets."""
+    lane = c["lane"]
+    r_w = rsrc(c["args"]["w2"], W2_BYTES)
+    r_s = rsrc(c["args"]["w2s"], W2_SCALE_BYTES)
+    e = uniform(fx.ptr_load(c["rt"]["expert"] + slot))
+    av = [
+        fx.Vector(
+            bo.buffer_load(
+                r_w,
+                lane * 4,
+                vec_width=4,
+                dtype=T.i32,
+                cache_modifier=CM_NT,
+                soffset_bytes=uniform(
+                    (e * (MH * RI // 8) + rgd * (2 * RI) + st * 256) * 4
+                ).ir_value(),
+            )
+        )
+        for st in range(W2_STEPS)
+    ]
+    sw = [
+        fx.Int32(
+            bo.buffer_load(
+                r_s,
+                scale_dword(
+                    e * MH + rgd * ROWS + lane % 16,
+                    sp * 8 + lane // 16,
+                    W2_SCALE_G,
+                ),
+                vec_width=1,
+                dtype=T.i32,
+            )
+        )
+        for sp in range(W2_STEPS // 2)
+    ]
+    return av + sw
+
+
+def expert_stage_context(c):
+    """Rematerialize only thread-derived addresses at one pipeline stage."""
+    stage_c = c.copy()
+    tid = fresh(c["tid"])
+    stage_c["tid"] = tid
+    stage_c["lane"] = tid % 64
+    stage_c["wave"] = uniform(tid // 64)
+    return stage_c
+
+
+@traced
+def stage_down_expert(c, slot, rgd, ops):
+    """One expert and one wave-owned W2 tile -> direct bf16 YR partials."""
+    s, lane = c["S"], c["lane"]
+    t = fx.min(lane % 16, s - 1)
+    kb = lane // 16
+    k = fx.ptr_load(c["rt"]["kof"] + (slot * 8 + t))
+    picked = (k >= 0) & (lane % 16 < s)
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    for st in range_constexpr(W2_STEPS):
+        bw = fx.Vector(
+            fx.ptr_load(
+                c["interq"] + (t * INTER_W + st * 16 + kb * 4),
+                result_type=fx.Vector.make_type(4, fx.Int32),
+            )
+        )
+        sb = fx.ptr_load(c["intsc"] + (t * UG_GROUPS + st * 4 + kb))
+        sw = ops[W2_STEPS + st // 2]
+        sa = (sw >> ((st % 2) * 16 + (rgd % 2) * 8)) & 0xFF
+        acc = mfma_scaled(ops[st], bw, acc, sa, sb, FP4, FP4, 0, 0)
+    if picked:
+        c["put_bf"](
+            c["yr_owner"],
+            (c["rank"] * s * TOPK + t * TOPK + k) * MH + rgd * ROWS + 4 * (lane // 16),
+            [bf16_round(acc[i]) for i in range(4)],
+        )
+    gpu.barrier()
+
+
+@traced
+def run_expert_wave_pipeline(c, nu):
+    """Joint q8 schedule: 32 teams of 16 CTAs, one expert at a time.
+
+    Each member publishes one native-FP4 wave-K UG group.  The team waits only
+    for those 16 groups, then each member computes 16 distinct W2 tiles.  A CTA
+    completes down before reusing expert-local LDS for its next ``slot + 32``.
+    """
+    team = c["bid"] // 16
+    member = c["bid"] % 16
+    slot = team
+    while slot < nu:
+        task = slot * UG_GROUPS + member
+        ug_c = expert_stage_context(c)
+        stage_ug_wave_splitk(ug_c, task, ug_wave_splitk_loads(ug_c, task))
+        enter_stage("inter_wait")
+        inter_c = expert_stage_context(c)
+        load_expert_inter(inter_c, slot)
+        c["stamp"](16)
+        enter_stage("down")
+        for it in range_constexpr(2):
+            down_c = expert_stage_context(c)
+            rgd = member * 16 + down_c["wave"] + 8 * it
+            stage_down_expert(down_c, slot, rgd, expert_down_loads(down_c, slot, rgd))
+        slot = slot + 32
+
+
 @traced
 def load_inter(c, nu, units=UG_UNITS):
     """Every ug task's UGRDY flag (a thread a task), then the picks' plain
@@ -953,6 +1218,88 @@ def stage_fin_token(c, j, t):
     lane, wave = c["lane"], c["wave"]
     if wave == 0:
         _stage_fin_wave(c, j, t, j * FIN_COLS + 2 * lane, True)
+    gpu.barrier()
+
+
+@traced
+def stage_fin_routes(c, j, t):
+    """Finalize one q8 ``(128-column slice, token)`` with one route/wave.
+
+    Each wave consumes one route. Wave 0 performs the original ordered top-k
+    accumulation after all eight routes stage ``(x0, x1, scale)`` in ``red``.
+    """
+    s, lane, wave, red = c["S"], c["lane"], c["wave"], c["red"]
+    a, rt = c["args"], c["rt"]
+    col = j * FIN_COLS + 2 * lane
+    wp = fx.Int32(bo.buffer_load(rsrc(a["w_post"]), col // 2, vec_width=1, dtype=T.i32))
+    w0 = bf_lo(wp) + fx.Float32(1.0)
+    w1 = bf_hi(wp) + fx.Float32(1.0)
+
+    got = c["poll"](
+        [
+            (
+                c["peer"]["yr_own"],
+                (((src * s + t) * TOPK + wave) * MH + col) // 2,
+                1,
+            )
+            for src in range_constexpr(TP)
+        ],
+        batch=FIN_BATCH,
+    )
+    c["stamp"](14)
+    lo, hi = bf_lo(got[0][0]), bf_hi(got[0][0])
+    for src in range_constexpr(1, TP):
+        lo = lo + bf_lo(got[src][0])
+        hi = hi + bf_hi(got[src][0])
+    x0 = bf16_round(lo) * w0
+    x1 = bf16_round(hi) * w1
+    sq = wave_sum(x0 * x0 + x1 * x1)
+    if lane == 0:
+        for p in range_constexpr(TP):
+            c["put"](
+                c["peer"]["owned_fmsq"][p],
+                (j * s + t) * TOPK + wave,
+                sq,
+            )
+
+    q = lane % FIN_TASKS
+    norms = c["poll"](
+        [
+            (
+                c["peer"]["owned_fmsq_own"],
+                (q * s + t) * TOPK + wave,
+                1,
+            )
+        ]
+    )
+    c["stamp"](15)
+    v = (lane < FIN_TASKS).select(f32_of(norms[0][0]), fx.Float32(0.0))
+    total = wave_sum(v)
+    tw = fx.ptr_load(rt["route"] + (t * 2 * TOPK + TOPK + wave)).bitcast(fx.Float32)
+    scale = hw_rsq(total * fx.Float32(1.0 / MH) + fx.Float32(c["eps_post"])) * tw
+    roff = (wave * 64 + lane) * 3
+    fx.ptr_store(x0, red + roff)
+    fx.ptr_store(x1, red + roff + 1)
+    fx.ptr_store(scale, red + roff + 2)
+    gpu.barrier()
+
+    if wave == 0:
+        f0 = fx.Float32(0.0)
+        f1 = fx.Float32(0.0)
+        for k in range_constexpr(TOPK):
+            koff = (k * 64 + lane) * 3
+            kx0 = fx.ptr_load(red + koff)
+            kx1 = fx.ptr_load(red + koff + 1)
+            kscale = fx.ptr_load(red + koff + 2)
+            f0 = f0 + kx0 * kscale
+            f1 = f1 + kx1 * kscale
+        fw = (
+            fx.Vector.from_elements([f0, f1], fx.Float32)
+            .to(fx.BFloat16)
+            .bitcast(fx.Int32)
+        )
+        for p in range_constexpr(TP):
+            c["put_words"](c["peer"]["owned_fin"][p], (t * MH + col) // 2, [fw[0]])
     gpu.barrier()
 
 

@@ -18,9 +18,8 @@ import flydsl.expr as fx
 import torch
 from flydsl.expr import const_expr
 
-from sglang.srt.rocm_muse_spark.mono.runtime.abi import RECORD_WORDS
 from sglang.srt.rocm_muse_spark.mono.ops.common.ops import memrealtime, traced
-from sglang.srt.rocm_muse_spark.mono.ops.common.plan import BLOCKS
+from sglang.srt.rocm_muse_spark.mono.runtime.abi import RECORD_WORDS
 
 
 @traced
@@ -69,7 +68,8 @@ def given_up_waits(health: torch.Tensor, names) -> list[str]:
     """Each CTA's first wait that gave up, the earliest first, from a rank's
     ``health`` words; ``names`` the regions a record may name."""
     by_id = {region_id(n): n for n in names}
-    records = health.view(BLOCKS + 1, RECORD_WORDS)[1:]
+    assert health.numel() % RECORD_WORDS == 0
+    records = health.view(-1, RECORD_WORDS)[1:]
     records = records[records[:, 0] != 0].tolist()
     t0 = min((r[6] for r in records), default=0)
     return [

@@ -27,6 +27,7 @@ import json
 from typing import Any
 
 import torch
+
 from sglang.srt.monokernels.spec import Plan
 from sglang.srt.rocm_muse_spark.mono.runner import MonoRunner
 
@@ -44,6 +45,7 @@ def layer_keys(
     fault: dict | None = None,
     *,
     post_eps: float | None = None,
+    experimental_two_cta: bool = False,
 ):
     """The K1 and K2 build keys of ``layer`` at ``width`` rows."""
     from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
@@ -69,6 +71,7 @@ def layer_keys(
     )
     k2_key = k2.make_key(
         tokens=width,
+        experimental_two_cta=experimental_two_cta,
         eps_post_attn=layer.post_attn_norm.variance_epsilon,
         eps_ffn=layer.pre_ffn_norm.variance_epsilon,
         eps_pre_expert=m.pre_expert_norm.variance_epsilon,
@@ -87,8 +90,8 @@ def layer_keys(
 
 def compile_checked(key) -> list[str]:
     """Compiles one build without launching it, then the residency proof: the
-    runtime's occupancy of its kernel must hold the whole grid (one CTA a CU,
-    all resident) with no private scratch. Returns problems (empty: launchable).
+    runtime's occupancy must hold the selected whole grid resident, with no
+    private scratch. Returns problems (empty: launchable).
 
     SGPR-to-VGPR spills can still occur and are reported separately in the
     compiled kernel resources.
@@ -103,7 +106,8 @@ def compile_checked(key) -> list[str]:
     found = residency(mod.build(key), THREADS)
     if not found:
         return [f"{type(key).__name__}: no code object to check"]
-    return [p for r in found for p in r.problems(BLOCKS, cus)]
+    blocks = BLOCKS if mod is k1 else k2.grid_blocks(key)
+    return [p for r in found for p in r.problems(blocks, cus)]
 
 
 class MuseLayerKernel:
@@ -128,6 +132,7 @@ class MuseLayerKernel:
             runner.q_len,
             runner.fault,
             post_eps=runner.prev_post_eps.get(layer.layer_idx),
+            experimental_two_cta=runner.k2_keys[width].experimental_two_cta,
         )
 
     # ---- LayerKernel protocol

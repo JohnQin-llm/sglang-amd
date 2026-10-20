@@ -17,6 +17,8 @@ Adapted from Kimi-K3's ``mono/runner.py`` (PR #60683).
 import os
 
 import torch
+
+from sglang.srt.environ import envs
 from sglang.srt.rocm_muse_spark.mono.ops.common.epoch import advance_epoch_
 from sglang.srt.rocm_muse_spark.mono.runtime.abi import PEER_HEAD
 from sglang.srt.rocm_muse_spark.mono.runtime.peer import PeerBuffer, bind_agreed
@@ -45,7 +47,6 @@ class MonoRunner:
 
     def __init__(self, device: torch.device):
         from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
-        from sglang.srt.rocm_muse_spark.mono.ops.common.plan import HEALTH_WORDS
 
         self.device = device
         tp = get_parallel().tp_group
@@ -55,6 +56,23 @@ class MonoRunner:
         self.peers = None
 
         def allocate_local() -> None:
+            expert_stack = envs.SGLANG_MUSE_MONO_EXPERT_STACK.get()
+            if expert_stack and (
+                get_parallel().moe_ep_size != 1
+                or not getattr(
+                    torch.cuda.get_device_properties(device), "gcnArchName", ""
+                ).startswith("gfx950")
+            ):
+                raise ValueError("Muse Mono expert stack requires gfx950 TP8/EP1")
+            # Freeze the width policy before allocation and graph capture.
+            # Layer-key construction consumes these same selected schedules.
+            self.k2_keys = {
+                width: k2.K2Build(
+                    tokens=width,
+                    experimental_two_cta=expert_stack and width == MAX_TOKENS,
+                )
+                for width in range(1, MAX_TOKENS + 1)
+            }
             self.allocation_guard_bytes = int(
                 os.environ.get("VLLM_ROCM_LAYER_MONOKERNEL_CANARY_BYTES", "0")
             )
@@ -66,7 +84,8 @@ class MonoRunner:
             guard = self.allocation_guard_bytes
             self._allocation_canary = 0xA5
             self._scratch_bytes = max(
-                k1.max_scratch_bytes(MAX_TOKENS), k2.max_scratch_bytes(MAX_TOKENS)
+                k1.max_scratch_bytes(MAX_TOKENS),
+                *(k2.scratch_bytes(key) for key in self.k2_keys.values()),
             )
             self._scratch_storage = torch.empty(
                 self._scratch_bytes + 2 * guard,
@@ -79,7 +98,10 @@ class MonoRunner:
             self.scratch.zero_()
             self.epoch = torch.zeros(1, dtype=torch.int32, device=device)
             self.seq_lens = torch.zeros(MAX_TOKENS, dtype=torch.int32, device=device)
-            self.health = torch.zeros(HEALTH_WORDS, dtype=torch.int32, device=device)
+            health_words = max(
+                k2.health_words_for_key(key) for key in self.k2_keys.values()
+            )
+            self.health = torch.zeros(health_words, dtype=torch.int32, device=device)
             self.stream_a = torch.empty(
                 MAX_TOKENS, HIDDEN, dtype=torch.float32, device=device
             )

@@ -1874,6 +1874,8 @@ class Envs:
     # Extra shuffled weight storage; see PrepackedMuseMoE for its memory cost.
     SGLANG_MUSE_MOE_PREPACKED = EnvBool(False)
     SGLANG_MUSE_MONO_EP_FALLBACK = EnvBool(False)
+    # Opt-in gfx950 row8 Mono K2 quarter normalization and expert pipeline.
+    SGLANG_MUSE_MONO_EXPERT_STACK = EnvBool(False)
     SGLANG_MUSE_COMPACT_TOP_P = EnvBool(False)
     SGLANG_MUSE_COMPACT_MOE_ALIGN = EnvBool(False)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
