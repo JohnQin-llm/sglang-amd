@@ -404,6 +404,31 @@ class TritonAttnBackend(AttentionBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
+        self.draft_window_split = None
+        if (
+            envs.SGLANG_MUSE_DFLASH_WINDOW_SPLIT.get()
+            and _is_hip
+            and is_gfx95_supported()
+            and self.is_draft_runner
+            and model_runner.spec_algorithm.is_dflash()
+            and "DFlash2DraftModel"
+            in (model_runner.model_config.hf_config.architectures or [])
+            and model_runner.server_args.max_running_requests == 1
+            and model_runner.server_args.tp_size == 8
+            and self.num_draft_tokens == 8
+            and self.num_head == 8
+            and self.num_kv_head == 1
+            and model_runner.model_config.head_dim == 128
+            and model_runner.kv_cache_dtype == torch.float8_e4m3fn
+            and self.sliding_window_size == 2047
+            and self.dcp_size == 1
+            and not self.enable_deterministic
+        ):
+            from sglang.kernels.ops.attention.dflash_window_splitkv import (
+                DraftWindowSplitKV,
+            )
+
+            self.draft_window_split = DraftWindowSplitKV(model_runner.device)
 
         # Auto-detect BLOCK_M that extend_attention kernel will use for this model.
         # This is used by the scheduler's tile-budget admission logic to match
@@ -1763,6 +1788,36 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        if self._can_use_draft_window_split(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            causal,
+            sliding_window_size,
+            logits_soft_cap,
+            sinks,
+            score_mod,
+            aux_tensors,
+        ):
+            self.draft_window_split(
+                q.view(8, 8, 128),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(8, 8, 128),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                sm_scale=layer.scaling,
+                k_scale=k_descale,
+                v_scale=v_descale,
+                sliding_window_size=sliding_window_size,
+            )
+            return o
+
         # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
         # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
         # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
@@ -1843,6 +1898,49 @@ class TritonAttnBackend(AttentionBackend):
         if self.dllm_attention is not None:
             return self.dllm_attention.forward_extend(layer, *args, **kwargs)
         return self.extend_attention_fwd(*args, **kwargs)
+
+    def _can_use_draft_window_split(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        causal,
+        sliding_window_size,
+        logits_soft_cap,
+        sinks,
+        score_mod,
+        aux_tensors,
+    ):
+        # C1 and DFlash8 ensure qo_indptr=[0,8]. Window metadata supplies
+        # at most 2047 prefix entries; the index allocation can be larger.
+        return (
+            self.draft_window_split is not None
+            and forward_batch.forward_mode.is_target_verify()
+            and forward_batch.batch_size == 1
+            and q.shape == (8, 1024)
+            and k.shape == v.shape == (8, 1, 128)
+            and q.dtype == k.dtype == v.dtype == torch.bfloat16
+            and layer.tp_q_head_num == 8
+            and layer.tp_k_head_num == 1
+            and layer.qk_head_dim == layer.v_head_dim == 128
+            and layer.attn_type == AttentionType.ENCODER_ONLY
+            and not layer.is_cross_attention
+            and not causal
+            and sliding_window_size == 2047
+            and logits_soft_cap == 0
+            and layer.xai_temperature_len <= 0
+            and self.forward_metadata.max_extend_len == 8
+            and self.forward_metadata.qo_indptr.numel() == 2
+            and self.forward_metadata.window_kv_indptr is not None
+            and self.forward_metadata.window_kv_indptr.numel() == 2
+            and self.forward_metadata.window_kv_indices is not None
+            and self.forward_metadata.custom_mask is None
+            and sinks is None
+            and score_mod is None
+            and aux_tensors is None
+        )
 
     def _dense_one_shot_kv_indptr_for(self, forward_batch: ForwardBatch):
         """Cumulative full sequence lengths addressing the one-shot K/V rows.

@@ -1867,6 +1867,8 @@ class Envs:
     SGLANG_MUSE_FLYDSL_DECODE = EnvBool(False)
     # Opt-in gfx950 Muse target-verification and pooler optimizations.
     SGLANG_MUSE_SWA_VERIFY = EnvBool(False)
+    # C1 DFlash8 draft attention on gfx95, with persistent split-KV scratch.
+    SGLANG_MUSE_DFLASH_WINDOW_SPLIT = EnvBool(False)
     SGLANG_MUSE_FUSED_QKV_PREPARE = EnvBool(False)
     SGLANG_MUSE_SPLITK_POOLER = EnvBool(False)
     SGLANG_MUSE_TOKEN_SHARDED_POOLER = EnvBool(False)
