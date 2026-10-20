@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from sglang.srt.mem_cache.memory_pool import MuseMonoMHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.rocm_muse_spark.layers import (
@@ -323,8 +324,8 @@ def test_full_attention_keeps_native_cache_and_only_launches_k2(monkeypatch):
 
 
 @pytest.mark.parametrize("multiplier", [None, 1.0, 32**-0.5])
-@pytest.mark.parametrize("rows", [1, 8])
-def test_layer_keys_preserve_native_router_multiplier(multiplier, rows):
+@pytest.mark.parametrize("rows,expert_stack", [(1, False), (8, False), (8, True)])
+def test_layer_keys_preserve_native_router_multiplier(multiplier, rows, expert_stack):
     from sglang.srt.rocm_muse_spark.mono.kernel import layer_keys
 
     norm = SimpleNamespace(variance_epsilon=1e-5)
@@ -345,13 +346,45 @@ def test_layer_keys_preserve_native_router_multiplier(multiplier, rows):
         post_attn_norm=norm,
         pre_ffn_norm=norm,
     )
-    attention_key, key = layer_keys(layer, width=rows, q_len=rows)
+    attention_key, key = layer_keys(
+        layer, width=rows, q_len=rows, experimental_two_cta=expert_stack
+    )
     assert attention_key.window == 2047
     assert key.router_output_multiplier == (1.0 if multiplier is None else multiplier)
+    assert key.experimental_two_cta == expert_stack
     # The original vLLM adapter uses already-scaled router weights.
     del layer.feed_forward.router_multiplier
-    _, original_key = layer_keys(layer, width=rows, q_len=rows)
+    _, original_key = layer_keys(
+        layer, width=rows, q_len=rows, experimental_two_cta=expert_stack
+    )
     assert original_key.router_output_multiplier == 1.0
+
+
+@pytest.mark.parametrize("expert_stack", [False, True])
+def test_compile_checked_requires_the_entire_selected_grid(monkeypatch, expert_stack):
+    from unittest.mock import Mock
+
+    from sglang.srt.rocm_muse_spark.mono.kernel import compile_checked
+    from sglang.srt.rocm_muse_spark.mono.ops import k2
+    from sglang.srt.rocm_muse_spark.mono.ops.common import residency
+
+    key = k2.K2Build(tokens=8, experimental_two_cta=expert_stack)
+    # A one-CTA/CU code object is safe for the default, unsafe for the stack.
+    proof = Mock()
+    proof.problems.side_effect = lambda blocks, cus: (
+        ["grid is not fully resident"] if blocks > cus else []
+    )
+    monkeypatch.setattr(k2, "compile_only", Mock())
+    monkeypatch.setattr(k2, "build", Mock(return_value=object()))
+    monkeypatch.setattr(residency, "residency", lambda kernel, threads: [proof])
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda: SimpleNamespace(multi_processor_count=256),
+    )
+    expected = ["grid is not fully resident"] if expert_stack else []
+    assert compile_checked(key) == expected
+    proof.problems.assert_called_once_with(512 if expert_stack else 256, 256)
 
 
 @pytest.mark.parametrize("native", [False, True])

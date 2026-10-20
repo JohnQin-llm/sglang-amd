@@ -1867,6 +1867,8 @@ class Envs:
     SGLANG_MUSE_FLYDSL_DECODE = EnvBool(False)
     # Opt-in gfx950 Muse target-verification and pooler optimizations.
     SGLANG_MUSE_SWA_VERIFY = EnvBool(False)
+    # C1 DFlash8 draft attention on gfx95, with persistent split-KV scratch.
+    SGLANG_MUSE_DFLASH_WINDOW_SPLIT = EnvBool(False)
     SGLANG_MUSE_FUSED_QKV_PREPARE = EnvBool(False)
     SGLANG_MUSE_SPLITK_POOLER = EnvBool(False)
     SGLANG_MUSE_TOKEN_SHARDED_POOLER = EnvBool(False)
@@ -1874,6 +1876,8 @@ class Envs:
     # Extra shuffled weight storage; see PrepackedMuseMoE for its memory cost.
     SGLANG_MUSE_MOE_PREPACKED = EnvBool(False)
     SGLANG_MUSE_MONO_EP_FALLBACK = EnvBool(False)
+    # Opt-in gfx950 row8 Mono K2 quarter normalization and expert pipeline.
+    SGLANG_MUSE_MONO_EXPERT_STACK = EnvBool(False)
     SGLANG_MUSE_COMPACT_TOP_P = EnvBool(False)
     SGLANG_MUSE_COMPACT_MOE_ALIGN = EnvBool(False)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(

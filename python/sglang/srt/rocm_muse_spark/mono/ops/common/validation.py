@@ -15,6 +15,7 @@ from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
 from sglang.srt.rocm_muse_spark.mono.ops.common.plan import (
     BLOCKS,
     PAIR_BYTES,
+    WAVES,
     Record,
     Space,
 )
@@ -41,17 +42,21 @@ def _assert_pairs(layout: dict[str, tuple[int, int]], expected: dict[str, int]) 
         )
 
 
-def _owners(count: int, base: int = 0, *, reverse: bool = False) -> list[int]:
+def _owners(
+    count: int, base: int = 0, *, reverse: bool = False, blocks: int = BLOCKS
+) -> list[int]:
     """Persistent ``first_task`` ownership, enumerated rather than assumed."""
     tasks = []
-    for bid in range(BLOCKS):
-        first = BLOCKS - 1 - bid if reverse else (bid - base) % BLOCKS
-        tasks.extend(range(first, count, BLOCKS))
+    for bid in range(blocks):
+        first = blocks - 1 - bid if reverse else (bid - base) % blocks
+        tasks.extend(range(first, count, blocks))
     return tasks
 
 
-def _assert_owned(count: int, base: int = 0, *, reverse: bool = False) -> None:
-    got = _owners(count, base, reverse=reverse)
+def _assert_owned(
+    count: int, base: int = 0, *, reverse: bool = False, blocks: int = BLOCKS
+) -> None:
+    got = _owners(count, base, reverse=reverse, blocks=blocks)
     assert len(got) == len(set(got)) == count
     assert sorted(got) == list(range(count))
 
@@ -174,16 +179,21 @@ def validate_k1(key: k1.K1Build) -> dict[str, int]:
 def validate_k2(key: k2.K2Build) -> dict[str, int]:
     """Prove one K2 width's scratch/peer layouts and persistent task plan."""
     s = key.tokens
+    quarter = key.experimental_two_cta and s == 8
     assert 1 <= s <= k2.MAX_TOKENS
-    layout = k2.scratch_layout(s)
+    blocks = k2.grid_blocks(key)
+    finish_groups, finish_roots = k2.finish_counts(blocks)
+    layout = k2.scratch_layout(s, experimental_two_cta=key.experimental_two_cta)
+    moe_pairs = moe.scratch_pairs(s, wave_splitk=key.experimental_two_cta)
     expected_names = {
         "msq1",
         "msq2",
         "xrdy",
-        *moe.scratch_pairs(s),
+        *moe_pairs,
         *moe.scratch_plain(s),
         "xrow",
         "finish",
+        *(("rstd1", "rstd2") if quarter else ()),
     }
     assert set(layout) == expected_names
     _assert_layout(layout, k2.scratch_bytes(key))
@@ -193,8 +203,9 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
             "msq1": k2.NSL * s,
             "msq2": k2.NSL * s,
             "xrdy": k2.NSL,
-            **moe.scratch_pairs(s),
-            "finish": BLOCKS + k2.FINISH_GROUPS + k2.FINISH_ROOTS,
+            **moe_pairs,
+            "finish": blocks + finish_groups + finish_roots,
+            **({"rstd1": 8, "rstd2": 8} if quarter else {}),
         },
     )
     for name, size in moe.scratch_plain(s).items():
@@ -217,26 +228,78 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
     )
     assert k2.peer_bytes() == 2 * k2._half()
 
+    # The candidate restores the dense kernel's original 256 producers: each
+    # producer owns two of the 512 o_proj tasks even though the grid has 512
+    # CTAs.  The default build has the same producer/task geometry.
     _assert_owned(oproj.OTASKS)
+    if key.experimental_two_cta:
+        assert blocks == 512
+        assert list(range(BLOCKS)) == [bid for bid in range(blocks) if bid < BLOCKS]
     _assert_owned(moe.R_TASKS, k2.R0)
     _assert_owned(moe.P_TASKS, k2.P0)
-    _assert_owned(k2.NSL)
+    _assert_owned(32 if quarter else k2.NSL)
     _assert_owned(s)
     _assert_owned(s, moe.XQ0)
     max_unique = min(moe.MAX_U, s * moe.TOPK)
-    ug_cases = (
-        (
+    if not key.experimental_two_cta and s == 8:
+        ug_cases = (
             (1, min(max_unique, moe.UG_Q8_ONE_GROUP_MAX_U)),
             (moe.UG_UNITS, max_unique),
         )
-        if s == 8
-        else ((moe.ug_units(s), max_unique),)
+    elif not key.experimental_two_cta:
+        ug_cases = ((moe.ug_units(s), max_unique),)
+    ug_capacity = moe.ug_task_capacity(s, wave_splitk=key.experimental_two_cta)
+    ug_capacity_limit = (
+        moe.UG_TASKS_WAVE_SPLITK if key.experimental_two_cta else moe.UG_TASKS_MAX
     )
-    for units, route_bound in ug_cases:
-        ug_tasks = route_bound * moe.UG_GROUPS // units
-        _assert_owned(ug_tasks, reverse=True)
-        assert ug_tasks <= moe.ug_task_capacity(s) <= moe.UG_TASKS_MAX
-    _assert_owned(moe.DOWN_TASKS)
+    if key.experimental_two_cta:
+        # team = bid // 16, member = bid % 16.  A team advances by 32
+        # experts; each member publishes exactly one of the expert's 16 flags.
+        ug_work = [
+            (slot, member, slot * moe.UG_GROUPS + member)
+            for team in range(32)
+            for member in range(16)
+            for slot in range(team, max_unique, 32)
+        ]
+        expected_ug = [
+            (slot, member, slot * moe.UG_GROUPS + member)
+            for slot in range(max_unique)
+            for member in range(16)
+        ]
+        assert sorted(ug_work) == expected_ug
+        assert len({task for _, _, task in ug_work}) == max_unique * moe.UG_GROUPS
+        assert max_unique * moe.UG_GROUPS <= ug_capacity <= ug_capacity_limit
+        assert ug_capacity == moe.UG_TASKS_WAVE_SPLITK == 1024
+        # Every member publishes its own task before entering load_expert_inter;
+        # each member's wait set is exactly the team's 16 publications.
+        for slot in range(max_unique):
+            publications = {slot * moe.UG_GROUPS + member for member in range(16)}
+            assert publications == set(
+                range(slot * moe.UG_GROUPS, (slot + 1) * moe.UG_GROUPS)
+            )
+    else:
+        for units, route_bound in ug_cases:
+            ug_tasks = route_bound * moe.UG_GROUPS // units
+            _assert_owned(ug_tasks, reverse=True, blocks=blocks)
+            assert ug_tasks <= ug_capacity <= ug_capacity_limit
+    if key.experimental_two_cta:
+        down_work = [
+            (slot, member * 16 + wave + 8 * iteration, member // 2)
+            for team in range(32)
+            for member in range(16)
+            for slot in range(team, max_unique, 32)
+            for iteration in range(2)
+            for wave in range(WAVES)
+        ]
+        expected_down = [
+            (slot, tile, tile // (moe.DOWN_TASKS // k2.TP))
+            for slot in range(max_unique)
+            for tile in range(moe.DOWN_TASKS)
+        ]
+        assert sorted(down_work) == expected_down
+        assert len(set(down_work)) == max_unique * moe.DOWN_TASKS
+    else:
+        _assert_owned(moe.DOWN_TASKS)
     if s == 8:
         # Every global slice has exactly one owner rank; every down tile targets
         # the same rank as the finalizer of its containing 128-column slice.
@@ -252,9 +315,7 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
             for rank in range(k2.TP)
             for local in range(moe.OWNER_FIN_CTAS)
         ]
-        expected_work = [
-            (j, t) for j in range(moe.FIN_TASKS) for t in range(s)
-        ]
+        expected_work = [(j, t) for j in range(moe.FIN_TASKS) for t in range(s)]
         assert sorted(owner_work) == expected_work
         assert len(set(owner_work)) == moe.FIN_TASKS * s
         for tile in range(moe.DOWN_TASKS):
@@ -262,11 +323,45 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
                 tile // (moe.DOWN_TASKS // k2.TP)
                 == (tile * moe.ROWS // moe.FIN_COLS) // moe.OWNED_FIN_TASKS
             )
-        _assert_owned(moe.OWNER_FIN_CTAS, k2.FIN0)
+        if key.experimental_two_cta:
+            # The extra 32 CTAs are the candidate finalizers; CTAs 0..31 stay
+            # reserved for the unchanged tagged FIN receive/materialization.
+            fin_base = blocks - moe.OWNER_FIN_CTAS
+            assert fin_base == 480
+            assert list(range(fin_base, blocks)) == [
+                fin_base + owner for owner in range(moe.OWNER_FIN_CTAS)
+            ]
+        else:
+            _assert_owned(moe.OWNER_FIN_CTAS, k2.FIN0)
     _assert_owned(moe.FIN_TASKS, k2.FIN0)  # local FIN gather/materialization
     _assert_owned(moe.UP_TASKS, k2.U0)
     _assert_owned(moe.GATHER_TASKS, k2.G0)
     assert moe.MAX_U * moe.UG_GROUPS // moe.UG_UNITS == moe.UG_TASKS_MAX
+    if key.experimental_two_cta:
+        assert k2.health_words_for_key(key) == (blocks + 1) * k2.TP == 4104
+
+    if quarter:
+        # Independently enumerate the quarter-token CTA/wave/lane mapping: each token
+        # owns all 64 original partial slots and every output column once.
+        slices = set()
+        columns = set()
+        ready = set()
+        for bid in range(32):
+            token, q = divmod(bid, 4)
+            ready.add((token, q))
+            for wave in range(8):
+                for i in range(2):
+                    j = q * 16 + wave * 2 + i
+                    assert (token, j) not in slices
+                    slices.add((token, j))
+                    for lane in range(64):
+                        for element in range(2):
+                            item = (token, j * 128 + lane * 2 + element)
+                            assert item not in columns
+                            columns.add(item)
+        assert len(slices) == 8 * 64
+        assert len(columns) == 8 * k2.seam.H
+        assert ready == {(token, q) for token in range(8) for q in range(4)}
 
     # Global W13 descriptors are byte bounded.  The final vector/dword of the
     # final expert reaches, but never crosses, its layout-derived extent.
@@ -285,13 +380,41 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
     )
     assert (last_scale_dword + 1) * 4 == moe.W13_SCALE_BYTES
     assert max(moe.W13_BYTES, moe.W13_SCALE_BYTES) <= 0x7FFFFFFF
+    assert moe.W2_BYTES == moe.E * moe.MH * moe.RI // 2
+    last_w2_dword_end = (
+        (moe.E - 1) * (moe.MH * moe.RI // 8)
+        + (moe.MH // moe.ROWS - 1) * (2 * moe.RI)
+        + (moe.W2_STEPS - 1) * 256
+        + 63 * 4
+        + 4
+    )
+    assert last_w2_dword_end * 4 == moe.W2_BYTES
+    assert moe.W2_SCALE_BYTES == moe.E * moe.MH * moe.W2_SCALE_G
+    last_w2_scale_dword = moe.scale_dword(
+        moe.E * moe.MH - 1, moe.W2_SCALE_G - 1, moe.W2_SCALE_G
+    )
+    assert (last_w2_scale_dword + 1) * 4 == moe.W2_SCALE_BYTES
 
+    seam_nodes = (
+        (
+            "seam_msq1_put",
+            "seam_rstd1_put",
+            "seam_rstd1_load",
+            "seam_msq2_put",
+            "seam_rstd2_put",
+            "seam_rstd2_load",
+        )
+        if quarter
+        else (
+            "seam_msq1_put",
+            "seam_msq1_sum",
+            "seam_msq2_put",
+            "seam_msq2_sum",
+        )
+    )
     nodes = (
         "oproj_ar_publish",
-        "seam_msq1_put",
-        "seam_msq1_sum",
-        "seam_msq2_put",
-        "seam_msq2_sum",
+        *seam_nodes,
         "ffn_publish",
         "router_publish",
         "pool_publish",
@@ -306,14 +429,29 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
         "branch_publish",
         "gather",
     )
-    _assert_dag(
-        nodes,
+    seam_edges = (
         (
+            ("oproj_ar_publish", "seam_msq1_put"),
+            ("seam_msq1_put", "seam_rstd1_put"),
+            ("seam_rstd1_put", "seam_rstd1_load"),
+            ("seam_rstd1_load", "seam_msq2_put"),
+            ("seam_msq2_put", "seam_rstd2_put"),
+            ("seam_rstd2_put", "seam_rstd2_load"),
+            ("seam_rstd2_load", "ffn_publish"),
+        )
+        if quarter
+        else (
             ("oproj_ar_publish", "seam_msq1_put"),
             ("seam_msq1_put", "seam_msq1_sum"),
             ("seam_msq1_sum", "seam_msq2_put"),
             ("seam_msq2_put", "seam_msq2_sum"),
             ("seam_msq2_sum", "ffn_publish"),
+        )
+    )
+    _assert_dag(
+        nodes,
+        (
+            *seam_edges,
             ("ffn_publish", "router_publish"),
             ("ffn_publish", "pool_publish"),
             ("router_publish", "route_publish"),
@@ -389,7 +527,7 @@ def validate_k2_trace(key: k2.K2Build, trace: Record) -> bool:
             "gather",
             "finish",
         ),
-        k2.scratch_layout(key.tokens),
+        k2.scratch_layout(key.tokens, experimental_two_cta=key.experimental_two_cta),
         {
             **k2.peer_layout(),
             "done": (k2.K2_DONE_OFFSET, k2.K2_DONE_BYTES),
@@ -409,6 +547,16 @@ def validate_k2_trace(key: k2.K2Build, trace: Record) -> bool:
             ("seam", "msq1", Space.SCRATCH, "poll"),
             ("seam", "msq2", Space.SCRATCH, "put"),
             ("seam", "msq2", Space.SCRATCH, "poll"),
+            *(
+                {
+                    ("seam", "rstd1", Space.SCRATCH, "put"),
+                    ("seam", "rstd1", Space.SCRATCH, "poll"),
+                    ("seam", "rstd2", Space.SCRATCH, "put"),
+                    ("seam", "rstd2", Space.SCRATCH, "poll"),
+                }
+                if key.experimental_two_cta
+                else set()
+            ),
             ("seam", "xrdy", Space.SCRATCH, "put"),
             ("route", "rlog", Space.PEER, "poll"),
             ("route", "route", Space.SCRATCH, "put"),
@@ -468,8 +616,14 @@ def validate_all() -> dict[str, int]:
                 )
                 max_scratch = max(max_scratch, result["scratch_bytes"])
                 builds += 1
+    validate_k2(k2.K2Build(tokens=8, experimental_two_cta=True))
+    builds += 1
     assert max_scratch <= k1.max_scratch_bytes(k1.MAX_TOKENS)
     assert k2.max_scratch_bytes() >= max(
         k2.scratch_bytes(k2.K2Build(tokens=s)) for s in range(1, k2.MAX_TOKENS + 1)
+    )
+    candidate = k2.K2Build(tokens=8, experimental_two_cta=True)
+    assert k2.max_scratch_bytes(experimental_two_cta=True) >= k2.scratch_bytes(
+        candidate
     )
     return {"builds": builds, "max_k1_scratch_bytes": max_scratch}
