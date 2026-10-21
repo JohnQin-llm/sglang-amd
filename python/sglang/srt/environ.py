@@ -1878,6 +1878,8 @@ class Envs:
     SGLANG_MUSE_MONO_EP_FALLBACK = EnvBool(False)
     # Opt-in gfx950 row8 Mono K2 quarter normalization and expert pipeline.
     SGLANG_MUSE_MONO_EXPERT_STACK = EnvBool(False)
+    # C1-only TP8/EP8 full K2, with native attention and existing packed weights.
+    SGLANG_MUSE_EP8_FULL_K2 = EnvBool(False)
     SGLANG_MUSE_COMPACT_TOP_P = EnvBool(False)
     SGLANG_MUSE_COMPACT_MOE_ALIGN = EnvBool(False)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
