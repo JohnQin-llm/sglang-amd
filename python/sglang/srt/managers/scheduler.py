@@ -6237,6 +6237,12 @@ def run_scheduler_process(
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
+                if envs.SGLANG_MUSE_EP8_FULL_K2.get():
+                    from sglang.srt.rocm_muse_spark.mono.lifecycle import (
+                        close_model_runners,
+                    )
+
+                    close_model_runners(scheduler.tp_worker.model_runner.model)
                 scheduler.release_host_resources()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()

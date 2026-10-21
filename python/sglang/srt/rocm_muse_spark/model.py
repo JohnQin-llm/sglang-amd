@@ -59,7 +59,13 @@ from sglang.srt.rocm_muse_spark.muse_router_gemv import (
     router_gemv,
     router_gemv_supported,
 )
-from sglang.srt.runtime_context import get_context, get_exec, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_disagg,
+    get_exec,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.utils import add_prefix
 from torch import nn
 
@@ -1440,30 +1446,37 @@ class MuseSpark1xDecoderLayer(nn.Module):
         ffn_boundary: FusedPostNormResidualPreNorm | None = None,
         pre_norm_dtype: torch.dtype | None = None,
         defer_ffn_boundary: bool = False,
+        full_k2=None,
     ):
         attn_input = (
             self.self_attn_input_norm(stream) if attn_input is None else attn_input
         )
-        attn_output = self.self_attn(positions, attn_input, forward_batch)
-        if _original_layout_selected():
-            ffn_input, stream = _original_boundary(
-                MuseSpark1xResidualStream(
-                    stream=stream,
-                    branch=attn_output,
-                    post_norm=self.post_attn_norm,
-                    connection=self.post_attention_residual_gate,
-                ),
-                self.pre_feedforward_layernorm,
+        if full_k2 is not None and self.layer_idx in full_k2.layers:
+            core = self.self_attn.forward_attention_core(
+                positions, attn_input, forward_batch
             )
+            stream, ffn_output = full_k2.forward(self, core, stream)
         else:
-            ffn_input, stream, _ = self._fused_attn_boundary.forward(
-                stream, attn_output, branch_dtype=torch.bfloat16
+            attn_output = self.self_attn(positions, attn_input, forward_batch)
+            if _original_layout_selected():
+                ffn_input, stream = _original_boundary(
+                    MuseSpark1xResidualStream(
+                        stream=stream,
+                        branch=attn_output,
+                        post_norm=self.post_attn_norm,
+                        connection=self.post_attention_residual_gate,
+                    ),
+                    self.pre_feedforward_layernorm,
+                )
+            else:
+                ffn_input, stream, _ = self._fused_attn_boundary.forward(
+                    stream, attn_output, branch_dtype=torch.bfloat16
+                )
+            ffn_output = (
+                self.mlp(ffn_input, forward_batch=forward_batch)
+                if self.is_moe_layer
+                else self.mlp(ffn_input)
             )
-        ffn_output = (
-            self.mlp(ffn_input, forward_batch=forward_batch)
-            if self.is_moe_layer
-            else self.mlp(ffn_input)
-        )
         if defer_ffn_boundary:
             return MuseSpark1xResidualStream(
                 stream=stream,
@@ -1604,6 +1617,11 @@ class MuseSpark1xModel(nn.Module):
         # DFLASH draft context: the residual stream after each listed layer, read
         # in operator dtype (bf16) like the CUDA model does.
         aux_hidden_states: list[torch.Tensor] = []
+        full_k2 = getattr(self, "_ep8_full_k2", None)
+        if full_k2 is not None and full_k2.eligible(forward_batch, input_ids):
+            full_k2.step_begin()
+        else:
+            full_k2 = None
         if (
             _original_layout_selected()
             and self._ffn_boundaries is not None
@@ -1619,6 +1637,7 @@ class MuseSpark1xModel(nn.Module):
                     forward_batch,
                     attn_input=attn_input,
                     defer_ffn_boundary=True,
+                    full_k2=full_k2,
                 )
                 next_norm = (
                     self.norm
@@ -1644,17 +1663,20 @@ class MuseSpark1xModel(nn.Module):
                     attn_input=attn_input,
                     ffn_boundary=self._ffn_boundaries[i],
                     pre_norm_dtype=final_pre_norm_dtype if i == last else None,
+                    full_k2=full_k2,
                 )
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(stream.to(torch.bfloat16))
             hidden_states = attn_input
         else:
             for i, layer in enumerate(self.layers):
-                stream = layer(positions, stream, forward_batch)
+                stream = layer(positions, stream, forward_batch, full_k2=full_k2)
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(stream.to(torch.bfloat16))
             norm_input = stream.to(torch.bfloat16)
             hidden_states = self.norm(norm_input).to(torch.bfloat16)
+        if full_k2 is not None:
+            full_k2.step_end()
         if self.layers_to_capture:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -2140,6 +2162,69 @@ class MuseSpark1xForCausalLM(nn.Module):
             refresh = getattr(op, "refresh_cached_weights", None)
             if refresh is not None:
                 refresh(torch.bfloat16)
+
+        decoder = self.model.language_model
+        runner = getattr(decoder, "_ep8_full_k2", None)
+        if runner is not None:
+            runner.refresh()
+        elif envs.SGLANG_MUSE_EP8_FULL_K2.get():
+            parallel, spec = get_parallel(), get_spec()
+            device = self.model.embed_tokens.weight.device
+            compatible = (
+                not _original_layout_selected()
+                # One runner owns scratch and epochs for the complete model.
+                # PDMux and batch-overlap modes can consume them concurrently.
+                and not get_disagg().enable_pdmux
+                and not get_exec().overlap.enable_two_batch_overlap
+                and not get_exec().overlap.enable_single_batch_overlap
+                and self.mxfp4_checkpoint
+                and envs.SGLANG_MUSE_MOE_PREPACKED.get()
+                and _moe_backend() == "flydsl"
+                and self.config.hidden_size == 8192
+                and self.config.moe_hidden_size == 4096
+                and self.config.moe_intermediate_size == 4096
+                and self.config.num_local_experts == 256
+                and self.config.num_experts_per_tok == 8
+                and not self.config.num_shared_experts
+                and all(layer.is_moe_layer for layer in decoder.layers)
+                and spec.speculative_algorithm == "DFLASH"
+                and spec.speculative_num_draft_tokens == 8
+                and parallel.tp_size == 8
+                and parallel.attn_tp_size == 8
+                and parallel.moe_ep_size == 8
+                and parallel.moe_tp_size == 1
+                and device.type == "cuda"
+                and torch.version.hip is not None
+                and getattr(
+                    torch.cuda.get_device_properties(device), "gcnArchName", ""
+                ).startswith("gfx950")
+            )
+            # Agreement precedes importing/allocating any persistent-kernel state.
+            from sglang.srt.rocm_muse_spark.mono.runtime.peer import tp_agree
+
+            if tp_agree(compatible, parallel.tp_group.cpu_group):
+                from sglang.srt.rocm_muse_spark.mono.ep8_runner import (
+                    Ep8FullK2Runner,
+                    Ep8FullK2Unsupported,
+                )
+
+                try:
+                    runner = Ep8FullK2Runner(decoder.layers, parallel)
+                except Ep8FullK2Unsupported as error:
+                    logger.warning(
+                        "Muse EP8 full K2 declined; retaining native execution: %s",
+                        error,
+                    )
+                else:
+                    object.__setattr__(decoder, "_ep8_full_k2", runner)
+                    logger.info(
+                        "Enabled Muse EP8 full K2 for DFlash B1/q8 (%d layers)",
+                        len(runner.layers),
+                    )
+            else:
+                logger.warning(
+                    "Muse EP8 full K2 is unsupported by this model/topology; retaining native execution"
+                )
 
 
 EntryClass = [MuseSpark1xForCausalLM]
