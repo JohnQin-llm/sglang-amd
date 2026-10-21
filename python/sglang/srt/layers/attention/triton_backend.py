@@ -404,31 +404,7 @@ class TritonAttnBackend(AttentionBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
-        self.draft_window_split = None
-        if (
-            envs.SGLANG_MUSE_DFLASH_WINDOW_SPLIT.get()
-            and _is_hip
-            and is_gfx95_supported()
-            and self.is_draft_runner
-            and model_runner.spec_algorithm.is_dflash()
-            and "DFlash2DraftModel"
-            in (model_runner.model_config.hf_config.architectures or [])
-            and model_runner.server_args.max_running_requests == 1
-            and model_runner.server_args.tp_size == 8
-            and self.num_draft_tokens == 8
-            and self.num_head == 8
-            and self.num_kv_head == 1
-            and model_runner.model_config.head_dim == 128
-            and model_runner.kv_cache_dtype == torch.float8_e4m3fn
-            and self.sliding_window_size == 2047
-            and self.dcp_size == 1
-            and not self.enable_deterministic
-        ):
-            from sglang.kernels.ops.attention.dflash_window_splitkv import (
-                DraftWindowSplitKV,
-            )
-
-            self.draft_window_split = DraftWindowSplitKV(model_runner.device)
+        self._init_draft_window_split(model_runner)
 
         # Auto-detect BLOCK_M that extend_attention kernel will use for this model.
         # This is used by the scheduler's tile-budget admission logic to match
@@ -1898,6 +1874,35 @@ class TritonAttnBackend(AttentionBackend):
         if self.dllm_attention is not None:
             return self.dllm_attention.forward_extend(layer, *args, **kwargs)
         return self.extend_attention_fwd(*args, **kwargs)
+
+    def _init_draft_window_split(self, model_runner):
+        # Scratch belongs to this backend, including each PDMux stream's own
+        # backend. Layers and graph buckets reuse it on their serialized stream.
+        # Admission depends on the actual batch below, not the server capacity.
+        self.draft_window_split = None
+        if (
+            envs.SGLANG_MUSE_DFLASH_WINDOW_SPLIT.get()
+            and _is_hip
+            and is_gfx95_supported()
+            and self.is_draft_runner
+            and model_runner.spec_algorithm.is_dflash()
+            and "DFlash2DraftModel"
+            in (model_runner.model_config.hf_config.architectures or [])
+            and model_runner.server_args.tp_size == 8
+            and self.num_draft_tokens == 8
+            and self.num_head == 8
+            and self.num_kv_head == 1
+            and model_runner.model_config.head_dim == 128
+            and model_runner.kv_cache_dtype == torch.float8_e4m3fn
+            and self.sliding_window_size == 2047
+            and self.dcp_size == 1
+            and not self.enable_deterministic
+        ):
+            from sglang.kernels.ops.attention.dflash_window_splitkv import (
+                DraftWindowSplitKV,
+            )
+
+            self.draft_window_split = DraftWindowSplitKV(model_runner.device)
 
     def _can_use_draft_window_split(
         self,

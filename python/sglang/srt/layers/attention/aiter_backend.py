@@ -370,6 +370,64 @@ class AiterAttnBackend(AttentionBackend):
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
 
+    def _init_muse_full_verify_q8(self, model_runner: ModelRunner) -> None:
+        self._muse_full_verify_q8 = None
+        self._muse_full_verify_layer_ordinals: dict[int, int] = {}
+        self._muse_full_verify_workspaces = None
+
+        architectures = (
+            getattr(model_runner.model_config.hf_config, "architectures", None) or []
+        )
+        if not (
+            self._use_unified_verify
+            and get_bool_env_var("SGLANG_MUSE_FULL_VERIFY_Q8", "0")
+            and is_gfx95_supported()
+            and not model_runner.is_draft_worker
+            and "MuseSparkForConditionalGeneration" in architectures
+            and get_parallel().attn_tp_size == 8
+            and self.page_size == 16
+            and self.num_head == 16
+            and self.num_kv_head == 2
+            and self.head_dim == 64
+            and self.v_head_dim == 64
+            and self.input_dtype == torch.bfloat16
+            and self.kv_cache_dtype == fp8_dtype
+            and self.num_draft_tokens == 8
+            and self.topk == 1
+            and not self.kv_cache_is_vectorized_5d
+            and self.dcp_world_size == 1
+        ):
+            return
+
+        layer_types = (
+            getattr(model_runner.model_config.hf_text_config, "layer_types", None)
+            or []
+        )
+        full_layer_ids = [
+            layer_id
+            for layer_id, layer_type in enumerate(layer_types)
+            if layer_type == "full_attention"
+        ]
+        if not full_layer_ids:
+            return
+
+        from sglang.kernels.ops.muse_spark.full_verify import (
+            allocate_workspace,
+            unified_attention_q8,
+        )
+
+        self._muse_full_verify_q8 = unified_attention_q8
+        self._muse_full_verify_layer_ordinals = {
+            layer_id: ordinal for ordinal, layer_id in enumerate(full_layer_ids)
+        }
+        # The runner serializes graph execution on this backend's stream. Two
+        # banks therefore cover adjacent full-attention layers; overlapping
+        # graphs own separate backend instances and, consequently, scratch.
+        self._muse_full_verify_workspaces = (
+            allocate_workspace(self.device),
+            allocate_workspace(self.device),
+        )
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -585,6 +643,7 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
+        self._init_muse_full_verify_q8(model_runner)
         self.use_muse_swa_verify = (
             envs.SGLANG_MUSE_SWA_VERIFY.get()
             and is_gfx95_supported()
@@ -4415,7 +4474,28 @@ class AiterAttnBackend(AttentionBackend):
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
                     # each replay and break the captured pointer.
-                    unified_attention(
+                    attention_fn = unified_attention
+                    workspace_kwargs = {}
+                    full_layer_ordinal = self._muse_full_verify_layer_ordinals.get(
+                        layer.layer_id
+                    )
+                    if (
+                        self._muse_full_verify_q8 is not None
+                        and self._muse_full_verify_workspaces is not None
+                        and full_layer_ordinal is not None
+                        and window_size == (-1, -1)
+                        and self.forward_metadata.max_q_len == 8
+                        and q_unified.shape[0] == 8
+                        and forward_batch.seq_lens.numel() == 1
+                    ):
+                        attention_fn = self._muse_full_verify_q8
+                        workspace_kwargs = {
+                            "workspace": self._muse_full_verify_workspaces[
+                                full_layer_ordinal % 2
+                            ]
+                        }
+
+                    attention_fn(
                         q=q_unified,
                         k=k_unified,
                         v=v_unified,
@@ -4435,6 +4515,7 @@ class AiterAttnBackend(AttentionBackend):
                         k_descale=k_descale,
                         v_descale=v_descale,
                         sinks=sinks,
+                        **workspace_kwargs,
                     )
                     return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
