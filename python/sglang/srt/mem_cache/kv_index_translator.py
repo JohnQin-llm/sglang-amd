@@ -68,6 +68,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
+    kv_indices_num_token_blocks,
 )
 from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table,
@@ -504,7 +505,15 @@ class KVIndexTranslator:
         )
         assert src.v2p is None, "pack_read_stream: a table-less translating read"
         assert token_mapping is None or not src.is_translated
-        create_flashinfer_kv_indices_triton[(bs,)](
+        # Full-prefix gathers can span a long context even at batch size one.
+        # Offset gathers are bounded windows and retain one program per request.
+        num_blocks = (
+            kv_indices_num_token_blocks(src.row_stride * src.entry_page_size, bs)
+            if kv_start_idx is None
+            else 1
+        )
+        grid = (bs, num_blocks) if num_blocks > 1 else (bs,)
+        create_flashinfer_kv_indices_triton[grid](
             src.ids,
             src.row_ids[:bs],
             seq_lens,
@@ -513,6 +522,7 @@ class KVIndexTranslator:
             out,
             src.row_stride,
             ENTRY_PAGE_SIZE=src.entry_page_size,
+            TOKEN_BLOCK_PARALLEL=num_blocks > 1,
             token_mapping=token_mapping,
         )
         return src.is_translated or token_mapping is not None

@@ -1,9 +1,11 @@
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 import torch
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -17,6 +19,88 @@ class TestCreateKvIndices(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_default_device(get_device())
+
+    def test_pack_read_stream_graph_replay(self):
+        for page_size in (1, 16):
+            for with_start in (False, True):
+                for with_mapping in (False, True):
+                    with self.subTest(
+                        page_size=page_size, start=with_start, mapping=with_mapping
+                    ):
+                        lengths = [0, 513, 32769]
+                        width = 65536 // page_size
+                        table = torch.randint(0, 1024, (3, width), dtype=torch.int32)
+                        rows = torch.tensor([2, 0, 1], dtype=torch.int32)
+                        lens = torch.tensor(lengths, dtype=torch.int32)
+                        indptr = torch.zeros(4, dtype=torch.int32)
+                        indptr[1:] = lens.cumsum(0)
+                        starts = [0, 7, 15] if with_start else [0, 0, 0]
+                        offsets = (
+                            torch.tensor(starts, dtype=torch.int32)
+                            if with_start
+                            else None
+                        )
+                        mapping = (
+                            torch.arange(1024 * page_size, dtype=torch.int64)
+                            .flip(0)
+                            .contiguous()
+                            if with_mapping
+                            else None
+                        )
+                        if mapping is not None:
+                            mapping[::13] = -1
+                        out = torch.full((sum(lengths) + 17,), -777, dtype=torch.int64)
+                        view = SimpleNamespace(
+                            ids=table,
+                            row_ids=rows,
+                            row_stride=table.stride(0),
+                            entry_page_size=page_size,
+                            v2p=None,
+                            is_translated=False,
+                        )
+                        reader = SimpleNamespace(
+                            _reads_translated=lambda kind: False,
+                            read_source=lambda *args, **kwargs: view,
+                        )
+
+                        def run():
+                            return KVIndexTranslator.pack_read_stream(
+                                reader,
+                                None,
+                                req_pool_indices=rows,
+                                seq_lens=lens,
+                                indptr=indptr,
+                                out=out,
+                                kv_start_idx=offsets,
+                                token_mapping=mapping,
+                            )
+
+                        self.assertEqual(run(), with_mapping)
+                        torch.cuda.synchronize()
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            run()
+                        saved = table.clone()
+                        for state in ("initial", "changed", "restored"):
+                            if state == "changed":
+                                table.add_(1).remainder_(1024)
+                            elif state == "restored":
+                                table.copy_(saved)
+                            graph.replay()
+                            expected = []
+                            for row, start, length in zip((2, 0, 1), starts, lengths):
+                                pos = torch.arange(start, start + length)
+                                values = table[row, pos // page_size].to(torch.int64)
+                                values = values * page_size + pos % page_size
+                                if mapping is not None:
+                                    values = mapping[values]
+                                expected.append(values)
+                            torch.cuda.synchronize()
+                            self.assertTrue(
+                                torch.equal(out[: sum(lengths)], torch.cat(expected))
+                            )
+                            self.assertTrue(bool((out[sum(lengths) :] == -777).all()))
+                        graph.reset()
 
     def _run_test(self, batch, max_batch, max_context_len):
         req_to_token = torch.arange(
