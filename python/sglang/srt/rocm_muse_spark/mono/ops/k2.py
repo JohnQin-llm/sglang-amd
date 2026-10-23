@@ -484,9 +484,7 @@ def _make(key: K2Build):
             f"_f{key.fault_rank}_{key.fault_epoch}_{key.fault_layer}_{key.fault_ticks}"
         )
     debug_regions = REGIONS + (
-        ("expert_tail_done", "up_partial_ready")
-        if key.experimental_two_cta
-        else ()
+        ("expert_tail_done", "up_partial_ready") if key.experimental_two_cta else ()
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])

@@ -1391,9 +1391,7 @@ def stage_up_partial(c, j, shard):
         e = fx.min(e0, vectors - 1)
         token = e // (UP_N // 8)
         kk = e % (UP_N // 8) * 8
-        source_kk = (
-            2 * shard + (kk // 128) % 2 + 8 * (kk // 256)
-        ) * 128 + kk % 128
+        source_kk = (2 * shard + (kk // 128) % 2 + 8 * (kk // 256)) * 128 + kk % 128
         v = fx.Vector(
             bo.buffer_load(
                 rsrc(c["fin"]),
@@ -1435,10 +1433,7 @@ def stage_up_partial(c, j, shard):
                     acc,
                 )
         if lane % ROWS < 8:
-            base = (
-                ((j * WAVES + original_wave) * 8 + token) * ROWS
-                + 4 * (lane // ROWS)
-            )
+            base = ((j * WAVES + original_wave) * 8 + token) * ROWS + 4 * (lane // ROWS)
             bo.buffer_store(
                 acc.bitcast(fx.Int32),
                 rsrc(c["up_partial"]),

@@ -207,7 +207,11 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
             **moe_pairs,
             "finish": blocks + finish_groups + finish_roots,
             **({"rstd1": 8, "rstd2": 8} if quarter else {}),
-            **({"expert_tail_done": k2.EXPERT_TAIL_PAIRS, "up_partial_ready": 256} if quarter else {}),
+            **(
+                {"expert_tail_done": k2.EXPERT_TAIL_PAIRS, "up_partial_ready": 256}
+                if quarter
+                else {}
+            ),
         },
     )
     if quarter:
@@ -528,11 +532,14 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
             ("down_publish", "up_weight_load"),
             ("up_weight_load", "up_compute"),
             *(
-                (("fin_receive", "up_weight_load"),
-                 ("up_compute", "up_partial_publish"),
-                 ("up_partial_publish", "up_combine"),
-                 ("up_combine", "branch_publish"))
-                if quarter else (("up_compute", "branch_publish"),)
+                (
+                    ("fin_receive", "up_weight_load"),
+                    ("up_compute", "up_partial_publish"),
+                    ("up_partial_publish", "up_combine"),
+                    ("up_combine", "branch_publish"),
+                )
+                if quarter
+                else (("up_compute", "branch_publish"),)
             ),
             ("branch_publish", "gather"),
         ),
@@ -659,9 +666,12 @@ def validate_k2_trace(key: k2.K2Build, trace: Record) -> bool:
             ),
             ("up", "frdy", Space.SCRATCH, "poll"),
             *(
-                {("up", "up_partial_ready", Space.SCRATCH, "put"),
-                 ("up", "up_partial_ready", Space.SCRATCH, "poll")}
-                if key.experimental_two_cta else set()
+                {
+                    ("up", "up_partial_ready", Space.SCRATCH, "put"),
+                    ("up", "up_partial_ready", Space.SCRATCH, "poll"),
+                }
+                if key.experimental_two_cta
+                else set()
             ),
             ("up", "br", Space.PEER, "put"),
             ("gather", "br", Space.PEER, "poll"),

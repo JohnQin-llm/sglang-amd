@@ -69,9 +69,9 @@ def _mfma4(a, b, acc):
 
 def _dpp(v, control):
     bits = v.bitcast(fx.Int32)
-    return fx.Int32(
-        update_dpp_i32(bits, bits, control, 0xF, 0xF, True)
-    ).bitcast(fx.Float32)
+    return fx.Int32(update_dpp_i32(bits, bits, control, 0xF, 0xF, True)).bitcast(
+        fx.Float32
+    )
 
 
 def _wv_reduce(acc):
@@ -92,10 +92,7 @@ def stage_o_wvsplit(c, rg):
     """Small-width production ``wvSplitK`` arithmetic for one 16-row tile."""
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
     r_w = rsrc(c["args"]["w_o"])
-    acc = [
-        [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)]
-        for _ in range(s)
-    ]
+    acc = [[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(2)] for _ in range(s)]
     # A_CHUNK=8, UNRL=2: lane k and lane k+512, two K4 MFMAs each.
     for unroll in range_constexpr(2):
         k0 = lane * 8 + unroll * 512
@@ -118,9 +115,7 @@ def stage_o_wvsplit(c, rg):
                             dtype=T.i32,
                         )
                     ).bitcast(fx.BFloat16)
-                    acc[token][y] = _mfma4(
-                        activation, weight, acc[token][y]
-                    )
+                    acc[token][y] = _mfma4(activation, weight, acc[token][y])
     for token in range_constexpr(s):
         for y in range_constexpr(2):
             reduced = _wv_reduce(acc[token][y])
@@ -134,8 +129,7 @@ def stage_o_wvsplit(c, rg):
         token = tid // (ROWS // 4)
         rq = tid % (ROWS // 4)
         values = [
-            bf16_round(fx.ptr_load(red + token * ROWS + 4 * rq + d))
-            for d in range(4)
+            bf16_round(fx.ptr_load(red + token * ROWS + 4 * rq + d)) for d in range(4)
         ]
         at = (c["rank"] * s + token) * H + rg * ROWS + 4 * rq
         for peer in range_constexpr(TP):
@@ -200,9 +194,7 @@ def stage_oproj(c, bid):
         acc = fx.Vector.filled(4, 0.0, fx.Float32)
         if wave < O_ROUNDS:
             rg = bid + BLOCKS * wave
-            acc = gemv.mfmas_full(
-                lane, c["xl"], CORE_ROW, CORE, s, o_loads_full(c, rg)
-            )
+            acc = gemv.mfmas_full(lane, c["xl"], CORE_ROW, CORE, s, o_loads_full(c, rg))
         fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
         gpu.barrier()
         for j in range_constexpr(O_ROUNDS):
