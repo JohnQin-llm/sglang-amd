@@ -160,8 +160,14 @@ def _launch_gemm(
     mxfp4,
     cfg,
     split_k=1,
+    single_layout=False,
 ):
-    from aiter.ops.flydsl.muse_moe_gemm import launch_muse_moe_gemm
+    if single_layout:
+        from sglang.srt.rocm_muse_spark.muse_moe_single_layout_gemm import (
+            launch_muse_moe_gemm,
+        )
+    else:
+        from aiter.ops.flydsl.muse_moe_gemm import launch_muse_moe_gemm
 
     # Gate/up carries twice as many accumulator fragments as down projection,
     # so one tile is not generally optimal for both stages.  Preserve the
@@ -208,8 +214,9 @@ def muse_moe_flydsl(
     has_norm: bool = True,
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
+    single_layout: bool = False,
 ) -> torch.Tensor:
-    """Muse MoE with native-layout FlyDSL grouped GEMMs and finalize."""
+    """Muse MoE with FlyDSL grouped GEMMs and unchanged per-slot finalize."""
     fx, _run_compiled = _require_flydsl()
 
     if hidden_states.ndim != 2 or topk_ids.ndim != 2 or w13.ndim != 3 or w2.ndim != 3:
@@ -333,6 +340,7 @@ def muse_moe_flydsl(
             mxfp4,
             cfg,
             split_k,
+            single_layout=single_layout,
         )
         stream = fx.Stream(torch.cuda.current_stream(hidden_states.device).cuda_stream)
         _run_compiled(
@@ -363,6 +371,7 @@ def muse_moe_flydsl(
             True,
             mxfp4,
             cfg,
+            single_layout=single_layout,
         )
         y = torch.empty(
             (num_valid, H), dtype=hidden_states.dtype, device=hidden_states.device
@@ -384,6 +393,7 @@ def muse_moe_flydsl(
         mxfp4,
         cfg,
         split_k,
+        single_layout=single_layout,
     )
 
     out = torch.empty((M, H), dtype=hidden_states.dtype, device=hidden_states.device)

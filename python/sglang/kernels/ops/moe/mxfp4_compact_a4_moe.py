@@ -113,6 +113,7 @@ def _expert_a4(
     BK: tl.constexpr,
     ACT: tl.constexpr,
     BM: tl.constexpr,
+    SINGLE_LAYOUT: tl.constexpr,
 ):
     expert_block, n_block = tl.program_id(1), tl.program_id(0)
     expert = tl.load(EXPERT + expert_block)
@@ -138,36 +139,29 @@ def _expert_a4(
                 valid[:, None],
                 other=127,
             )
-            w = tl.load(
-                W
-                + expert * (wn * 2048)
-                + n[None, :] * 2048
-                + tile * (BK // 2)
-                + kp[:, None]
-            )
-            ws = tl.load(
-                WS
-                + expert * (wn * 128)
-                + n[:, None] * 128
-                + tile * (BK // 32)
-                + ks[None, :]
-            )
+            kb = tile * (BK // 2) + kp[:, None]
+            sb = tile * (BK // 32) + ks[None, :]
+            if SINGLE_LAYOUT:
+                nr = n[None, :]
+                ns = n[:, None]
+                wo = nr // 16 * (2048 * 16) + kb // 16 * 256 + nr % 16 * 16 + kb % 16
+                so = (
+                    ns // 32 * (128 * 32)
+                    + sb // 8 * 256
+                    + sb % 4 * 64
+                    + ns % 16 * 4
+                    + sb % 8 // 4 * 2
+                    + ns % 32 // 16
+                )
+            else:
+                wo = n[None, :] * 2048 + kb
+                so = n[:, None] * 128 + sb
+            w = tl.load(W + expert * (wn * 2048) + wo)
+            ws = tl.load(WS + expert * (wn * 128) + so)
             acc = tl.dot_scaled(a, asc, "e2m1", w, ws, "e2m1", acc)
             if ACT:
-                wu = tl.load(
-                    W
-                    + expert * (wn * 2048)
-                    + (n[None, :] + 4096) * 2048
-                    + tile * (BK // 2)
-                    + kp[:, None]
-                )
-                wsu = tl.load(
-                    WS
-                    + expert * (wn * 128)
-                    + (n[:, None] + 4096) * 128
-                    + tile * (BK // 32)
-                    + ks[None, :]
-                )
+                wu = tl.load(W + expert * (wn * 2048) + 4096 * 2048 + wo)
+                wsu = tl.load(WS + expert * (wn * 128) + 4096 * 128 + so)
                 up = tl.dot_scaled(a, asc, "e2m1", wu, wsu, "e2m1", up)
         if ACT:
             activated = (acc * tl.sigmoid(acc) * up).to(tl.bfloat16).to(tl.float32)
@@ -196,7 +190,7 @@ def compact_a4_applies(m: int, h: int, w13, w2, s13, s2) -> bool:
     )
 
 
-def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
+def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start, single_layout=False):
     """Per-(token, slot) expert outputs BF16 [M * 8, 4096] for the 32 local experts starting at ``local_start``."""
     m, h = x.shape
     if not (
@@ -257,9 +251,24 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
         512,
         True,
         bm,
+        single_layout,
         **options,
     )
     _expert_a4[grid](
-        inter, inter_scale, w2, s2, sid, eid, y, y, rows, 64, 512, False, bm, **options
+        inter,
+        inter_scale,
+        w2,
+        s2,
+        sid,
+        eid,
+        y,
+        y,
+        rows,
+        64,
+        512,
+        False,
+        bm,
+        single_layout,
+        **options,
     )
     return y
