@@ -986,6 +986,7 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        deferred_releases = []
 
         # Folds the relay point's selection into the DAG and sets the finish
         # states the loop below observes. Beam + spec is rejected at admission.
@@ -1005,7 +1006,12 @@ class SchedulerBatchResultProcessor:
                     continue
                 req.time_stats.set_last_decode_finish_time()
                 self._handle_finish_state_updated_req(
-                    req, batch, result, i, logits_output
+                    req,
+                    batch,
+                    result,
+                    i,
+                    logits_output,
+                    deferred_releases=deferred_releases,
                 )
                 continue
 
@@ -1042,7 +1048,14 @@ class SchedulerBatchResultProcessor:
                 self._handle_sampling_mask_abort(req)
                 continue
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            self._handle_finish_state_updated_req(
+                req,
+                batch,
+                result,
+                i,
+                logits_output,
+                deferred_releases=deferred_releases,
+            )
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -1087,6 +1100,11 @@ class SchedulerBatchResultProcessor:
             )
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        # Release after streaming: a long request's radix-tree insert takes
+        # milliseconds and would otherwise delay its last tokens.
+        for req, checkpoint in deferred_releases:
+            self._prepare_kv_cache_release(req)
+            release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (
@@ -1371,6 +1389,7 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
+        deferred_releases: Optional[list] = None,
     ):
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
         known_mamba_boundary = None
@@ -1446,13 +1465,16 @@ class SchedulerBatchResultProcessor:
             else:
                 if get_memory().enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
-                self._prepare_kv_cache_release(req)
                 checkpoint = (
                     req.mamba_lazy_checkpoint
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+                if deferred_releases is not None:
+                    deferred_releases.append((req, checkpoint))
+                else:
+                    self._prepare_kv_cache_release(req)
+                    release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
             req.time_stats.set_completion_time()
 
