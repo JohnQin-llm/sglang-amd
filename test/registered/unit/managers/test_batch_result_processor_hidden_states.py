@@ -10,12 +10,14 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
     SamplingMaskStatus,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -347,6 +349,53 @@ class TestDecodeWithoutLogits(CustomTestCase):
         self.assertEqual(req.output_ids, [8])
         self.assertEqual(processor.metrics_reporter.num_generated_tokens, 1)
         processor.output_streamer.stream_output.assert_called_once_with([req], False)
+
+
+class TestDecodeFinishRelease(CustomTestCase):
+    def test_finished_request_is_streamed_before_its_kv_is_released(self):
+        """A finished request's last tokens must not wait for its KV release."""
+        processor = _make_processor(self)
+        sampling_params = SamplingParams(max_new_tokens=1, temperature=0)
+        sampling_params.normalize(None)
+        req = Req(
+            rid="r0",
+            origin_input_text="",
+            origin_input_ids=[1, 2, 3],
+            sampling_params=sampling_params,
+        )
+        batch = SimpleNamespace(
+            reqs=[req],
+            return_logprob=False,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            batch_size=lambda: 1,
+            mamba_track_mask_cpu=None,
+        )
+        result = GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=torch.tensor([8]),
+        )
+        events = []
+        processor.output_streamer.stream_output.side_effect = lambda *args: (
+            events.append("stream")
+        )
+        processor.token_to_kv_pool_allocator.free_group_end.side_effect = lambda: (
+            events.append("free_group_end")
+        )
+
+        with (
+            patch.object(
+                SchedulerBatchResultProcessor, "_maybe_update_reasoning_tokens"
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache",
+                side_effect=lambda *args, **kwargs: events.append("release"),
+            ) as release,
+        ):
+            processor.process_batch_result_decode(batch, result)
+
+        self.assertTrue(req.finished())
+        self.assertEqual(events, ["stream", "release", "free_group_end"])
+        release.assert_called_once_with(req, processor.tree_cache, checkpoint=True)
 
 
 class TestSamplingMaskStatusErrors(CustomTestCase):
