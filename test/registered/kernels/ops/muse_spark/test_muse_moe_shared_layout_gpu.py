@@ -6,7 +6,7 @@ No synthetic checkpoint is substituted. Run separately for TP4/E64 and TP8/E32:
     --baseline-root /path/to/untouched/official-source
 
 Trusted torch.save fixture schema (CPU tensors are accepted):
-  metadata: {source_commit: 286b186cc9ca905ffe0d6f1ab0687fe029a8066f,
+  metadata: {source_commit: 93406f598d109f1991c34ac9e938dad51c05c34b,
              checkpoint: <official checkpoint identity>, tp: 4|8, ep: 4|8,
              local_start: <global expert start>, layer: <layer index>}
   experts: {w13_weight, w2_weight, w13_weight_scale, w2_weight_scale}
@@ -21,7 +21,8 @@ Route stress cases derive all-local/no-local ids from those captured routes.
 
 Tests cover native A16 fallback at both topologies, compact A4 verify only at
 TP8, A4 prefill thresholds, graph replay, A4 alias storage, and partial reload.
-Default configs are retained. Set --bench for 30-iteration synchronized median
+Use production configs, including K256 for single-layout A16 at 513..1024 rows.
+Set --bench for 30-iteration synchronized median
 latency AFTER correctness; no tuning or performance claim is made by this file.
 This is a component test, not the parent's full-model relL2 < .02 validation.
 """
@@ -38,8 +39,9 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
-COMMIT = "286b186cc9ca905ffe0d6f1ab0687fe029a8066f"
+COMMIT = "93406f598d109f1991c34ac9e938dad51c05c34b"
 ROOT = Path(__file__).resolve().parents[5]
 PREFIX = "python/sglang/srt/rocm_muse_spark/"
 FIXTURE = os.environ.get("MUSE_SINGLE_LAYOUT_GPU_FIXTURE")
@@ -260,6 +262,35 @@ class TestOfficialSharedLayoutGPU(unittest.TestCase):
                                 ),
                                 flush=True,
                             )
+
+    def test_a16_schedule_boundaries(self):
+        from sglang.srt.rocm_muse_spark import muse_moe_single_layout_gemm as gemm
+
+        # Slice captured fixture rows to exercise both sides of the K-tile
+        # change and the transition to the larger LDS schedule. Observe the
+        # actual compiler arguments, not just the host config dictionary.
+        source = self.case(1025)
+        launcher = gemm._launcher
+        for m, block_m, unroll in (
+            (16, 16, 16),
+            (512, 16, 16),
+            (513, 32, 8),
+            (1023, 32, 8),
+            (1024, 32, 8),
+            (1025, 64, 4),
+        ):
+            case = tuple(t[:m].contiguous() for t in source)
+            calls = []
+
+            def record(*args, _calls=calls, **kwargs):
+                _calls.append((args[3], args[10]))
+                return launcher(*args, **kwargs)
+
+            expected = self.invoke("native-a16", case, False)
+            with patch.object(gemm, "_launcher", side_effect=record):
+                actual = self.invoke("native-a16", case, True)
+            self.assertEqual(calls, [(block_m, unroll)] * 2)
+            self.check(actual, expected, f"E{self.e}/M{m}/a16-schedule-boundary")
 
     def test_z_graph_replay_and_partial_reload(self):
         torch = self.torch

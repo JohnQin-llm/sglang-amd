@@ -50,7 +50,9 @@ def _require_flydsl():
     return fx, _run_compiled
 
 
-def _pick_flydsl_config(M: int, topk: int, E: int, mxfp4: bool) -> dict:
+def _pick_flydsl_config(
+    M: int, topk: int, E: int, mxfp4: bool, single_layout: bool = False
+) -> dict:
     rows = M * topk
     table = (
         {"small": _SMALL_M_FP4, "mid": _MID_M_FP4, "large": _LARGE_M_FP4}
@@ -112,6 +114,12 @@ def _pick_flydsl_config(M: int, topk: int, E: int, mxfp4: bool) -> dict:
         cfg["BLOCK_N"] = 32 if M <= 4 else (64 if M <= 16 else 128)
         cfg["num_warps"] = 2
         cfg["FLYDSL_K_UNROLL"] = 16
+        if single_layout and M > 512:
+            # Shuffled scales require byte gathers. At BM32, a K512 tile
+            # spills both gate/up and down registers on gfx950. K256
+            # keeps this register-resident schedule spill-free; preserve
+            # the smaller-row and native-layout schedules.
+            cfg["FLYDSL_K_UNROLL"] = 8
         if M > 128:
             # Down projection re-reads the intermediate once per N tile, and
             # that traffic grows with the routed rows while the weight stream
@@ -293,7 +301,7 @@ def muse_moe_flydsl(
     else:
         assert K == kw and I == iw, "shape mismatch between w13/w2/hidden"
     if cfg is None:
-        cfg = _pick_flydsl_config(M, topk, E, mxfp4)
+        cfg = _pick_flydsl_config(M, topk, E, mxfp4, single_layout=single_layout)
     assert (
         K % cfg["BLOCK_K"] == 0 and I % cfg["BLOCK_K"] == 0 and cfg["BLOCK_K"] % 32 == 0
     )
