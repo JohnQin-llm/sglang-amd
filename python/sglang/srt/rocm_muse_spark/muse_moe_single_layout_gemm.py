@@ -367,46 +367,90 @@ def _launcher(
                     return words
 
                 def load_b_scales(tile_i):
-                    """E8M0 exponents for one K tile, one dword group per column.
+                    """Recover native scale dwords from the shuffled scale tiles.
 
-                    The K tile spans ``unroll`` scale bytes, so every lane can
-                    read the exponents of its own column directly. That drops
-                    the per-fragment ``ds_bpermute`` broadcast the byte-wide
-                    loads used to need.
+                    One aligned load contains scales for columns n/n+16 and
+                    K groups k/k+4. The four lane rows load k=0..3, then
+                    broadcast their dwords to the other rows of the wave.
+                    This replaces sixteen byte gathers per column at K512
+                    with two dword loads and eight lane broadcasts. Rebuild
+                    exactly the original per-column scale byte order.
                     """
-                    scales = []
-                    for nr in range_constexpr(n_repeat):
-                        for half in range_constexpr(halves):
-                            col = cols[nr] + half * N
-                            # Shuffled scale bytes are NOT contiguous. Rebuild
-                            # each native little-endian dword before the original
-                            # scale extraction / decode / MFMA pipeline.
-                            dwords = []
-                            for word in range_constexpr(unroll // 4):
-                                packed_scale = fx.Int32(0)
-                                for byte in range_constexpr(4):
-                                    exponent = buffer_ops.buffer_load(
+                    if fx.const_expr(unroll >= 8 and unroll % 8 == 0):
+                        scales = []
+                        for nr in range_constexpr(n_repeat):
+                            for half in range_constexpr(halves):
+                                col = cols[nr] + half * N
+                                dwords = []
+                                for group in range_constexpr(unroll // 8):
+                                    raw = []
+                                    loaded = buffer_ops.buffer_load(
                                         s_r,
                                         scale_byte(
-                                            col, tile_i * unroll + word * 4 + byte
-                                        ),
+                                            col,
+                                            tile_i * unroll + group * 8 + lane // 16,
+                                        )
+                                        // 4,
                                         vec_width=1,
-                                        dtype=T.i8,
+                                        dtype=T.i32,
                                     )
-                                    exponent = fx.Int32(
-                                        arith.extui(T.i32, _to_raw(exponent))
-                                    )
-                                    packed_scale = packed_scale | (
-                                        exponent << (byte * 8)
-                                    )
-                                dwords.append(packed_scale)
-                            if fx.const_expr(unroll // 4 == 1):
-                                scales.append(_to_raw(dwords[0]))
-                            else:
+                                    for byte in range_constexpr(4):
+                                        raw.append(
+                                            fx.Int32(
+                                                fx.rocdl.ds_bpermute(
+                                                    T.i32,
+                                                    _to_raw((row_lane + byte * 16) * 4),
+                                                    loaded,
+                                                )
+                                            )
+                                        )
+                                    for part in range_constexpr(2):
+                                        packed = fx.Int32(0)
+                                        shift = col % 32 // 16 * 8 + part * 16
+                                        for byte in range_constexpr(4):
+                                            exponent = (raw[byte] >> shift) & 255
+                                            packed = packed | (exponent << (byte * 8))
+                                        dwords.append(packed)
                                 scales.append(
                                     _to_raw(fx.Vector.from_elements(dwords, fx.Int32))
                                 )
-                    return scales
+                        return scales
+                    else:
+                        scales = []
+                        for nr in range_constexpr(n_repeat):
+                            for half in range_constexpr(halves):
+                                col = cols[nr] + half * N
+                                # Shuffled scale bytes are NOT contiguous. Rebuild
+                                # each native little-endian dword before the original
+                                # scale extraction / decode / MFMA pipeline.
+                                dwords = []
+                                for word in range_constexpr(unroll // 4):
+                                    packed_scale = fx.Int32(0)
+                                    for byte in range_constexpr(4):
+                                        exponent = buffer_ops.buffer_load(
+                                            s_r,
+                                            scale_byte(
+                                                col, tile_i * unroll + word * 4 + byte
+                                            ),
+                                            vec_width=1,
+                                            dtype=T.i8,
+                                        )
+                                        exponent = fx.Int32(
+                                            arith.extui(T.i32, _to_raw(exponent))
+                                        )
+                                        packed_scale = packed_scale | (
+                                            exponent << (byte * 8)
+                                        )
+                                    dwords.append(packed_scale)
+                                if fx.const_expr(unroll // 4 == 1):
+                                    scales.append(_to_raw(dwords[0]))
+                                else:
+                                    scales.append(
+                                        _to_raw(
+                                            fx.Vector.from_elements(dwords, fx.Int32)
+                                        )
+                                    )
+                        return scales
 
                 def scale_dwords(loaded):
                     if fx.const_expr(unroll // 4 == 1):

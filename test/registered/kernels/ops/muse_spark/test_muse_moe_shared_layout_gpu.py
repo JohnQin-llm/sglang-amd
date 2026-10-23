@@ -292,6 +292,66 @@ class TestOfficialSharedLayoutGPU(unittest.TestCase):
             self.assertEqual(calls, [(block_m, unroll)] * 2)
             self.check(actual, expected, f"E{self.e}/M{m}/a16-schedule-boundary")
 
+    def test_scale_byte_patterns(self):
+        # Vary adjacent columns and scale bytes independently. Real checkpoint
+        # scales often repeat, which can hide a packed-byte/lane ordering bug.
+        # Keep real FP4 weights and captured activations; this scale stress is
+        # synthetic and does not represent checkpoint quality or performance.
+        torch = self.torch
+        names = ("w13_weight_scale", "w2_weight_scale")
+        saved = {n: getattr(self.native, n).clone() for n in names}
+        generator = torch.Generator(device=self.norm.device).manual_seed(1023)
+        source = self.case(1025, "all-local")
+
+        def reload_scales():
+            self.layout.begin_load(self.shared)
+            for name in names:
+                getattr(self.shared, name).copy_(getattr(self.native, name))
+            self.layout.finish_load(self.shared)
+            self.ops.prepare_a4w4_weights(self.shared)
+
+        try:
+            with torch.no_grad():
+                for name in names:
+                    getattr(self.native, name).random_(118, 126, generator=generator)
+                reload_scales()
+            cases = [("native-a16", m) for m in (1, 8, 16, 128, 513, 1024)]
+            if self.e == 32:
+                cases += [("compact-a4", m) for m in (8, 16, 128, 512)]
+            for role, m in cases:
+                case = tuple(t[:m].contiguous() for t in source)
+                expected = self.invoke(role, case, False)
+                actual = self.invoke(role, case, True)
+                self.check(actual, expected, f"E{self.e}/M{m}/{role}/scale-patterns")
+        finally:
+            torch.cuda.synchronize()
+            with torch.no_grad():
+                for name in names:
+                    getattr(self.native, name).copy_(saved[name])
+                reload_scales()
+                self.ref_ops.prepare_a4w4_weights(self.native)
+
+    def test_compact_launch_boundaries(self):
+        if self.e != 32:
+            self.skipTest("compact A4 is restricted to E32")
+        from sglang.kernels.ops.moe import mxfp4_compact_a4_moe as compact
+
+        source = self.case(1025)
+        launch = compact._expert_a4.run
+        for m in (8, 376, 384, 392, 512):
+            case = tuple(t[:m].contiguous() for t in source)
+            calls = []
+
+            def record(*args, _calls=calls, **kwargs):
+                _calls.append((args[9], kwargs["num_stages"]))
+                return launch(*args, **kwargs)
+
+            expected = self.invoke("compact-a4", case, False)
+            with patch.object(compact._expert_a4, "run", side_effect=record):
+                actual = self.invoke("compact-a4", case, True)
+            self.assertEqual(calls, [(128, 1) if m >= 384 else (64, 2), (64, 2)])
+            self.check(actual, expected, f"E32/M{m}/compact-launch-boundary")
+
     def test_z_graph_replay_and_partial_reload(self):
         torch = self.torch
         for update_row, (role, m) in enumerate(
