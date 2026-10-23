@@ -17,12 +17,17 @@ Adapted from Kimi-K3's ``mono/runner.py`` (PR #60683).
 import os
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.rocm_muse_spark.mono.ops.common.epoch import advance_epoch_
 from sglang.srt.rocm_muse_spark.mono.runtime.abi import PEER_HEAD
 from sglang.srt.rocm_muse_spark.mono.runtime.peer import PeerBuffer, bind_agreed
-from sglang.srt.rocm_muse_spark.mono.spec import HIDDEN, MAX_TOKENS, TP
+from sglang.srt.rocm_muse_spark.mono.spec import (
+    ALLOCATION_WIDTHS,
+    HIDDEN,
+    MAX_TOKENS,
+    TP,
+    WIDE_ENABLED,
+)
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -46,7 +51,7 @@ class MonoRunner:
     """Collective: every TP rank builds it at the same point."""
 
     def __init__(self, device: torch.device):
-        from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
+        from sglang.srt.rocm_muse_spark.mono.ops import k1, k2, k2_dispatch
 
         self.device = device
         tp = get_parallel().tp_group
@@ -57,21 +62,21 @@ class MonoRunner:
 
         def allocate_local() -> None:
             expert_stack = envs.SGLANG_MUSE_MONO_EXPERT_STACK.get()
-            if expert_stack and (
+            if (expert_stack or WIDE_ENABLED) and (
                 get_parallel().moe_ep_size != 1
                 or not getattr(
                     torch.cuda.get_device_properties(device), "gcnArchName", ""
                 ).startswith("gfx950")
             ):
-                raise ValueError("Muse Mono expert stack requires gfx950 TP8/EP1")
+                raise ValueError("Muse Mono expert/wide stack requires gfx950 TP8/EP1")
             # Freeze the width policy before allocation and graph capture.
             # Layer-key construction consumes these same selected schedules.
             self.k2_keys = {
-                width: k2.K2Build(
-                    tokens=width,
+                width: k2_dispatch.default_key(
+                    width,
                     experimental_two_cta=expert_stack and width == MAX_TOKENS,
                 )
-                for width in range(1, MAX_TOKENS + 1)
+                for width in ALLOCATION_WIDTHS
             }
             self.allocation_guard_bytes = int(
                 os.environ.get("VLLM_ROCM_LAYER_MONOKERNEL_CANARY_BYTES", "0")
@@ -85,7 +90,10 @@ class MonoRunner:
             self._allocation_canary = 0xA5
             self._scratch_bytes = max(
                 k1.max_scratch_bytes(MAX_TOKENS),
-                *(k2.scratch_bytes(key) for key in self.k2_keys.values()),
+                *(
+                    k2_dispatch.module_for_key(key).scratch_bytes(key)
+                    for key in self.k2_keys.values()
+                ),
             )
             self._scratch_storage = torch.empty(
                 self._scratch_bytes + 2 * guard,
@@ -96,23 +104,30 @@ class MonoRunner:
                 self._scratch_storage.fill_(self._allocation_canary)
             self.scratch = self._scratch_storage[guard : guard + self._scratch_bytes]
             self.scratch.zero_()
+            max_tokens = max(self.k2_keys)
             self.epoch = torch.zeros(1, dtype=torch.int32, device=device)
-            self.seq_lens = torch.zeros(MAX_TOKENS, dtype=torch.int32, device=device)
+            self.seq_lens = torch.zeros(max_tokens, dtype=torch.int32, device=device)
             health_words = max(
-                k2.health_words_for_key(key) for key in self.k2_keys.values()
+                k2_dispatch.module_for_key(key).health_words_for_key(key)
+                for key in self.k2_keys.values()
             )
             self.health = torch.zeros(health_words, dtype=torch.int32, device=device)
             self.stream_a = torch.empty(
-                MAX_TOKENS, HIDDEN, dtype=torch.float32, device=device
+                max_tokens, HIDDEN, dtype=torch.float32, device=device
             )
             self.core = torch.empty(
-                MAX_TOKENS, k1.CORE, dtype=torch.bfloat16, device=device
+                max_tokens, k1.CORE, dtype=torch.bfloat16, device=device
             )
             torch.cuda.synchronize(device)
 
         bind_agreed(allocate_local, tp.cpu_group)
         guard = self.allocation_guard_bytes
-        self._peer_bytes = PEER_HEAD + k2.peer_bytes(MAX_TOKENS)
+        peer_bytes = k2.peer_bytes(MAX_TOKENS)
+        if WIDE_ENABLED:
+            from sglang.srt.rocm_muse_spark.mono.ops import k2_wide
+
+            peer_bytes = max(peer_bytes, k2_wide.peer_bytes())
+        self._peer_bytes = PEER_HEAD + peer_bytes
         self.peers = PeerBuffer(
             self._peer_bytes + 2 * guard,
             tp.cpu_group,

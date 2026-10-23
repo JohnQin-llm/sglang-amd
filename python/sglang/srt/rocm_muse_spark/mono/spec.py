@@ -5,8 +5,17 @@ from __future__ import annotations
 
 import os
 
+from sglang.srt.environ import envs
+
 TP = 8
 MAX_TOKENS = 8
+WIDE_TOKENS = (16, 24)
+# Freeze before registration, allocation, and graph capture.
+WIDE_ENABLED = envs.SGLANG_MUSE_MONO_WIDE_STAGED.get()
+SERVING_WIDTHS = (1, 8) + (WIDE_TOKENS if WIDE_ENABLED else ())
+ALLOCATION_WIDTHS = tuple(range(1, MAX_TOKENS + 1)) + (
+    WIDE_TOKENS if WIDE_ENABLED else ()
+)
 BLOCKS = 256
 THREADS = 512
 HIDDEN = 8192
@@ -63,8 +72,8 @@ def step_disable_reason(forward_batch, rows: int) -> str | None:
     mode = forward_batch.forward_mode
     if not (mode.is_decode() or mode.is_target_verify()):
         return "not decode/target-verify"
-    if not 1 <= rows <= MAX_TOKENS:
-        return f"width {rows} is outside 1..{MAX_TOKENS}"
+    if rows not in ALLOCATION_WIDTHS:
+        return f"width {rows} is not enabled for Muse monokernels"
     batch = int(forward_batch.batch_size)
     if batch <= 0 or rows % batch:
         return "rows do not hold whole uniform requests"

@@ -34,8 +34,11 @@ from sglang.srt.rocm_muse_spark.mono.spec import (
     INTER,
     KV_BLOCK,
     MOE_HIDDEN,
+    SERVING_WIDTHS,
     TOP_K,
     TP,
+    WIDE_ENABLED,
+    WIDE_TOKENS,
     WINDOW,
     kernel_layers,
     native_attention_enabled,
@@ -94,6 +97,10 @@ def config_disable_reasons(cfg: Any, config: Any) -> list[str]:
     # qualification is still pending. Target verification requires an explicit
     # experimental flag until that qualification is complete.
     algorithm = getattr(cfg, "speculative_algorithm", None)
+    if WIDE_ENABLED and (
+        algorithm != "DFLASH" or cfg.speculative_num_draft_tokens != 8
+    ):
+        reasons.append("wide staged verification requires DFlash block8")
     native_probe = any(
         os.getenv(name, "0") == "1"
         for name in (
@@ -273,18 +280,30 @@ def build(model, config, context: BuildContext) -> BuiltMuseOriginal:
         if spec_config.speculative_algorithm is None
         else int(spec_config.speculative_num_draft_tokens)
     )
-    expected_width = 8 if q_len == 8 else 1
-    if q_len not in (1, 8) or any(w != expected_width for w in context.widths):
+    supported_widths = (
+        SERVING_WIDTHS if WIDE_ENABLED else ((8,) if q_len == 8 else (1,))
+    )
+    if q_len not in (1, 8) or any(
+        w not in supported_widths or w % q_len for w in context.widths
+    ):
         raise ValueError(
-            "Original Muse kernels require one decode token or one DFlash8 block"
+            "Original Muse kernels require widths 1/8/16/24 containing whole "
+            "decode tokens or DFlash8 blocks"
         )
     compile_errors: list[str] = []
     built_keys = set()
     for i in indices:
         previous_eps = decoder.layers[i - 1].post_ffn_norm.variance_epsilon
         for width in context.widths:
-            keys = layer_keys(decoder.layers[i], width, q_len, post_eps=previous_eps)
-            if i in native_layers:
+            native_attention = width in WIDE_TOKENS or i in native_layers
+            keys = layer_keys(
+                decoder.layers[i],
+                width,
+                q_len,
+                post_eps=previous_eps,
+                native_attention=native_attention,
+            )
+            if native_attention:
                 keys = keys[1:]
             for key in keys:
                 if key in built_keys:
@@ -310,8 +329,12 @@ def build(model, config, context: BuildContext) -> BuiltMuseOriginal:
         )
         runner.layer_names[i] = f"model.layers.{i}"
         for width in context.widths:
+            native_attention = width in WIDE_TOKENS or i in native_layers
             kernels[i, width] = MuseLayerKernel(
-                decoder.layers[i], runner, width, native_attention=i in native_layers
+                decoder.layers[i],
+                runner,
+                width,
+                native_attention=native_attention,
             )
     built = BuiltMuseOriginal(model, runner, kernels)
     # Keep an explicit owner for deterministic, idempotent server teardown.
@@ -322,7 +345,11 @@ def build(model, config, context: BuildContext) -> BuiltMuseOriginal:
 MONO_SPEC = MonoSpec(
     name="Muse original TP8 W4A4 K1+K2",
     devices={
-        "gfx950": DeviceLimits(widths=(1, 8), tp_sizes=(TP,), resident_blocks=BLOCKS)
+        "gfx950": DeviceLimits(
+            widths=SERVING_WIDTHS,
+            tp_sizes=(TP,),
+            resident_blocks=BLOCKS,
+        )
     },
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     requires=Requirements(

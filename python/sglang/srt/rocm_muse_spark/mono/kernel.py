@@ -27,7 +27,6 @@ import json
 from typing import Any
 
 import torch
-
 from sglang.srt.monokernels.spec import Plan
 from sglang.srt.rocm_muse_spark.mono.runner import MonoRunner
 
@@ -46,30 +45,36 @@ def layer_keys(
     *,
     post_eps: float | None = None,
     experimental_two_cta: bool = False,
+    native_attention: bool = False,
 ):
     """The K1 and K2 build keys of ``layer`` at ``width`` rows."""
-    from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
+    from sglang.srt.rocm_muse_spark.mono.ops import k1, k2_dispatch
 
     fault = fault or {}
     a = layer.self_attn
     m = layer.feed_forward
-    k1_key = k1.make_key(
-        tokens=width,
-        q_len=q_len,
-        window=max(0, int(a.attn.sliding_window_size)),
-        rope=bool(a.use_rope),
-        scale=float(a.scaling),
-        eps=a.pre_qkv_proj_norm.variance_epsilon,
-        # K1 closes the *previous* layer's FFN boundary.  Do not infer this
-        # epsilon from the current layer even though the target checkpoint
-        # happens to use one value everywhere.
-        post_eps=(
-            layer.post_ffn_norm.variance_epsilon if post_eps is None else post_eps
-        ),
-        qk_eps=a.rms_norm_eps,
-        **fault,
-    )
-    k2_key = k2.make_key(
+    wide = k2_dispatch.family_for_width(width) == "wide"
+    if wide and not native_attention:
+        raise ValueError("M16/M24 FullK2 requires the native attention path")
+    k1_key = None
+    if not wide:
+        k1_key = k1.make_key(
+            tokens=width,
+            q_len=q_len,
+            window=max(0, int(a.attn.sliding_window_size)),
+            rope=bool(a.use_rope),
+            scale=float(a.scaling),
+            eps=a.pre_qkv_proj_norm.variance_epsilon,
+            # K1 closes the *previous* layer's FFN boundary.  Do not infer this
+            # epsilon from the current layer even though the target checkpoint
+            # happens to use one value everywhere.
+            post_eps=(
+                layer.post_ffn_norm.variance_epsilon if post_eps is None else post_eps
+            ),
+            qk_eps=a.rms_norm_eps,
+            **fault,
+        )
+    k2_key = k2_dispatch.make_key(
         tokens=width,
         experimental_two_cta=experimental_two_cta,
         eps_post_attn=layer.post_attn_norm.variance_epsilon,
@@ -89,24 +94,28 @@ def layer_keys(
 
 
 def compile_checked(key) -> list[str]:
-    """Compiles one build without launching it, then the residency proof: the
-    runtime's occupancy must hold the selected whole grid resident, with no
-    private scratch. Returns problems (empty: launchable).
+    """Compile and check the selected schedule's resource contract.
+
+    Staged wide K2 rejects spills but permits partially resident grids. Legacy
+    persistent schedules retain their existing whole-grid capacity checks.
+    Returns problems (empty: launchable).
 
     SGPR-to-VGPR spills can still occur and are reported separately in the
     compiled kernel resources.
     """
-    from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
+    from sglang.srt.rocm_muse_spark.mono.ops import k1, k2_dispatch
     from sglang.srt.rocm_muse_spark.mono.ops.common.plan import BLOCKS, THREADS
     from sglang.srt.rocm_muse_spark.mono.ops.common.residency import residency
 
-    mod = k1 if isinstance(key, k1.K1Build) else k2
+    mod = k1 if isinstance(key, k1.K1Build) else k2_dispatch.module_for_key(key)
+    if not getattr(mod, "REQUIRES_GRID_RESIDENCY", True):
+        return mod.resources(key)["problems"]
     mod.compile_only(key)
     cus = torch.cuda.get_device_properties().multi_processor_count
     found = residency(mod.build(key), THREADS)
     if not found:
         return [f"{type(key).__name__}: no code object to check"]
-    blocks = BLOCKS if mod is k1 else k2.grid_blocks(key)
+    blocks = BLOCKS if mod is k1 else mod.grid_blocks(key)
     return [p for r in found for p in r.problems(blocks, cus)]
 
 
@@ -132,8 +141,14 @@ class MuseLayerKernel:
             runner.q_len,
             runner.fault,
             post_eps=runner.prev_post_eps.get(layer.layer_idx),
-            experimental_two_cta=runner.k2_keys[width].experimental_two_cta,
+            experimental_two_cta=getattr(
+                runner.k2_keys[width], "experimental_two_cta", False
+            ),
+            native_attention=native_attention,
         )
+        from sglang.srt.rocm_muse_spark.mono.ops import k2_dispatch
+
+        self.k2_module = k2_dispatch.module_for_width(width)
 
     # ---- LayerKernel protocol
 
@@ -145,9 +160,12 @@ class MuseLayerKernel:
         return [self.k2_key] if self.native_attention else [self.k1_key, self.k2_key]
 
     def compile(self, key) -> None:
-        from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
+        from sglang.srt.rocm_muse_spark.mono.ops import k1
 
-        (k1 if key == self.k1_key else k2).compile_only(key)
+        module = (
+            k1 if self.k1_key is not None and key == self.k1_key else self.k2_module
+        )
+        module.compile_only(key)
 
     def launch(self, step: Plan, positions: torch.Tensor, x: Any, forward_batch):
         return self.forward(positions, x, forward_batch, new_step=self.first)
@@ -160,7 +178,7 @@ class MuseLayerKernel:
             attention_inputs,
             prepare_seq_lens,
         )
-        from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
+        from sglang.srt.rocm_muse_spark.mono.ops import k1
 
         layer, runner, t = self.layer, self.runner, self.width
         a = layer.self_attn
@@ -175,7 +193,10 @@ class MuseLayerKernel:
         stream, branch = x.stream, x.branch
         if stream.shape[0] != t or branch.shape[0] != t:
             raise ValueError(f"MonoKernel width {t}: got {stream.shape[0]} rows")
-        if float(x.post_norm.variance_epsilon) != self.k1_key.post_eps:
+        if (
+            self.k1_key is not None
+            and float(x.post_norm.variance_epsilon) != self.k1_key.post_eps
+        ):
             raise ValueError(
                 "MonoKernel predecessor post-FFN epsilon changed after build: "
                 f"{x.post_norm.variance_epsilon} != {self.k1_key.post_eps}"
@@ -214,7 +235,7 @@ class MuseLayerKernel:
             )
         stream_out = torch.empty_like(stream)
         branch_out = torch.empty_like(branch)
-        k2.k2_launch(
+        self.k2_module.k2_launch(
             self.k2_key,
             core=core,
             stream_a=stream_a,
@@ -274,7 +295,14 @@ def prepare_layer_monokernel(
     if fault is not None:
         _RUNNER.fault = dict(fault)
     for w in widths:
-        k = MuseLayerKernel(layer, _RUNNER, w)
+        from sglang.srt.rocm_muse_spark.mono.ops import k2_dispatch
+
+        k = MuseLayerKernel(
+            layer,
+            _RUNNER,
+            w,
+            native_attention=k2_dispatch.family_for_width(w) == "wide",
+        )
         problems = [p for key in k.warmup_keys() for p in compile_checked(key)]
         if problems:
             raise RuntimeError("MonoKernel not launchable: " + "; ".join(problems))
@@ -308,7 +336,7 @@ def layer_monokernel_identity(layer, width: int) -> dict[str, Any]:
     with every result prevents a timing or SNR record from being attributed to
     a later dirty-worktree candidate.
     """
-    from sglang.srt.rocm_muse_spark.mono.ops import k1, k2
+    from sglang.srt.rocm_muse_spark.mono.ops import k1
 
     kernel = _KERNELS.get((layer.layer_idx, width))
     if kernel is None:
@@ -316,7 +344,7 @@ def layer_monokernel_identity(layer, width: int) -> dict[str, Any]:
             "no prepared MonoKernel identity for layer "
             f"{layer.layer_idx}, width {width}"
         )
-    k1_key = dataclasses.asdict(kernel.k1_key)
+    k1_key = None if kernel.k1_key is None else dataclasses.asdict(kernel.k1_key)
     k2_key = dataclasses.asdict(kernel.k2_key)
 
     def build_identity(source: str, key: dict[str, Any]) -> dict[str, Any]:
@@ -335,8 +363,8 @@ def layer_monokernel_identity(layer, width: int) -> dict[str, Any]:
         ).gcnArchName,
         "torch_version": torch.__version__,
         "hip_version": torch.version.hip,
-        "k1": build_identity(k1._SOURCES, k1_key),
-        "k2": build_identity(k2._SOURCES, k2_key),
+        "k1": None if k1_key is None else build_identity(k1._SOURCES, k1_key),
+        "k2": build_identity(kernel.k2_module._SOURCES, k2_key),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     payload["candidate_sha256"] = hashlib.sha256(encoded).hexdigest()
