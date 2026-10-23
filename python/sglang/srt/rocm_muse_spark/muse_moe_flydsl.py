@@ -50,7 +50,9 @@ def _require_flydsl():
     return fx, _run_compiled
 
 
-def _pick_flydsl_config(M: int, topk: int, E: int, mxfp4: bool) -> dict:
+def _pick_flydsl_config(
+    M: int, topk: int, E: int, mxfp4: bool, single_layout: bool = False
+) -> dict:
     rows = M * topk
     table = (
         {"small": _SMALL_M_FP4, "mid": _MID_M_FP4, "large": _LARGE_M_FP4}
@@ -112,6 +114,12 @@ def _pick_flydsl_config(M: int, topk: int, E: int, mxfp4: bool) -> dict:
         cfg["BLOCK_N"] = 32 if M <= 4 else (64 if M <= 16 else 128)
         cfg["num_warps"] = 2
         cfg["FLYDSL_K_UNROLL"] = 16
+        if single_layout and M > 512:
+            # Shuffled scales require byte gathers. At BM32, a K512 tile
+            # spills both gate/up and down registers on gfx950. K256
+            # keeps this register-resident schedule spill-free; preserve
+            # the smaller-row and native-layout schedules.
+            cfg["FLYDSL_K_UNROLL"] = 8
         if M > 128:
             # Down projection re-reads the intermediate once per N tile, and
             # that traffic grows with the routed rows while the weight stream
@@ -160,8 +168,14 @@ def _launch_gemm(
     mxfp4,
     cfg,
     split_k=1,
+    single_layout=False,
 ):
-    from aiter.ops.flydsl.muse_moe_gemm import launch_muse_moe_gemm
+    if single_layout:
+        from sglang.srt.rocm_muse_spark.muse_moe_single_layout_gemm import (
+            launch_muse_moe_gemm,
+        )
+    else:
+        from aiter.ops.flydsl.muse_moe_gemm import launch_muse_moe_gemm
 
     # Gate/up carries twice as many accumulator fragments as down projection,
     # so one tile is not generally optimal for both stages.  Preserve the
@@ -208,8 +222,9 @@ def muse_moe_flydsl(
     has_norm: bool = True,
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
+    single_layout: bool = False,
 ) -> torch.Tensor:
-    """Muse MoE with native-layout FlyDSL grouped GEMMs and finalize."""
+    """Muse MoE with FlyDSL grouped GEMMs and unchanged per-slot finalize."""
     fx, _run_compiled = _require_flydsl()
 
     if hidden_states.ndim != 2 or topk_ids.ndim != 2 or w13.ndim != 3 or w2.ndim != 3:
@@ -286,7 +301,7 @@ def muse_moe_flydsl(
     else:
         assert K == kw and I == iw, "shape mismatch between w13/w2/hidden"
     if cfg is None:
-        cfg = _pick_flydsl_config(M, topk, E, mxfp4)
+        cfg = _pick_flydsl_config(M, topk, E, mxfp4, single_layout=single_layout)
     assert (
         K % cfg["BLOCK_K"] == 0 and I % cfg["BLOCK_K"] == 0 and cfg["BLOCK_K"] % 32 == 0
     )
@@ -333,6 +348,7 @@ def muse_moe_flydsl(
             mxfp4,
             cfg,
             split_k,
+            single_layout=single_layout,
         )
         stream = fx.Stream(torch.cuda.current_stream(hidden_states.device).cuda_stream)
         _run_compiled(
@@ -363,6 +379,7 @@ def muse_moe_flydsl(
             True,
             mxfp4,
             cfg,
+            single_layout=single_layout,
         )
         y = torch.empty(
             (num_valid, H), dtype=hidden_states.dtype, device=hidden_states.device
@@ -384,6 +401,7 @@ def muse_moe_flydsl(
         mxfp4,
         cfg,
         split_k,
+        single_layout=single_layout,
     )
 
     out = torch.empty((M, H), dtype=hidden_states.dtype, device=hidden_states.device)

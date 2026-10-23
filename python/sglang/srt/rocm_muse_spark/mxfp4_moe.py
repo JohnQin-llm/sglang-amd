@@ -7,11 +7,14 @@ with input scale before the route-weighted sum, which a combining MoE epilogue c
 * Compact A4 (``SGLANG_MUSE_COMPACT_A4_VERIFY``): target-verify batches (a multiple of 8 rows, up to 512) at
   TP8 / EP8 run the Triton ``mxfp4_compact_a4_moe`` experts on the checkpoint weights as stored.
 * a4w4 (``SGLANG_MUSE_A4W4_MOE``): prefill batches of at least ``A4W4_MIN_ROWS`` rows run aiter's FlyDSL
-  stage-1 / stage-2 MXFP4 kernels on weights shuffled once at load into aiter's preshuffle layout (an extra copy
-  beside the native one); stage 1 writes MXFP4 + sorted scales itself.
+  stage-1 / stage-2 MXFP4 kernels on weights shuffled once at load into aiter's preshuffle layout.
+  The opt-in single-layout mode aliases Parameter storage; otherwise this is a second copy.
+  Stage 1 writes MXFP4 + sorted scales itself.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 
@@ -19,7 +22,7 @@ from sglang.kernels.ops.moe.mxfp4_compact_a4_moe import MAX_ROWS as COMPACT_A4_M
 from sglang.kernels.ops.moe.mxfp4_compact_a4_moe import compact_a4_experts
 from sglang.kernels.ops.quantization.mxfp4_quant_rows import mxfp4_quant_rows
 from sglang.srt.environ import envs
-from sglang.srt.rocm_muse_spark import muse_moe_flydsl
+from sglang.srt.rocm_muse_spark import muse_moe_flydsl, single_layout
 
 COMPACT_A4_ENABLED = envs.SGLANG_MUSE_COMPACT_A4_VERIFY.get()
 A4W4_ENABLED = envs.SGLANG_MUSE_A4W4_MOE.get()
@@ -39,6 +42,26 @@ __all__ = [
     "run_a4w4",
     "run_compact_a4",
 ]
+
+
+def single_layout_enabled(experts, *, ready=True):
+    # Check live options against the startup constants before any consumer can
+    # interpret the buffers. No GPU query or tensor scalar read on this path.
+    enabled = envs.SGLANG_MUSE_MOE_SINGLE_LAYOUT.get()
+    if not enabled and not getattr(experts, "_single_layout_mode", False):
+        return False
+    mode = single_layout.check_options(
+        experts,
+        enabled=enabled,
+        a4w4=A4W4_ENABLED and envs.SGLANG_MUSE_A4W4_MOE.get(),
+        backend=os.environ.get("MUSE_MOE_BACKEND", "auto").lower(),
+        compact_unchanged=(
+            COMPACT_A4_ENABLED == envs.SGLANG_MUSE_COMPACT_A4_VERIFY.get()
+        ),
+    )
+    if ready:
+        single_layout.require_ready(experts)
+    return mode
 
 
 def _finalize_per_slot(
@@ -76,6 +99,7 @@ def run_compact_a4(x, scores, ids, experts, local_start, norm_weight, eps, gain)
         experts.w13_weight_scale,
         experts.w2_weight_scale,
         local_start=local_start,
+        single_layout=single_layout_enabled(experts),
     )
     return _finalize_per_slot(
         y, norm_weight, scores, ids, local_start, experts.w13_weight.shape[0], eps, gain
@@ -84,7 +108,10 @@ def run_compact_a4(x, scores, ids, experts, local_start, norm_weight, eps, gain)
 
 @torch.no_grad()
 def prepare_a4w4_weights(experts) -> None:
-    """Shuffle the MXFP4 expert weights and scales into aiter's FlyDSL preshuffle layout (a second copy)."""
+    """Prepare the official A4 layout; single-layout mode keeps only alias views."""
+    mode = single_layout_enabled(experts, ready=False)
+    if mode and experts._single_layout_state == "shuffled":
+        return
     from aiter import dtypes
     from aiter.ops.shuffle import (
         shuffle_scale_a16w4,
@@ -97,6 +124,24 @@ def prepare_a4w4_weights(experts) -> None:
     s13, s2 = experts.w13_weight_scale, experts.w2_weight_scale
     e, two_i, h_half = w13.shape
     h, i = w2.shape[1], two_i // 2
+    if mode:
+        single_layout.transform(experts)
+        # Parameter objects/addresses stay fixed, including across quiescent
+        # reloads. Only dtype/shape views are retained for the A4 consumers.
+        try:
+            w1s, w2s = w13.view(dtypes.fp4x2), w2.view(dtypes.fp4x2)
+            w1s.is_shuffled = w2s.is_shuffled = True
+            experts.a4w4_weights = (
+                w1s,
+                w2s,
+                s13.view(dtypes.fp8_e8m0).view(e * two_i, h_half * 2 // 32),
+                s2.view(dtypes.fp8_e8m0).view(e * h, i // 32),
+            )
+        except BaseException:
+            experts._single_layout_state = "failed"
+            experts.a4w4_weights = None
+            raise
+        return
     experts.a4w4_weights = (
         shuffle_weight(w13.view(dtypes.fp4x2), (16, 16)),
         shuffle_weight_a16w4(w2.view(dtypes.fp4x2), 16, False),
@@ -119,6 +164,7 @@ def run_a4w4(
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from aiter.utility.fp4_utils import moe_mxfp4_sort
 
+    single_layout_enabled(experts)
     w1s, w2s, s1s, s2s = experts.a4w4_weights
     m, h = ids.shape[0], experts.w2_weight.shape[1]
     topk = ids.shape[1]

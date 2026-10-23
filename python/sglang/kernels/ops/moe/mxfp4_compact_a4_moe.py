@@ -99,6 +99,33 @@ def _scatter_a4(
 
 
 @triton.jit
+def _load_single_layout_weight(
+    W, base, n_block, BN: tl.constexpr, BK: tl.constexpr, tile
+):
+    # Physical axes: [N/16, Kbytes/16, N%16, Kbytes%16]. Read contiguous
+    # packed fragments, then present the original [Kbytes, N] dot operand.
+    r = tl.arange(0, BN * (BK // 2))
+    off = r // (16 * (BK // 2)) * (16 * 2048) + r % (16 * (BK // 2))
+    raw = tl.load(W + base + n_block * BN * 2048 + tile * (BK // 2) * 16 + off)
+    raw = tl.reshape(raw, (BN // 16, BK // 32, 16, 16))
+    return tl.reshape(tl.permute(raw, (1, 3, 0, 2)), (BK // 2, BN))
+
+
+@triton.jit
+def _load_single_layout_scale(
+    WS, base, n_block, BN: tl.constexpr, BK: tl.constexpr, tile
+):
+    # Physical axes: [N/32, Kscales/8, Kscales%4, N%16, Kscales/4%2, N/16%2].
+    # Reshape/permute preserves scale bytes and avoids scattered byte loads.
+    tl.static_assert(BN % 32 == 0 and BK % 256 == 0)
+    r = tl.arange(0, BN * (BK // 32))
+    off = r // (32 * (BK // 32)) * (32 * 128) + r % (32 * (BK // 32))
+    raw = tl.load(WS + base + n_block * BN * 128 + tile * (BK // 32) * 32 + off)
+    raw = tl.reshape(raw, (BN // 32, BK // 256, 4, 16, 2, 2))
+    return tl.reshape(tl.permute(raw, (0, 5, 3, 1, 4, 2)), (BN, BK // 32))
+
+
+@triton.jit
 def _expert_a4(
     A,
     AS,
@@ -113,6 +140,7 @@ def _expert_a4(
     BK: tl.constexpr,
     ACT: tl.constexpr,
     BM: tl.constexpr,
+    SINGLE_LAYOUT: tl.constexpr,
 ):
     expert_block, n_block = tl.program_id(1), tl.program_id(0)
     expert = tl.load(EXPERT + expert_block)
@@ -138,36 +166,32 @@ def _expert_a4(
                 valid[:, None],
                 other=127,
             )
-            w = tl.load(
-                W
-                + expert * (wn * 2048)
-                + n[None, :] * 2048
-                + tile * (BK // 2)
-                + kp[:, None]
-            )
-            ws = tl.load(
-                WS
-                + expert * (wn * 128)
-                + n[:, None] * 128
-                + tile * (BK // 32)
-                + ks[None, :]
-            )
+            kb = tile * (BK // 2) + kp[:, None]
+            sb = tile * (BK // 32) + ks[None, :]
+            if SINGLE_LAYOUT:
+                w = _load_single_layout_weight(
+                    W, expert * (wn * 2048), n_block, BN, BK, tile
+                )
+                ws = _load_single_layout_scale(
+                    WS, expert * (wn * 128), n_block, BN, BK, tile
+                )
+            else:
+                wo = n[None, :] * 2048 + kb
+                so = n[:, None] * 128 + sb
+                w = tl.load(W + expert * (wn * 2048) + wo)
+                ws = tl.load(WS + expert * (wn * 128) + so)
             acc = tl.dot_scaled(a, asc, "e2m1", w, ws, "e2m1", acc)
             if ACT:
-                wu = tl.load(
-                    W
-                    + expert * (wn * 2048)
-                    + (n[None, :] + 4096) * 2048
-                    + tile * (BK // 2)
-                    + kp[:, None]
-                )
-                wsu = tl.load(
-                    WS
-                    + expert * (wn * 128)
-                    + (n[:, None] + 4096) * 128
-                    + tile * (BK // 32)
-                    + ks[None, :]
-                )
+                if SINGLE_LAYOUT:
+                    wu = _load_single_layout_weight(
+                        W, expert * (wn * 2048) + 4096 * 2048, n_block, BN, BK, tile
+                    )
+                    wsu = _load_single_layout_scale(
+                        WS, expert * (wn * 128) + 4096 * 128, n_block, BN, BK, tile
+                    )
+                else:
+                    wu = tl.load(W + expert * (wn * 2048) + 4096 * 2048 + wo)
+                    wsu = tl.load(WS + expert * (wn * 128) + 4096 * 128 + so)
                 up = tl.dot_scaled(a, asc, "e2m1", wu, wsu, "e2m1", up)
         if ACT:
             activated = (acc * tl.sigmoid(acc) * up).to(tl.bfloat16).to(tl.float32)
@@ -196,7 +220,7 @@ def compact_a4_applies(m: int, h: int, w13, w2, s13, s2) -> bool:
     )
 
 
-def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
+def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start, single_layout=False):
     """Per-(token, slot) expert outputs BF16 [M * 8, 4096] for the 32 local experts starting at ``local_start``."""
     m, h = x.shape
     if not (
@@ -241,9 +265,13 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
         num_warps=4,
     )
     _scatter_a4[(32,)](ids, sid, first, m, local_start, s_pow2, per_e, bm, num_warps=4)
+    # Wider gate/up tiles amortize activation reads at the upper verify sizes.
+    # One pipeline stage keeps their LDS footprint bounded. Down projection
+    # and small batches retain the original N64, two-stage schedule.
+    gate_bn = 128 if single_layout and m >= 384 else 64
     grid = (4096 // 64, nb)
-    options = dict(num_warps=4, num_stages=2, matrix_instr_nonkdim=16)
-    _expert_a4[grid](
+    options = dict(num_warps=4, matrix_instr_nonkdim=16)
+    _expert_a4[(4096 // gate_bn, nb)](
         q,
         qs,
         w13,
@@ -253,13 +281,30 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
         inter,
         inter_scale,
         rows,
-        64,
+        gate_bn,
         512,
         True,
         bm,
+        single_layout,
+        num_stages=1 if gate_bn == 128 else 2,
         **options,
     )
     _expert_a4[grid](
-        inter, inter_scale, w2, s2, sid, eid, y, y, rows, 64, 512, False, bm, **options
+        inter,
+        inter_scale,
+        w2,
+        s2,
+        sid,
+        eid,
+        y,
+        y,
+        rows,
+        64,
+        512,
+        False,
+        bm,
+        single_layout,
+        num_stages=2,
+        **options,
     )
     return y
