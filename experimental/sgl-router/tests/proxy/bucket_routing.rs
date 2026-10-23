@@ -66,7 +66,6 @@ fn build_app_context(
             policy,
             decode_policy: Default::default(),
             dp_aware: false,
-            dp_rank_policy: Default::default(),
             bucket_config: Some(bucket_config),
             reorg_buckets: None,
             reorg_admission: Default::default(),

@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use axum::Router;
 
-use super::{info, loads, metrics, native_api, openai};
-use crate::HttpLayer;
+use super::{info, native_api, openai};
 use crate::api_server::core::CoreHandle;
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
 use crate::api_server::log;
@@ -54,14 +53,10 @@ async fn startup_warmup(core: CoreHandle, server_args: Arc<ServerArgs>) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     listener: std::net::TcpListener,
     core: CoreHandle,
     server_args: Arc<ServerArgs>,
-    // Whether this listener serves the node's `/metrics`.
-    metrics_listener: bool,
-    http_layer: Option<HttpLayer>,
     // The runtime's shutdown signal, shared with every worker stage: it fires
     // (disconnects) when `Runtime::request_shutdown` drops the sender, at
     // which point `serve` stops accepting and its in-flight handlers are
@@ -78,14 +73,10 @@ pub async fn serve(
     tokio::spawn(startup_warmup(state.core.clone(), server_args.clone()));
 
     // Each endpoint module registers its own routes and merges here.
-    let mut router = Router::new()
+    let router = Router::new()
         .merge(info::routes())
-        .merge(loads::routes())
         .merge(native_api::routes())
         .merge(openai::routes());
-    if server_args.metrics.is_some() && metrics_listener {
-        router = router.merge(metrics::routes());
-    }
 
     // TODO(auth): no API-key boundary yet. Python gates every route (except
     // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
@@ -95,9 +86,6 @@ pub async fn serve(
     let mut app = router
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state);
-    if let Some(http_layer) = http_layer {
-        app = http_layer(app);
-    }
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
     // router carries its own Arc<Registry> state, so it cannot merge into the

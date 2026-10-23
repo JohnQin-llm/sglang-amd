@@ -16,9 +16,7 @@ use crate::state::load_monitor::engine_reported_load::{
 use crate::state::AffinityStore;
 use crate::workers::Worker;
 
-use super::admission::{
-    partition_admitted, AdmissionLimits, Decision, EngineAdmission, EngineMetrics,
-};
+use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
 use super::affinity;
 use super::power_of_two::PowerOfTwoPolicy;
 use super::{Pick, PickError, PickRequest, Policy, Rejection};
@@ -108,13 +106,9 @@ impl Policy for SessionAwarePolicy {
                     return rejection.map_or(Ok(primary), Err);
                 }
                 let fallback = async {
-                    // The fallback samples only engines that pass admission.
-                    let (admitted, rejections) =
-                        partition_admitted(self.admission.as_ref(), &alternatives, &load)?;
-                    if admitted.is_empty() {
-                        return Err(PickError::NoAdmissibleEngine(rejections));
-                    }
-                    self.pick_fallback(&admitted, request).await
+                    let pick = self.pick_fallback(&alternatives, request).await?;
+                    self.check(&pick.engine, &load)?;
+                    Ok::<_, PickError>(pick)
                 }
                 .await;
                 let mut pick = affinity::choose(
@@ -138,15 +132,12 @@ impl Policy for SessionAwarePolicy {
                 return Ok(pick);
             }
 
-            // The nested power-of-two policy uses AdmissionLimits::default(),
-            // so it samples only the engines this policy's admission accepts.
+            // The nested power-of-two policy uses AdmissionLimits::default().
+            // The session owner checks its chosen engine before creating or
+            // replacing a binding.
+            let mut pick = self.pick_fallback(engines, request).await?;
             let load = self.engine_load.capture_snapshot(Instant::now());
-            let (admitted, rejections) =
-                partition_admitted(self.admission.as_ref(), engines, &load)?;
-            if admitted.is_empty() {
-                return Err(PickError::NoAdmissibleEngine(rejections));
-            }
-            let mut pick = self.pick_fallback(&admitted, request).await?;
+            self.check(&pick.engine, &load)?;
             let Some(key) = key else {
                 pick.reason = "no_session";
                 return Ok(pick);

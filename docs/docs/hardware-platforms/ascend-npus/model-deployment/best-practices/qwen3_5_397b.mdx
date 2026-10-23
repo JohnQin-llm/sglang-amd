@@ -5,7 +5,9 @@ metatags:
 ---
 
 <Note>
-This page focuses on optimal configuration and benchmark results for Qwen3.5-397B-A17B on the Ascend NPU. For environment setup, model weight download, feature configuration, and deployment instructions, etc., see the [Qwen3.5-397B-A17B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_5_397b).
+This page focuses on optimal configuration and benchmark results for Qwen3.5-397B-A17B on the Ascend NPU. For environment
+setup, model weight download, feature configuration, and deployment instructions, etc., see
+the [Qwen3.5-397B-A17B Model Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_5_397b).
 
 On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
 </Note>
@@ -56,6 +58,8 @@ On the A3 Series, each card has 2 dies, so `--tp-size` is twice the card count; 
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -78,14 +82,13 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=0
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -141,7 +144,9 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --random-range-ratio 1 \
     --seed 1 \
-    --request-rate inf
+    --request-rate inf \
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
 ### Qwen3.5-397B-A17B W4A8 8P IN128K OUT1K 50ms
@@ -166,6 +171,8 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -188,14 +195,13 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=0
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -277,6 +283,8 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -300,20 +308,14 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=32
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
-export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
-export SGLANG_ZBAL_LOCAL_MEM_SIZE=60672
 export STREAMS_PER_DEVICE=32
-export ZBAL_ENABLE_GRAPH=1
-export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
 
 python3 -m sglang.launch_server \
     --model-path $MODEL_PATH \
@@ -365,7 +367,9 @@ python -m sglang.bench_serving \
     --gsp-output-len 1024 \
     --max-concurrency 40 \
     --num-prompts 40 \
-    --request-rate inf
+    --request-rate inf \
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
 ### Qwen3.5-397B-A17B W4A8 8P IN16K OUT1K 20ms
@@ -390,6 +394,8 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -412,14 +418,13 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=0
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -450,8 +455,7 @@ python3 -m sglang.launch_server \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
     --mamba-ssm-dtype bfloat16 \
-    --dp-size 4 \
-    --enable-dp-attention \
+    --attn-dp-size 4 \
     --enable-dp-lm-head \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
@@ -479,7 +483,9 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --random-range-ratio 1 \
     --seed 1 \
-    --request-rate inf
+    --request-rate inf \
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
 ### Qwen3.5-397B-A17B W4A8 8P IN16K OUT1K 50ms
@@ -504,6 +510,8 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -526,14 +534,13 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=0
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -564,8 +571,7 @@ python3 -m sglang.launch_server \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
     --mamba-ssm-dtype bfloat16 \
-    --dp-size 4 \
-    --enable-dp-attention \
+    --attn-dp-size 4 \
     --enable-dp-lm-head \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
@@ -593,7 +599,9 @@ python -m sglang.bench_serving \
     --random-output-len 1024 \
     --random-range-ratio 1 \
     --seed 1 \
-    --request-rate inf
+    --request-rate inf \
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
 ### Qwen3.5-397B-A17B W4A8 8P IN3K5 OUT1K5 22.2ms
@@ -618,6 +626,8 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -640,14 +650,13 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=6
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=0
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -677,8 +686,7 @@ python3 -m sglang.launch_server \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
     --mamba-ssm-dtype bfloat16 \
-    --dp-size 8 \
-    --enable-dp-attention \
+    --attn-dp-size 8 \
     --enable-dp-lm-head \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
@@ -706,7 +714,9 @@ python -m sglang.bench_serving \
     --random-output-len 1500 \
     --random-range-ratio 1 \
     --seed 1 \
-    --request-rate inf
+    --request-rate inf \
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
 ### Qwen3.5-397B-A17B W4A8 8P IN3K5 OUT1K5 50ms
@@ -731,6 +741,8 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -753,14 +765,13 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3584
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=6
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=0
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -790,8 +801,7 @@ python3 -m sglang.launch_server \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
     --mamba-ssm-dtype bfloat16 \
-    --dp-size 8 \
-    --enable-dp-attention \
+    --attn-dp-size 8 \
     --enable-dp-lm-head \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
@@ -819,7 +829,9 @@ python -m sglang.bench_serving \
     --random-output-len 1500 \
     --random-range-ratio 1 \
     --seed 1 \
-    --request-rate inf
+    --request-rate inf \
+    --temperature 0.6 \
+    --top-p 0.95
 ```
 
 ### Qwen3.5-397B-A17B W4A8 8P IN64K OUT1K 20ms
@@ -844,6 +856,8 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -866,14 +880,13 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=0
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -904,8 +917,7 @@ python3 -m sglang.launch_server \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
     --mamba-ssm-dtype bfloat16 \
-    --dp-size 2 \
-    --enable-dp-attention \
+    --attn-dp-size 2 \
     --enable-dp-lm-head \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
@@ -960,6 +972,8 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -982,14 +996,13 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_BUFFSIZE=0
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 export SGLANG_SET_CPU_AFFINITY=1
 export SGLANG_ZBAL_BOOTSTRAP_URL=tcp://127.0.0.1:24669
@@ -1020,8 +1033,7 @@ python3 -m sglang.launch_server \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
     --mamba-ssm-dtype bfloat16 \
-    --dp-size 2 \
-    --enable-dp-attention \
+    --attn-dp-size 2 \
     --enable-dp-lm-head \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
@@ -1076,6 +1088,8 @@ python -m sglang.bench_serving \
 # ============================================================
 # Before running, update the following variables:
 #   MODEL_PATH: path to the model weights directory
+#   HCCL_SOCKET_IFNAME: network interface name for HCCL
+#   GLOO_SOCKET_IFNAME: network interface name for Gloo
 # ============================================================
 
 MODEL_PATH=/path/to/model-weights
@@ -1099,13 +1113,12 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=20
 export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export GDN_ATTN_BACKEND_TRITON=1
-export GLOO_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=<network-interface>
 export HCCL_OP_EXPANSION_MODE=AIV
-export HCCL_SOCKET_IFNAME=lo
+export HCCL_SOCKET_IFNAME=<network-interface>
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 
@@ -1130,8 +1143,7 @@ python3 -m sglang.launch_server \
     --mm-attention-backend ascend_attn \
     --dtype bfloat16 \
     --mamba-ssm-dtype bfloat16 \
-    --dp-size 2 \
-    --enable-dp-attention \
+    --attn-dp-size 2 \
     --enable-dp-lm-head \
     --speculative-algorithm NEXTN \
     --speculative-num-steps 3 \
@@ -1162,5 +1174,7 @@ python -m sglang.bench_serving \
     --gsp-output-len 1024 \
     --max-concurrency 96 \
     --num-prompts 96 \
-    --request-rate inf
+    --request-rate inf \
+    --temperature 0.6 \
+    --top-p 0.95
 ```

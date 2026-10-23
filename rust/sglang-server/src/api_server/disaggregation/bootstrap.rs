@@ -471,10 +471,7 @@ mod tests {
             },
             server_args: Arc::new(server_args),
         };
-        (
-            crate::runtime::start(cfg, None).expect("start runtime"),
-            addr,
-        )
+        (crate::runtime::start(cfg).expect("start runtime"), addr)
     }
 
     /// The full wire contract the Python decode side / PD router depends on:

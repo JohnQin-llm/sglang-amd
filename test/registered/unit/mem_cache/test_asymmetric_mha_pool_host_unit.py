@@ -20,7 +20,6 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
     host = AsymmetricMHATokenToKVPoolHost.__new__(AsymmetricMHATokenToKVPoolHost)
-    host._transfer_device = torch.device("cpu")
     host.layout = layout
     host.page_size = 2
     host.layer_num = 3
@@ -64,23 +63,12 @@ def _make_device_pool(host: AsymmetricMHATokenToKVPoolHost) -> SimpleNamespace:
     v_buffer = [
         torch.empty(size, host.head_num, host.v_head_dim) for _ in range(host.layer_num)
     ]
-    host.device_k_buffers = tuple(k_buffer)
-    host.device_v_buffers = tuple(v_buffer)
-    host.device_k_data_ptrs = torch.tensor(
-        [x.data_ptr() for x in k_buffer], dtype=torch.uint64
-    )
-    host.device_v_data_ptrs = torch.tensor(
-        [x.data_ptr() for x in v_buffer], dtype=torch.uint64
-    )
-    host.device_pool = SimpleNamespace(
-        layer_num=host.layer_num,
-        layer_shard_enabled=False,
+    return SimpleNamespace(
         k_buffer=k_buffer,
         v_buffer=v_buffer,
-        k_data_ptrs=host.device_k_data_ptrs,
-        v_data_ptrs=host.device_v_data_ptrs,
+        k_data_ptrs=torch.tensor([x.data_ptr() for x in k_buffer], dtype=torch.uint64),
+        v_data_ptrs=torch.tensor([x.data_ptr() for x in v_buffer], dtype=torch.uint64),
     )
-    return host.device_pool
 
 
 class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):

@@ -39,7 +39,6 @@ class TestDFlashDominoRollout(CustomTestCase):
             vocab_size=31,
             shift_label=shift_label,
             candidate_pool_size=pool_size,
-            in_cuda_graph=False,
         )
 
     def test_gru_feedback_matches_sequence(self):

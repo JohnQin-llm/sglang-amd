@@ -89,7 +89,7 @@ class TestNPUDeepSeekV4ReturnIndexerTopk(CustomTestCase):
             "--disable-cuda-graph",
             "--enable-return-indexer-topk",
             "--json-model-override-args",
-            '{"num_hidden_layers": 6, "compress_ratios": [0, 0, 4, 128, 4, 128], "quantization_config": null}',
+            '{"num_hidden_layers": 6, "compress_ratios": [0, 0, 4, 128, 4, 128]}',
             "--host",
             host[2:],
             "--port",

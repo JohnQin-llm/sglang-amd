@@ -27,7 +27,7 @@ class _FakeGraph:
         pass
 
 
-def _load_npu_graph_runner_module():
+def _load_npu_graph_runner():
     # Load shared modules before stubbing torch_npu so platform detection stays on CPU.
     importlib.import_module("sglang.srt.multimodal.vit_cuda_graph_runner")
     torch_npu = SimpleNamespace()
@@ -37,14 +37,14 @@ def _load_npu_graph_runner_module():
             "torch_npu": torch_npu,
         },
     ):
-        return importlib.import_module(
+        module = importlib.import_module(
             "sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner"
         )
+    return module.ViTNpuGraphRunner
 
 
 def test_npu_vit_graph_keys_include_attention_boundaries():
-    module = _load_npu_graph_runner_module()
-    runner_cls = module.ViTNpuGraphRunner
+    runner_cls = _load_npu_graph_runner()
     vit = SimpleNamespace(
         blocks=[_Block()],
         merger=lambda x: x,
@@ -70,8 +70,10 @@ def test_npu_vit_graph_keys_include_attention_boundaries():
     first_layout = torch.tensor([0, 4, 8], dtype=torch.int32)
     second_layout = torch.tensor([0, 2, 8], dtype=torch.int32)
 
-    # patch.dict dropped the module from sys.modules, so patch it by object.
-    with patch.object(target=module, attribute="set_graph_pool_id"):
+    with patch(
+        "sglang.srt.hardware_backend.npu.graph_runner."
+        "vit_npu_graph_runner.set_graph_pool_id"
+    ):
         runner.run(
             x,
             first_layout,

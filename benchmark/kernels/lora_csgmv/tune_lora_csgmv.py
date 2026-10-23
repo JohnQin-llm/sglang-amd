@@ -290,8 +290,6 @@ def benchmark_expand_config(
             x=x,
             weights=weights,
             output=output,
-            output_stride_0=output.stride(0),
-            output_stride_1=output.stride(1),
             seg_indptr=batch_info.seg_indptr,
             weight_indices=batch_info.weight_indices,
             lora_ranks=batch_info.lora_ranks,
@@ -304,7 +302,6 @@ def benchmark_expand_config(
             MAX_RANK=max_rank,
             BLOCK_M=batch_info.max_len,
             BLOCK_N=config["BLOCK_N"],
-            SLICE_OFFSETS=(),
             BLOCK_K=config["BLOCK_K"],
             **extra_kwargs,
         )
@@ -318,8 +315,6 @@ def benchmark_expand_config(
             x=x,
             weights=weights,
             output=output,
-            output_stride_0=output.stride(0),
-            output_stride_1=output.stride(1),
             seg_indptr=batch_info.seg_indptr,
             weight_indices=batch_info.weight_indices,
             lora_ranks=batch_info.lora_ranks,
@@ -332,7 +327,6 @@ def benchmark_expand_config(
             MAX_RANK=max_rank,
             BLOCK_M=batch_info.max_len,
             BLOCK_N=config["BLOCK_N"],
-            SLICE_OFFSETS=(),
             BLOCK_K=config["BLOCK_K"],
             **extra_kwargs,
         )

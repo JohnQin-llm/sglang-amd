@@ -27,7 +27,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.storage import backend_factory
 from sglang.srt.mem_cache.storage.seaweedfs import seaweedfs_store
@@ -94,18 +93,19 @@ class InMemoryS3:
 
 
 def _host_pool(layout: str) -> MHATokenToKVPoolHost:
-    device_pool = MHATokenToKVPool(
-        dtype=torch.bfloat16,
+    device_pool = SimpleNamespace(
+        store_dtype=torch.bfloat16,
         size=64,
-        page_size=PAGE_SIZE,
         layer_num=4,
         start_layer=0,
         end_layer=4,
         head_num=2,
         head_dim=64,
         v_head_dim=64,
+        row_dim=128,
         device="cpu",
-        enable_memory_saver=False,
+        layer_shard_enabled=False,
+        hicache_write_back_staging=None,
     )
     return MHATokenToKVPoolHost(
         device_pool=device_pool,

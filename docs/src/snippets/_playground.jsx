@@ -23,14 +23,6 @@
 // `(rowValues, base) => [...]` for cross-row composition (e.g. preset x cluster
 // size); a function returning null means "leave the base untouched".
 // Changing the Deploy selection resets every axis back to inherit-from-base.
-// flagSelects may use `range: {min, max, step?, flag}` with a slider instead of
-// listing numeric options, or `control: "toggle"` with two off/on options.
-// Parsers may set `items[].default` to override the inherited initial state.
-// PD may set `ports: {prefill, decode}` and `modes[].stripPrefixes`; role strips
-// run last so later Playground overrides cannot restore a forbidden flag.
-// moe.ep.matchCp limits EP to 1 or the effective CP size while CP is enabled;
-// invalid/stale picks fall back to 1 in both the selector and command. Optional
-// moe.ep.denseTpMatchesCp emits --moe-dense-tp-size CP for CP+EP configurations.
 // config.playgroundExclusiveGroups declares {axes, when, note} groups whose
 // Enable controls turn each other off for matching selections.
 //   pdDisagg     — role + transfer backend + IB device + optional router
@@ -150,8 +142,8 @@ export const Playground = ({ config }) => {
   // derived ranges from overlapping — no --dist-init-addr needed single-host.
   // `dist` is only used by the multi-node renderer (cross-node rendezvous).
   const PD_PORTS = {
-    prefill: { serve: pgFeatures.pdDisagg?.ports?.prefill ?? 30000, dist: 30335 },
-    decode:  { serve: pgFeatures.pdDisagg?.ports?.decode ?? 30100, dist: 30435 },
+    prefill: { serve: 30000, dist: 30335 },
+    decode:  { serve: 30100, dist: 30435 },
   };
 
   // ==========================================================================
@@ -502,29 +494,6 @@ export const Playground = ({ config }) => {
   //   - apply must not mutate its inputs.
   //   - strip policy: most axes strip ONLY when overridden; pdDisagg and
   //     hicache strip unconditionally.
-  const flagSelectOptions = (spec) => {
-    if (!spec.range) return spec.options || [];
-    const { min, max, flag } = spec.range;
-    const step = spec.range.step || 1;
-    return Array.from({ length: Math.floor((max - min) / step) + 1 }, (_, i) => {
-      const value = String(min + i * step);
-      return { id: value, label: value, flags: [`${flag} ${value}`] };
-    });
-  };
-
-  // Optional config constraints are shared by UI changes and command output.
-  const normalizeDeltas = (deltas, derived, base, changedAxis = null) =>
-    typeof pgFeatures.normalizeDeltas === "function"
-      ? pgFeatures.normalizeDeltas(deltas, derived || {}, base, changedAxis)
-      : deltas;
-
-  // Namespaced sibling values let chip constraints depend on another row
-  // without overwriting Deployment selection keys such as "speculative".
-  const flagSelectFacts = (value, derived) => Object.fromEntries(
-    Object.keys({ ...derived, ...value }).map((id) => [
-      `flagSelect.${id}`, value?.[id] ?? derived?.[id],
-    ]));
-
   const AXIS_HANDLERS = {
 
     // ---- Axis: Attention Parallelism ----------------------------------------
@@ -756,18 +725,6 @@ export const Playground = ({ config }) => {
     moe: {
       initState: () => ({ backend: null, ep: null, mmQuant: null }),
 
-      // One policy shared by rendering and command generation. Opt-in only:
-      // other cookbooks retain their existing EP choices and inherited value.
-      resolveEp: (value, fc, derived, cpSize) => {
-        const coupled = !!fc.ep?.matchCp && cpSize > 1;
-        const picked = value.ep ?? derived?.ep ?? null;
-        return {
-          coupled,
-          ep: coupled ? (picked === cpSize ? cpSize : 1) : picked,
-          entries: coupled ? [1, cpSize] : (fc.ep?.values || [null]),
-        };
-      },
-
       // Prefer --moe-a2a-backend over --moe-runner-backend when both present.
       // mmQuant is derived from the base flag (FP4 activations present → W4A4).
       deriveFromBase: (cell, fc, h) => {
@@ -847,19 +804,11 @@ export const Playground = ({ config }) => {
             env = h.stripEnvByPrefix(env, quantKeys);
           }
         }
-        const cpSize = cpEnabledIn(flags) ? h.parseIntFlag(flags, "--attn-cp-size") : 1;
-        const epState = AXIS_HANDLERS.moe.resolveEp(value, fc, derived, cpSize);
-        if (value.ep !== null || epState.coupled) {
+        if (value.ep !== null) {
           const epHead = h.flagSpelling(flags, h.EP_HEADS, "--ep");
           flags = h.stripFlagsByFirstToken(flags, h.EP_HEADS);
-          if (epState.ep > 1) {
-            flags = h.insertAfter(flags, h.ANCHOR_NEAR_MOE, [`${epHead} ${epState.ep}`]);
-          }
-        }
-        if (fc.ep?.denseTpMatchesCp && cpSize > 1) {
-          flags = h.stripFlagsByFirstToken(flags, ["--moe-dense-tp-size"]);
-          if (epState.ep > 1) {
-            flags = h.insertAfter(flags, h.ANCHOR_NEAR_MOE, [`--moe-dense-tp-size ${cpSize}`]);
+          if (value.ep > 1) {
+            flags = h.insertAfter(flags, h.ANCHOR_NEAR_MOE, [`${epHead} ${value.ep}`]);
           }
         }
         return { flags, env };
@@ -867,7 +816,6 @@ export const Playground = ({ config }) => {
 
       render: ({ axisId, value, setValue, fc, base, s, renderSelect, derived }) => {
         if (!fc.backend && !fc.ep) return null;
-        const epState = AXIS_HANDLERS.moe.resolveEp(value, fc, derived, base.effCp);
         const setSlot = (k, v) => setValue({ ...value, [k]: v });
         // Display: explicit > derived > null.
         const slotDisplay = (k) => {
@@ -915,7 +863,7 @@ export const Playground = ({ config }) => {
               {epShown && (
                 <span style={s.field}>
                   <span style={s.fieldLabel}>{fc.ep.label || "EP"}</span>
-                  {renderSelect(epState.ep, epState.entries,
+                  {renderSelect(slotDisplay("ep"), fc.ep.values || [null],
                     (v) => setSlot("ep", v), base, undefined,
                     { hideValues: hideNull("ep") })}
                 </span>
@@ -932,7 +880,7 @@ export const Playground = ({ config }) => {
     parsers: {
       initState: (fc) => {
         const out = {};
-        for (const item of (fc.items || [])) out[item.id] = item.default ?? null;
+        for (const item of (fc.items || [])) out[item.id] = null;
         return out;
       },
 
@@ -1144,7 +1092,6 @@ export const Playground = ({ config }) => {
           "--disaggregation-mode", "--disaggregation-transfer-backend",
           "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
         ]);
-        env = h.stripEnvByPrefix(env, fc.stripEnv || []);
         const backends = fc.transferBackends || [];
         // A config that omits `modes` has the role on the Deploy panel instead;
         // this card then only tunes the transport for whatever role is selected.
@@ -1692,7 +1639,7 @@ export const Playground = ({ config }) => {
           const prefixes = spec.stripPrefixes || [];
           const fam = flags.filter((f) => prefixes.includes(f.split(/[\s=]/)[0]));
           let hit = null;
-          for (const opt of flagSelectOptions(spec)) {
+          for (const opt of (spec.options || [])) {
             if (typeof opt.flags === "function") continue;
             const of = opt.flags || [];
             if (of.length === fam.length && of.every((x) => fam.includes(x))) {
@@ -1707,7 +1654,6 @@ export const Playground = ({ config }) => {
       apply: ({ flags, env, value, fc, sel, h, derived }) => {
         const evalBase = {
           ...(sel || {}),
-          ...flagSelectFacts(value, derived),
           dpAttnOn: h.dpAttnOnIn(flags),
           pdMode: h.findFlagArg(flags, "--disaggregation-mode") || "off",
         };
@@ -1719,7 +1665,7 @@ export const Playground = ({ config }) => {
           if (v === null || v === undefined) continue;          // inherit base
           const d = derived ? derived[spec.id] : null;
           if (v === d) continue;                                // already == base
-          const opt = flagSelectOptions(spec).find((o) => o.id === v);
+          const opt = (spec.options || []).find((o) => o.id === v);
           if (!opt) continue;
           if (h.evaluateChip(opt, evalBase).disabled) continue;
           // `flags` may be a function of the whole row-value object (cross-row
@@ -1762,7 +1708,7 @@ export const Playground = ({ config }) => {
           // every option's env keys, then add the picked option's — mirrors the
           // MoE backend card's strip-then-emit shape.
           const envKeys = [...(spec.stripEnv || [])];
-          for (const o of flagSelectOptions(spec)) {
+          for (const o of (spec.options || [])) {
             for (const e of (o.env || [])) envKeys.push(e.split("=")[0]);
           }
           if (envKeys.length) env = h.stripEnvByPrefix(env, envKeys);
@@ -1778,29 +1724,13 @@ export const Playground = ({ config }) => {
           // current base (e.g. draft tokens with speculation off) is not rendered.
           // Also receives (rowValues, derived) for sibling-dependent rows.
           if (typeof spec.showWhen === "function" && !spec.showWhen(base, value, derived)) continue;
-          const opts = flagSelectOptions(spec)
-            .map((o) => h.evaluateChip(o, { ...base, ...flagSelectFacts(value, derived) }))
+          const opts = (spec.options || [])
+            .map((o) => h.evaluateChip(o, base))
             .filter((c) => !c.hidden);
           if (!opts.length) continue;
           const explicit = value ? value[spec.id] : null;
           const display = (explicit !== null && explicit !== undefined)
             ? explicit : (derived ? derived[spec.id] : null);
-          if (spec.control === "toggle" && opts.length === 2) {
-            const on = display === opts[1].value;
-            cards.push(
-              <div key={`${axisId}-${spec.id}`} style={s.card}>
-                <div style={s.compactRow}>
-                  <span style={s.axisTitle}>{spec.title}</span>
-                  <button type="button" aria-label={spec.title} aria-pressed={on}
-                    style={{ ...s.chip, ...(on ? s.chipChecked : {}) }}
-                    onClick={() => setValue({ ...value, [spec.id]: opts[on ? 0 : 1].value })}>
-                    {on ? opts[1].label : opts[0].label}
-                  </button>
-                </div>
-              </div>
-            );
-            continue;
-          }
           // `control: "slider"` renders the same option list as a range input —
           // for dense ordered scales (1..7) where chips are just noise. Option
           // ORDER is the scale; the option id is still what apply() consumes.
@@ -1813,15 +1743,11 @@ export const Playground = ({ config }) => {
                   <span style={s.axisTitle}>{spec.title}</span>
                   <input
                     type="range"
-                    aria-label={spec.title}
-                    aria-valuetext={cur ? cur.label : ""}
-                    min={spec.range ? spec.range.min : 0}
-                    max={spec.range ? spec.range.max : opts.length - 1}
-                    step={spec.range ? (spec.range.step || 1) : 1}
-                    value={spec.range && cur ? Number(cur.value) : idx}
+                    min={0} max={opts.length - 1} step={1}
+                    value={idx}
                     onChange={(e) => setValue({
                       ...value,
-                      [spec.id]: spec.range ? e.target.value : opts[Number(e.target.value)].value,
+                      [spec.id]: opts[Number(e.target.value)].value,
                     })}
                     style={{ flex: 1, minWidth: "120px", accentColor: "#D45D44" }}
                   />
@@ -1860,7 +1786,6 @@ export const Playground = ({ config }) => {
   // Thread the base cell's (flags, env) through every declared axis's apply,
   // in declaration order; collect render hints (pdDisagg's role banner).
   const applyAllDeltas = (baseFlags, baseEnv, allDeltas, sel, derivedMap) => {
-    allDeltas = normalizeDeltas(allDeltas, derivedMap, sel);
     let flags = [...baseFlags];
     let env = [...(baseEnv || [])];
     let pdMode = null;
@@ -1891,16 +1816,6 @@ export const Playground = ({ config }) => {
         const hints = handler.getRenderHints(
           value, fc, { flags, env, sel: liveSel, h: helpers }) || {};
         if (hints.pdMode) pdMode = hints.pdMode;
-      }
-    }
-    // Apply role exclusions after every axis: an explicit slider or toggle
-    // must not restore a flag excluded by the selected role.
-    const roleOverride = (pdFc?.roleOverrides || []).find((r) =>
-      r && r.mode === pdRoleSel && r.when && matchConstraint(sel, r.when));
-    const role = (pdFc?.modes || []).find((m) => m.id === pdRoleSel);
-    for (const spec of [role, roleOverride]) {
-      if (spec && (!spec.when || matchConstraint(sel, spec.when))) {
-        flags = stripFlagsByFirstToken(flags, spec.stripPrefixes || []);
       }
     }
     return { flags, env, pdMode };
@@ -2043,9 +1958,7 @@ export const Playground = ({ config }) => {
       cmd = dockerLines.join(" \\\n");
     } else {
       const flagBlock = f.map((x) => "  " + x).join(" \\\n");
-      const envBlock = pdMode && pgFeatures.pdDisagg?.exportEnv
-        ? cellEnv.map((e) => `export ${e}\n`).join("")
-        : cellEnv.length ? cellEnv.join(" \\\n") + " \\\n" : "";
+      const envBlock = cellEnv.length ? cellEnv.join(" \\\n") + " \\\n" : "";
       cmd = `${envBlock}sglang serve \\\n${flagBlock}`;
     }
     const cellHints = (cell.pd ? cell.hints || [] : []).filter(() =>
@@ -2537,7 +2450,7 @@ export const Playground = ({ config }) => {
     }
     return out;
   };
-  const [rawDeltas, setDeltas] = useState(initialDeltas);
+  const [deltas, setDeltas] = useState(initialDeltas);
 
   // Picking a different base is picking a different starting point, so the
   // playground goes back to inheriting everything. Carrying overrides across a
@@ -2614,8 +2527,6 @@ export const Playground = ({ config }) => {
     }
   }
 
-  const deltas = normalizeDeltas(rawDeltas, derivedMap, base);
-
   // Cross-axis facts folded into the `base` handed to chip-constraint
   // matching, so `hide`/`disable` can react to another axis's live state
   // (render path only; the raw base stays untouched).
@@ -2687,8 +2598,6 @@ export const Playground = ({ config }) => {
     : null;
   const constraintBase = {
     ...base, dpAttnOn, cpOn, cpStrategy, cpSizeTarget, effTp, pdMode,
-    effCp: constraintEffective && cpEnabledIn(constraintEffective.flags)
-      ? parseIntFlag(constraintEffective.flags, "--attn-cp-size") : 1,
     workerNnodes: baseCell?.nnodes ?? parseNnodes(base.nodes), specAlgorithm,
   };
 
@@ -2803,14 +2712,10 @@ export const Playground = ({ config }) => {
   const pdRouter = (baseCell && baseCell.pd && baseCell.router) || (pdMode !== "off"
     && resolveRouter(config.playgroundFeatures
       && config.playgroundFeatures.pdDisagg, base)) || null;
-  const curlPort = (pdRouter && pdRouter.port != null)
-    ? pdRouter.port : PD_PORTS[pdMode]?.serve;
-  const curlEnv = curlPort != null
-    ? { ...env, CURL_PORT: String(curlPort), CURL_DECODE_PORT: String(curlPort) }
+  const curlEnv = (pdRouter && pdRouter.port != null)
+    ? { ...env, CURL_PORT: String(pdRouter.port) }
     : env;
-  const curlTemplate = typeof config.curl === "function"
-    ? config.curl({ ...base, pdMode }, baseCell) : config.curl;
-  const curlText = interpolate(curlTemplate || "", curlEnv, modelName);
+  const curlText = interpolate(config.curl || "", curlEnv, modelName);
   const routerText = pdRouter && pdRouter.command
     ? interpolate(pdRouter.command, {
         ...env,
@@ -2846,7 +2751,6 @@ export const Playground = ({ config }) => {
   const baseSummary = baseCell
     ? Object.entries(base)
         .filter(([k, v]) => v !== undefined && v !== ""
-          && (!pgFeatures.baseSummaryDims || pgFeatures.baseSummaryDims.includes(k))
           && (!config.resolveRecipe || !(config.overlayDims || []).some(
             (d) => d.id === k && !rowVisible(d, base))))
         .map(([k, v]) => (k === "hw" ? String(v).toUpperCase() : String(v)))
@@ -2965,8 +2869,7 @@ export const Playground = ({ config }) => {
         // nothing to tune — declared per config as `showWhen(base)`.
         if (typeof fc.showWhen === "function" && !fc.showWhen(constraintBase)) return null;
         const setValue = (next) => setDeltas((d) =>
-          normalizeDeltas(
-            updateAxisDeltas(d, axisId, next, constraintBase), derivedMap, base, axisId));
+          updateAxisDeltas(d, axisId, next, constraintBase));
         const rendered = handler.render({
           axisId, value: deltas[axisId], setValue,
           // constraintBase = 5 cell dims + cross-axis facts (dpAttnOn, pdMode).

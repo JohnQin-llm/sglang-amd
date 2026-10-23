@@ -34,20 +34,13 @@ class TestHostMemory(unittest.TestCase):
             f"1 0 0:1 {mount_root} {escaped} rw - {filesystem} cgroup {options}\n"
         )
 
-    def memory(
-        self, path, usage, maximum="max", high="max", v1=False, stat=None, minimum=0
-    ):
+    def memory(self, path, usage, maximum="max", high="max", v1=False, stat=None):
         directory = self.mount / path
         directory.mkdir(parents=True, exist_ok=True)
         files = (
             {"memory.limit_in_bytes": maximum, "memory.usage_in_bytes": usage}
             if v1
-            else {
-                "memory.max": maximum,
-                "memory.high": high,
-                "memory.current": usage,
-                "memory.min": minimum,
-            }
+            else {"memory.max": maximum, "memory.high": high, "memory.current": usage}
         )
         prefix = "total_" if v1 else ""
         stat = {f"{prefix}active_file": 0, f"{prefix}inactive_file": 0} | (stat or {})
@@ -114,17 +107,6 @@ class TestHostMemory(unittest.TestCase):
                 self.assertEqual(
                     host_memory._cgroup_memory_headroom(self.proc), expected
                 )
-
-    def test_protected_sibling_cache_stays_charged(self):
-        self.configure()
-        self.memory("task", 850, 900, stat={"inactive_file": 600})
-        self.memory("task/engine", 250, 1000)
-        self.memory("task/sibling", 600, stat={"inactive_file": 600})
-        self.assertEqual(self.available(), 650)
-
-        # Parent reclaim must preserve the sibling's protected cache.
-        (self.mount / "task/sibling/memory.min").write_text("600")
-        self.assertEqual(self.available(), 50)
 
     def test_independent_engines_have_separate_allowances(self):
         # Both engines see the same host RAM but have different charged usage.
@@ -207,10 +189,7 @@ class TestHostMemory(unittest.TestCase):
                         self.without_cgroupfs(v1=v1)
                     with self.assertRaisesRegex(RuntimeError, "set --hicache-size"):
                         self.available()
-                    with self.assertLogs(host_memory.logger, level="WARNING"):
-                        self.assertEqual(
-                            self.available(allow_cgroup_fallback=True), 5000
-                        )
+                    self.assertEqual(self.available(allow_cgroup_fallback=True), 5000)
 
     def test_missing_counters_for_known_limit_requires_explicit_sizing(self):
         for name in ("memory.current", "memory.stat"):
@@ -220,8 +199,7 @@ class TestHostMemory(unittest.TestCase):
                 (self.mount / "task/engine" / name).unlink()
                 with self.assertRaisesRegex(RuntimeError, "set --hicache-size"):
                     self.available()
-                with self.assertLogs(host_memory.logger, level="WARNING"):
-                    self.assertEqual(self.available(allow_cgroup_fallback=True), 5000)
+                self.assertEqual(self.available(allow_cgroup_fallback=True), 5000)
 
 
 if __name__ == "__main__":

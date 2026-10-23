@@ -11,11 +11,7 @@ import functools
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.rocm_muse_spark.muse_moe_triton import moe_align_block_size
-
-_USE_VERIFY_M32 = envs.SGLANG_MUSE_MOE_VERIFY_M32.get()
-_USE_COMPACT_ALIGN = envs.SGLANG_MUSE_COMPACT_MOE_ALIGN.get()
 
 # Pre-fusion Triton tiles. Do not copy muse_moe_triton._pick_config — decode-fusion
 # returned mid/large MXFP4 to BLOCK_K=256 / BLOCK_N=64, which FlyDSL did not sweep.
@@ -289,14 +285,8 @@ def muse_moe_flydsl(
             raise ValueError("MXFP4 scales must use contiguous uint8 E8M0 layout")
     else:
         assert K == kw and I == iw, "shape mismatch between w13/w2/hidden"
-    use_verify_shape = mxfp4 and (M, topk, E, K, I, H) == (256, 8, 32, 4096, 4096, 4096)
     if cfg is None:
         cfg = _pick_flydsl_config(M, topk, E, mxfp4)
-        if _USE_VERIFY_M32 and use_verify_shape:
-            # Eight correlated speculative positions can send more than 16 rows
-            # to an expert. Reuse its weights across 32 rows while retaining the
-            # two-wave register pipeline and the original accumulation order.
-            cfg["BLOCK_M"] = 32
     assert (
         K % cfg["BLOCK_K"] == 0 and I % cfg["BLOCK_K"] == 0 and cfg["BLOCK_K"] % 32 == 0
     )
@@ -311,16 +301,9 @@ def muse_moe_flydsl(
         hidden_states = hidden_states.contiguous()
     ids32 = topk_ids.to(torch.int32).contiguous()
     scores32 = topk_scores.to(torch.float32).contiguous()
-    if _USE_COMPACT_ALIGN and use_verify_shape and cfg["BLOCK_M"] in (16, 32):
-        from sglang.kernels.ops.muse_spark.moe_align import align_local
-
-        sorted_ids, expert_ids, num_post = align_local(
-            ids32, E, local_expert_start, cfg["BLOCK_M"]
-        )
-    else:
-        sorted_ids, expert_ids, num_post = moe_align_block_size(
-            ids32, E, local_expert_start, cfg["BLOCK_M"]
-        )
+    sorted_ids, expert_ids, num_post = moe_align_block_size(
+        ids32, E, local_expert_start, cfg["BLOCK_M"]
+    )
     num_valid = M * topk
     split_k = int(cfg.get("FLYDSL_SPLIT_K", 1))
 

@@ -15,7 +15,8 @@ use tokio::sync::OnceCell;
 
 use crate::config::{AffinityConfig, AffinityMode};
 use crate::state::kv_events::{
-    BlockSizeOracle, CacheNamespace, PrefixLookupResult, RadixTreePrefixProvider,
+    compute_block_hashes, compute_block_hashes_bigram, BlockSizeOracle, PrefixLookupResult,
+    RadixTreePrefixProvider,
 };
 use crate::state::load_monitor::engine_ranking::CandidateLoads;
 use crate::state::load_monitor::engine_reported_load::{
@@ -23,9 +24,7 @@ use crate::state::load_monitor::engine_reported_load::{
 };
 use crate::workers::Worker;
 
-use super::admission::{
-    partition_admitted, AdmissionLimits, Decision, EngineAdmission, EngineMetrics,
-};
+use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
 use super::affinity;
 use super::power_of_two::PowerOfTwoPolicy;
 use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
@@ -53,24 +52,23 @@ impl fmt::Debug for CacheSource {
 }
 
 impl CacheSource {
-    async fn lookup(
-        &self,
-        tokens: Option<&[u32]>,
-        namespace: &CacheNamespace,
-    ) -> Result<Signal, PickError> {
+    async fn lookup(&self, tokens: Option<&[u32]>) -> Result<Signal, PickError> {
         let Some(tokens) = tokens else {
             return Ok(None);
         };
         let (index, oracle) = match self {
             Self::Local(provider) => {
-                return Ok(provider
-                    .match_request_tokens(tokens, namespace)
-                    .map(Arc::new))
+                return Ok(provider.match_request_tokens(tokens).map(Arc::new))
             }
             Self::Remote { index, block_size } => (index, block_size),
         };
-        let Some(hashes) = oracle.block_hashes(tokens, namespace) else {
+        let Some(block_size) = oracle.get() else {
             return Ok(None);
+        };
+        let hashes = if oracle.is_bigram() {
+            compute_block_hashes_bigram(tokens, block_size as usize)
+        } else {
+            compute_block_hashes(tokens, block_size as usize)
         };
         let query_blocks = hashes.len();
         if query_blocks == 0 {
@@ -176,7 +174,7 @@ pub struct CacheAwarePolicy {
     engine_load: Arc<EngineReportedLoadTable>,
     config: AffinityConfig,
     pub admission: Arc<dyn EngineAdmission>,
-    /// Picks among the engines this policy's admission accepts.
+    /// This policy checks admission on the fallback's pick.
     pub fallback: Arc<dyn Policy>,
 }
 
@@ -306,10 +304,7 @@ impl Policy for CacheAwarePolicy {
                     "cache-aware selection requires a plain or prefill group".into(),
                 ));
             }
-            let lookup = || {
-                self.source
-                    .lookup(request.token_ids, request.cache_namespace)
-            };
+            let lookup = || self.source.lookup(request.token_ids);
             let signal = match request.prefix {
                 Some(memo) => memo
                     .cell(&self.source)
@@ -341,10 +336,6 @@ impl Policy for CacheAwarePolicy {
                 })
                 .cloned()
                 .collect();
-            // The fallback samples only engines that pass admission.
-            let (pool, pool_rejections) =
-                partition_admitted(self.admission.as_ref(), &pool, &load)?;
-            rejections.extend(pool_rejections);
             if pool.is_empty() && affinity.is_none() && !rejections.is_empty() {
                 return Err(PickError::NoAdmissibleEngine(rejections));
             }
@@ -352,6 +343,9 @@ impl Policy for CacheAwarePolicy {
                 let mut pick = self.pick_fallback(&pool, request).await?;
                 if !pool.iter().any(|e| Arc::ptr_eq(e, &pick.engine)) {
                     return Err(PickError::OutsideCandidates(pick.engine.id.clone()));
+                }
+                if let Some(rejection) = self.check(&pick.engine, &load)? {
+                    return Err(PickError::AdmissionRejected(rejection));
                 }
                 pick.reason = if affinity.is_some() {
                     "affinity_load"

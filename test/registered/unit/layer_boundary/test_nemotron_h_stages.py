@@ -16,7 +16,6 @@ from sglang.srt.layers.layer_boundary import (
     UnreducedOutput,
 )
 from sglang.srt.layers.layer_boundary import exit as exit_module
-from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageKind
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.models import nemotron_h_utils as utils
@@ -29,7 +28,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 def layer_stage(pattern, index):
     from sglang.srt.layers.layer_boundary.construction import BatchVariant
-    from sglang.srt.layers.layer_boundary.factories import _connect_line
+    from sglang.srt.layers.layer_boundary.factories import _connect, _incoming
 
     previous = utils._declaration(pattern, index - 1) if index else None
     declaration = replace(
@@ -42,9 +41,8 @@ def layer_stage(pattern, index):
         if index + 1 < len(pattern)
         else None
     )
-    incoming, outgoing = _connect_line(
-        [declaration], [pattern], before=previous, after=following
-    )
+    incoming = _incoming(declaration)
+    outgoing = _connect(declaration, following, residual_from=incoming)
     return SimpleNamespace(
         kind=declaration.kind,
         edges=(
@@ -68,14 +66,12 @@ def stages(pattern, *, dp=1, tp=1, a2a=False):
 
     parallel = SimpleNamespace(
         attn_dp_size=dp,
-        attn_dp_enabled=dp > 1,
         attn_tp_size=tp,
         attn_cp_size=1,
         tp_size=dp * tp,
         moe_dp_size=1,
         moe_dense_tp_size=None,
         enable_attn_tp_input_scattered=False,
-        disable_attn_tp_gather=False,
         enable_prefill_cp=False,
     )
     with (
@@ -120,14 +116,17 @@ class TestStageEdges(CustomTestCase):
                     self.assertEqual(out_of.residual_to, rows)
                     self.assertEqual(into.residual, rows)
                     self.assertEqual(into.produced.layout, rows)
-                    # The next entry owes the sum the exit always leaves.
                     produced = out_of.produced
+                    may_leave = produced.always_partial or produced.may_defer_to_next
+                    self.assertEqual(
+                        into.produced.group, produced.group if may_leave else None
+                    )
                     self.assertEqual(
                         into.produced.always_partial, produced.always_partial
                     )
                     self.assertEqual(
-                        into.produced.group,
-                        produced.group if produced.always_partial else None,
+                        into.produced.may_defer_to_next,
+                        produced.may_defer_to_next,
                     )
                 self.assertEqual(
                     layers[0].edges[0].produced, OutputContract(rows, update=None)
@@ -138,7 +137,7 @@ class TestStageEdges(CustomTestCase):
                 self.assertFalse(last.always_partial or last.may_defer_to_next)
 
     def test_what_each_kind_of_boundary_carries(self):
-        # (pattern, layer 0's output): group, always_partial, may_defer_to_next
+        # (pattern, boundary after layer 0): group, always_partial, may_defer_to_next
         cases = {
             "M-": (SumGroup.ATTN_TP, True, False),
             "*E": (SumGroup.ATTN_TP, True, False),
@@ -150,9 +149,9 @@ class TestStageEdges(CustomTestCase):
         }
         for pattern, expected in cases.items():
             with self.subTest(pattern=pattern):
-                out = stages(pattern, tp=2)[0].edges[1].produced
+                into = stages(pattern, tp=2)[1].edges[0].produced
                 self.assertEqual(
-                    (out.group, out.always_partial, out.may_defer_to_next),
+                    (into.group, into.always_partial, into.may_defer_to_next),
                     expected,
                 )
         # Without attention TP a mixer's output is complete.
@@ -162,9 +161,9 @@ class TestStageEdges(CustomTestCase):
         # backend dispatches only the MoE, so an MLP still sums over TP.
         into = stages("EM", tp=2, a2a=True)[1].edges[0].produced
         self.assertEqual(into, OutputContract(into.layout, update=None))
-        out = stages("-M", tp=2, a2a=True)[0].edges[1].produced
+        into = stages("-M", tp=2, a2a=True)[1].edges[0].produced
         self.assertEqual(
-            (out.group, out.always_partial, out.may_defer_to_next),
+            (into.group, into.always_partial, into.may_defer_to_next),
             (SumGroup.TP, False, True),
         )
 
@@ -191,21 +190,18 @@ class TestMixerExit(CustomTestCase):
                     may_defer_to_next=may,
                     update=PLAIN_ADD,
                 )
-                path = SimpleNamespace(output=produced)
-                plan = SimpleNamespace(finishes_directly=False, path_for=lambda b: path)
-                communicator = SimpleNamespace(plan=plan)
+                communicator = SimpleNamespace(
+                    plan=SimpleNamespace(
+                        path_for=lambda batch: SimpleNamespace(output=produced),
+                    ),
+                    _sum_deferral_allowed=MagicMock(return_value=movable),
+                )
                 hidden = torch.ones(2, 4)
                 summed = MagicMock(side_effect=lambda h, *args, **kwargs: h * 2)
                 with (
                     get_parallel().override(tp_group=tp_group, tp_size=2),
                     patch.object(exit_module, "sum_output", summed),
                 ):
-                    with patch.object(
-                        exit_module, "_sum_deferral_allowed", return_value=movable
-                    ):
-                        path.exit = exit_module.exit_facts(
-                            StageKind.ATTENTION, plan, BatchVariant.ORDINARY, path
-                        )
                     with MixerExit(
                         communicator, None, stream=ResidualStream()
                     ) as mixer_exit:

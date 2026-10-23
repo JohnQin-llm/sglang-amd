@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -9,7 +10,6 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
-    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=1600, stage="nightly", runner_config="4-gpu-b200")
@@ -51,16 +51,6 @@ DP_ATTENTION_EP_ARGS = [
     "0.93",
     "--max-prefill-tokens",
     "8192",
-]
-
-EPLB_ARGS = [
-    "--ep-size",
-    "4",
-    "--enable-eplb",
-    "--ep-num-redundant-experts",
-    "32",
-    "--eplb-rebalance-num-iterations",
-    "50",
 ]
 
 MTP_ARGS = [
@@ -114,8 +104,7 @@ class TestNvidiaNemotron3SuperNVFP4(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            terminate_and_kill_process_tree(cls.process)
+        kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         _run_gsm8k(self)
@@ -142,8 +131,7 @@ class TestNvidiaNemotron3SuperNVFP4PerToken(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            terminate_and_kill_process_tree(cls.process)
+        kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         _run_gsm8k(self, threshold=0.93)
@@ -164,32 +152,7 @@ class TestNvidiaNemotron3SuperNVFP4MTP(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            terminate_and_kill_process_tree(cls.process)
-
-    def test_gsm8k(self):
-        _run_gsm8k(self)
-
-
-class TestNvidiaNemotron3SuperNVFP4EPLB(CustomTestCase):
-    """EP with dynamic EPLB rebalancing during the eval."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = NEMOTRON_3_SUPER_NVFP4_MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(0):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=NEMOTRON_3_SUPER_NVFP4_ARGS + EPLB_ARGS,
-            )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            terminate_and_kill_process_tree(cls.process)
+        kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         _run_gsm8k(self)
@@ -216,8 +179,7 @@ class TestNvidiaNemotron3SuperNVFP4DPAttentionEP(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            terminate_and_kill_process_tree(cls.process)
+        kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
         _run_gsm8k(self)

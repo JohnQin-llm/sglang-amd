@@ -11,7 +11,8 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 class TestXIELU(CustomTestCase):
     def test_builds_on_the_meta_device_with_the_same_scalars(self):
-        # Built on the meta device, nothing can be read back from a buffer.
+        # A layer built only for the stage boundaries it declares is built on
+        # the meta device, where nothing can be read back from a buffer.
         for dtype in (torch.bfloat16, torch.float32):
             with self.subTest(dtype=dtype):
                 on_cpu = XIELU(beta=0.3, eps=-1e-6, dtype=dtype)

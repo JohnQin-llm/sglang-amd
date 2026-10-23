@@ -19,12 +19,10 @@ use dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
-use serde::Deserialize;
 
-use super::pd_routing::PDRoutingFields;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
-    model_error, openai_error, submit_generation, unix_seconds_u32,
+    openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput};
 use crate::message::finish_reason::Matched;
@@ -36,14 +34,6 @@ use crate::message::types::{OneOrMany, TokenIds};
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/completions", post(completions))
-}
-
-#[derive(Deserialize)]
-struct CompletionRequest {
-    #[serde(flatten)]
-    request: CreateCompletionRequest,
-    #[serde(flatten)]
-    routing: PDRoutingFields,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -68,9 +58,9 @@ pub(super) struct ChoiceExtensions {
 
 async fn completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CompletionRequest>, JsonRejection>,
+    body: Result<Json<CreateCompletionRequest>, JsonRejection>,
 ) -> Response {
-    let CompletionRequest { request, routing } = match body {
+    let request = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
@@ -79,8 +69,12 @@ async fn completions(
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
-    if let Some(message) = model_error(&model, &state.server_args.served_model_name) {
-        return openai_error(StatusCode::BAD_REQUEST, message, false);
+    if model != state.server_args.served_model_name {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            format!("The model `{model}` does not exist"),
+            false,
+        );
     }
 
     if request.prompt_embeds.is_some() {
@@ -133,9 +127,8 @@ async fn completions(
         return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false);
     }
 
-    let prompt_count = prompts.len();
-    let choices_per_prompt = request.n.unwrap_or(1) as usize;
-    let choice_count = match prompt_count.checked_mul(choices_per_prompt) {
+    let n = request.n.unwrap_or(1) as usize;
+    let choice_count = match prompts.len().checked_mul(n) {
         Some(count) if count <= MAX_OPENAI_CHOICES => count,
         _ => {
             return openai_error(
@@ -145,19 +138,11 @@ async fn completions(
             );
         }
     };
-    let routing = match routing.normalize(prompt_count, choices_per_prompt) {
-        Ok(routing) => routing,
-        Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
-    };
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_seconds_u32();
     let mut submitted = Vec::with_capacity(choice_count);
 
     for (prompt_index, prompt) in prompts.into_iter().enumerate() {
-        // Normalized routing is indexed by prompt, not by choice.
-        let bootstrap_host = &routing.bootstrap.bootstrap_hosts[prompt_index];
-        let bootstrap_port = routing.bootstrap.bootstrap_ports[prompt_index];
-        let bootstrap_room = routing.bootstrap.bootstrap_rooms[prompt_index];
         let (text, input_ids, mut prompt_echo) = match prompt {
             PromptSpec::Text(text) => {
                 let prompt_echo = if echo { text.clone() } else { String::new() };
@@ -165,8 +150,8 @@ async fn completions(
             }
             PromptSpec::TokenIds(input_ids) => (None, Some(input_ids), String::new()),
         };
-        for sample_index in 0..choices_per_prompt {
-            let index = prompt_index * choices_per_prompt + sample_index;
+        for sample_index in 0..n {
+            let index = prompt_index * n + sample_index;
             let rid = Rid::from_client(&format!("{response_id}-{index}"));
             if echo
                 && sample_index == 0
@@ -191,11 +176,6 @@ async fn completions(
                 },
                 top_logprobs_num: request.logprobs.unwrap_or(0) as i64,
                 return_text_in_logprobs: request.logprobs.map(|_| true),
-                bootstrap_host: bootstrap_host.clone(),
-                bootstrap_port,
-                bootstrap_room,
-                routed_dp_rank: routing.routed_dp_rank,
-                disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
                 ..Default::default()
             };
             let call = match submit_generation(&state, native, stream).await {

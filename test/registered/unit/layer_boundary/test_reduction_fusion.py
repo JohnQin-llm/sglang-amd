@@ -4,7 +4,6 @@ import unittest
 from functools import partial
 from unittest.mock import MagicMock, patch
 
-import msgspec
 import torch
 
 from sglang.srt.layers import layer_boundary as comm
@@ -15,11 +14,8 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary import ops as transport_ops
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
-from sglang.srt.layers.layer_boundary.contracts import BatchVariant, StageKind
-from sglang.srt.layers.layer_boundary.exit import (
-    _sum_deferral_allowed,
-    exit_facts,
-)
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
+from sglang.srt.layers.layer_boundary.exit import ExitPolicy
 from sglang.srt.layers.layer_boundary.ops import keep_output
 from sglang.srt.layers.moe import (
     can_merge_post_experts_all_reduce,
@@ -363,11 +359,12 @@ class TestFuseMlpAllReduceGate(CustomTestCase):
                 tp_size=moe_ep_size * moe_tp_size * moe_dp_size,
             ),
         ):
-            communicator = _fake_communicator(ffn_sum_is_movable)
-            return _sum_deferral_allowed(
-                communicator,
-                communicator.path_for(forward_batch).output,
-                scattered=False,
+            return ExitPolicy(
+                _fake_communicator(ffn_sum_is_movable)
+            )._sum_deferral_allowed(
+                ExitPolicy(_fake_communicator(ffn_sum_is_movable)).plan.path_for(
+                    forward_batch
+                )
             )
 
     def test_hybrid_ep_tp_fuses_when_mergeable(self):
@@ -521,14 +518,6 @@ class TestDeferFfnReduction(CustomTestCase):
                 return_value=tp_group_object if tp_group else object(),
             ),
         ):
-            # What the exit decides from fixed facts is recorded on the path.
-            path = communicator.paths[BatchVariant.ORDINARY]
-            communicator.paths[BatchVariant.ORDINARY] = msgspec.structs.replace(
-                path,
-                exit=exit_facts(
-                    StageKind.FFN, communicator, BatchVariant.ORDINARY, path
-                ),
-            )
             return communicator.output._defers_sum(
                 forward_batch,
                 communicator.output.plan.path_for(forward_batch),

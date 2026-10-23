@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Streaming passthrough: an SSE body for HTTP, a chunk stream for gRPC.
+//! SSE passthrough — bridges a reqwest `bytes_stream()` into an axum Body.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,29 +27,6 @@ pub enum StreamEndReason {
     PumpPanicked,
 }
 
-/// A stream the router ended itself; it reads as before, and a gRPC caller
-/// maps `reason` to the router's error contract.
-#[derive(Debug)]
-pub struct RouterStreamError {
-    pub reason: StreamEndReason,
-    message: String,
-}
-
-impl RouterStreamError {
-    fn io(reason: StreamEndReason, message: impl Into<String>) -> std::io::Error {
-        let message = message.into();
-        std::io::Error::other(Self { reason, message })
-    }
-}
-
-impl std::fmt::Display for RouterStreamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for RouterStreamError {}
-
 /// How the SSE pump ended, reported to the `on_complete` hook.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamEnd {
@@ -62,14 +39,9 @@ pub struct StreamEnd {
 /// SSE-legal framing variants (no space after `data:`, whitespace after `{`),
 /// so the match is anchored to the spec rather than one serializer's bytes.
 fn is_error_event_line(line: &[u8]) -> bool {
-    line.strip_prefix(b"data:").is_some_and(is_error_payload)
-}
-
-/// A JSON payload whose first key is `error`: an SSE event's data or a gRPC chunk.
-pub(crate) fn is_error_payload(payload: &[u8]) -> bool {
-    payload
-        .trim_ascii_start()
-        .strip_prefix(b"{")
+    line.strip_prefix(b"data:")
+        .map(|p| p.trim_ascii_start())
+        .and_then(|p| p.strip_prefix(b"{"))
         .map(|p| p.trim_ascii_start())
         .is_some_and(|p| p.starts_with(b"\"error\""))
 }
@@ -85,7 +57,7 @@ const NATIVE_STATUS: &[u8] = br#""status_code":"#;
 /// Finds error events emitted after an SSE response commits a 200.
 /// Line-anchored, so lookalike text inside event payloads cannot match.
 #[derive(Default)]
-pub struct ErrorEventScanner {
+struct ErrorEventScanner {
     line_start: Vec<u8>,
     /// The current line's last bytes, so a native key split across chunks matches.
     line_tail: Vec<u8>,
@@ -138,20 +110,6 @@ pub fn has_error_event(body: &[u8]) -> bool {
     ErrorEventScanner::default().feed(body)
 }
 
-/// An upstream item the pump forwards unchanged.
-pub trait PumpItem: Send + 'static {
-    /// Whether this item carries an error event; `scanner` keeps line state across items.
-    fn is_error_event(&self, _scanner: &mut ErrorEventScanner) -> bool {
-        false
-    }
-}
-
-impl PumpItem for Bytes {
-    fn is_error_event(&self, scanner: &mut ErrorEventScanner) -> bool {
-        scanner.feed(self)
-    }
-}
-
 /// Bounds on a streaming response beyond what the upstream stream itself provides.
 #[derive(Debug, Clone, Default)]
 pub struct StreamLimits {
@@ -163,22 +121,7 @@ pub struct StreamLimits {
     pub abort: Option<CancellationToken>,
 }
 
-/// Bridge a byte stream into an axum Body that streams chunks unchanged; see [`pump`].
-pub fn bytes_stream_to_body<S, E>(
-    stream: S,
-    guards: Option<Box<dyn Send + 'static>>,
-    on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
-    on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
-    limits: StreamLimits,
-) -> Body
-where
-    S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
-    E: std::error::Error + Send + Sync + 'static,
-{
-    Body::from_stream(pump(stream, guards, on_complete, on_first_byte, limits))
-}
-
-/// Forward upstream items unchanged.
+/// Bridge a byte stream into an axum Body that streams chunks unchanged.
 ///
 /// One tokio task pumps upstream chunks through a bounded 64-slot channel so a
 /// slow client backpressures the upstream read. The pump stops as soon as the
@@ -192,20 +135,18 @@ where
 ///
 /// `guards` is held until the pump finishes; `on_first_byte` runs on the first
 /// `Ok` chunk; `on_complete` runs exactly once with the final [`StreamEnd`].
-/// An upstream error is wrapped, not stringified, so a gRPC caller can recover its `Status`.
-pub fn pump<T, S, E>(
+pub fn bytes_stream_to_body<S, E>(
     mut stream: S,
     guards: Option<Box<dyn Send + 'static>>,
     on_complete: Option<Box<dyn FnOnce(StreamEnd) + Send + 'static>>,
     mut on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
     limits: StreamLimits,
-) -> impl futures::Stream<Item = Result<T, std::io::Error>> + Send + 'static
+) -> Body
 where
-    T: PumpItem,
-    S: futures::Stream<Item = Result<T, E>> + Send + Unpin + 'static,
-    E: std::error::Error + Send + Sync + 'static,
+    S: futures::Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::fmt::Display + Send + Sync + 'static,
 {
-    let (tx, rx) = tokio::sync::mpsc::channel::<T>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
     let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let mut end = StreamEnd {
@@ -233,24 +174,24 @@ where
                 }
                 _ = expired => {
                     end.reason = StreamEndReason::Expired;
-                    Err(RouterStreamError::io(end.reason, "SSE stream exceeded stale_request_timeout"))
+                    Err(std::io::Error::other("SSE stream exceeded stale_request_timeout"))
                 }
                 _ = aborted => {
                     end.reason = StreamEndReason::Aborted;
-                    Err(RouterStreamError::io(end.reason, "SSE stream aborted by the router"))
+                    Err(std::io::Error::other("SSE stream aborted by the router"))
                 }
                 result = async {
                     loop {
-                        let item = match tokio::time::timeout(idle, stream.next()).await {
+                        let bytes = match tokio::time::timeout(idle, stream.next()).await {
                             Ok(None) => return (StreamEndReason::Completed, Ok(())),
-                            Ok(Some(Ok(item))) => item,
+                            Ok(Some(Ok(bytes))) => bytes,
                             Ok(Some(Err(e))) => return (
                                 StreamEndReason::UpstreamError,
-                                Err(std::io::Error::other(e)),
+                                Err(std::io::Error::other(e.to_string())),
                             ),
                             Err(_) => return (
                                 StreamEndReason::IdleTimeout,
-                                Err(RouterStreamError::io(StreamEndReason::IdleTimeout, "SSE upstream idle timeout")),
+                                Err(std::io::Error::other("SSE upstream idle timeout")),
                             ),
                         };
                         started.store(true, Ordering::Relaxed);
@@ -258,9 +199,9 @@ where
                             hook();
                         }
                         if !end.saw_error_event {
-                            end.saw_error_event = item.is_error_event(&mut scanner);
+                            end.saw_error_event = scanner.feed(&bytes);
                         }
-                        if tx.send(item).await.is_err() {
+                        if tx.send(bytes).await.is_err() {
                             // Receiver gone; the `tx.closed()` arm reports the disconnect.
                             std::future::pending::<()>().await;
                         }
@@ -280,10 +221,9 @@ where
                     .copied()
                     .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
                     .unwrap_or("<non-string panic payload>");
-                Err(RouterStreamError::io(
-                    end.reason,
-                    format!("SSE pump panicked: {message}"),
-                ))
+                Err(std::io::Error::other(format!(
+                    "SSE pump panicked: {message}"
+                )))
             }
         };
         if let Some(hook) = on_complete {
@@ -296,13 +236,10 @@ where
         futures::future::ready(match result {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(Err(error)),
-            Err(_) => Some(Err(RouterStreamError::io(
-                StreamEndReason::PumpPanicked,
-                "SSE pump cancelled",
-            ))),
+            Err(_) => Some(Err(std::io::Error::other("SSE pump cancelled"))),
         })
     });
-    ReceiverStream::new(rx).map(Ok).chain(terminal)
+    Body::from_stream(ReceiverStream::new(rx).map(Ok).chain(terminal))
 }
 
 async fn cancelled(token: Option<CancellationToken>) {

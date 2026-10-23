@@ -11,12 +11,11 @@ use crate::state::load_monitor::engine_ranking::{compare_decode_engines, compare
 use crate::state::load_monitor::engine_reported_load::EngineReportedLoadTable;
 use crate::workers::Worker;
 
-use super::admission::{partition_admitted, AdmissionLimits, EngineAdmission};
-use super::{Pick, PickError, PickRequest, Policy, Stage};
+use super::admission::{AdmissionLimits, Decision, EngineAdmission, EngineMetrics};
+use super::{Pick, PickError, PickRequest, Policy, Rejection, Stage};
 
-/// Samples two distinct admitted engines and selects the better-ranked one for
-/// its stage. Engines that fail admission are never sampled, so the pick fails
-/// only when no engine is admitted.
+/// Samples two distinct engines and selects the better-ranked one for its stage.
+/// Checks admission only on the selected engine; rejection never resamples.
 #[derive(Debug)]
 pub struct PowerOfTwoPolicy {
     /// Shared application state; snapshots are local to each pick.
@@ -45,19 +44,16 @@ impl Policy for PowerOfTwoPolicy {
             }
             // Selection and admission use the same load observation.
             let load = self.engine_load.capture_snapshot(Instant::now());
-            let (admitted, rejections) =
-                partition_admitted(self.admission.as_ref(), engines, &load)?;
-            let engine = match admitted.as_slice() {
-                [] => return Err(PickError::NoAdmissibleEngine(rejections)),
+            let engine = match engines {
                 [engine] => Arc::clone(engine),
                 _ => {
                     let mut rng = rand::thread_rng();
-                    let i = rng.gen_range(0..admitted.len());
-                    let mut j = rng.gen_range(0..admitted.len() - 1);
+                    let i = rng.gen_range(0..engines.len());
+                    let mut j = rng.gen_range(0..engines.len() - 1);
                     if j >= i {
                         j += 1;
                     }
-                    let (left, right) = (&admitted[i], &admitted[j]);
+                    let (left, right) = (&engines[i], &engines[j]);
                     let ordering = match request.stage {
                         Stage::Plain | Stage::Prefill => {
                             compare_prefill_engines(left, right, Some(&load))
@@ -67,6 +63,13 @@ impl Policy for PowerOfTwoPolicy {
                     Arc::clone(if ordering.is_gt() { right } else { left })
                 }
             };
+            let metrics = EngineMetrics::observe(&engine, &load);
+            if let Decision::Reject(reason) = self.admission.check(&engine, &metrics)? {
+                return Err(PickError::AdmissionRejected(Rejection {
+                    engine: engine.id.clone(),
+                    reason,
+                }));
+            }
             Ok(Pick {
                 engine,
                 reason: "power_of_two",

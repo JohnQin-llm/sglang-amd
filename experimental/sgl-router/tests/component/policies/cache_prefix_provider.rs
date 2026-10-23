@@ -6,8 +6,7 @@ use std::sync::Arc;
 
 use sgl_kv_indexer::PrefixOutcome;
 use sgl_router::state::kv_events::{
-    compute_block_hashes, BlockSizeOracle, CacheNamespace, HashTree, KvWorkerId,
-    RadixTreePrefixProvider,
+    compute_block_hashes, BlockSizeOracle, HashTree, KvWorkerId, RadixTreePrefixProvider,
 };
 
 #[test]
@@ -31,7 +30,7 @@ fn radix_tree_reports_contiguous_prefix_depth_per_worker() {
     );
 
     let signal = RadixTreePrefixProvider::new(tree, oracle)
-        .match_request_tokens(&tokens, CacheNamespace::NONE)
+        .match_request_tokens(&tokens)
         .expect("established local tree must produce a prefix signal");
     let PrefixOutcome::Matched {
         matches,

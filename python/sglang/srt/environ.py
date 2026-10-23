@@ -422,6 +422,9 @@ class Envs:
     SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
     # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
+    # HiCache: GPU sleep cycles before each layer's host-to-device load, so a forward
+    # that skips the per-layer load wait reads unloaded layers
+    SGLANG_TEST_HICACHE_H2D_DELAY_CYCLES = EnvInt(0)
 
     # ===================================================================
     # CI reporting: per-model metrics jsonl for nightly XPU dashboard
@@ -572,6 +575,10 @@ class Envs:
     # Per-call move cap on a non-urgent lazy-compaction flush, so a large
     # backlog cannot stall the scheduler loop; urgent flushes are uncapped.
     SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL = EnvInt(4096)
+    # Max pages one compaction move-kernel launch copies (eager or lazy, urgent
+    # or not); a larger move is issued as consecutive launches of this size
+    # within the same compaction call.
+    SGLANG_COMPACTION_MAX_PAGES_PER_MOVE = EnvInt(4096)
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
@@ -1865,15 +1872,47 @@ class Envs:
     # Use the experimental FlyDSL split-K paged GQA kernel for Muse Spark's
     # short-window decode layers on gfx950.
     SGLANG_MUSE_FLYDSL_DECODE = EnvBool(False)
-    # Opt-in gfx950 Muse target-verification and pooler optimizations.
-    SGLANG_MUSE_SWA_VERIFY = EnvBool(False)
-    SGLANG_MUSE_FUSED_QKV_PREPARE = EnvBool(False)
-    SGLANG_MUSE_SPLITK_POOLER = EnvBool(False)
-    SGLANG_MUSE_TOKEN_SHARDED_POOLER = EnvBool(False)
-    SGLANG_MUSE_MOE_VERIFY_M32 = EnvBool(False)
-    # Extra shuffled weight storage; see PrepackedMuseMoE for its memory cost.
-    SGLANG_MUSE_MOE_PREPACKED = EnvBool(False)
-    SGLANG_MUSE_COMPACT_MOE_ALIGN = EnvBool(False)
+    # Muse Spark on MI355X (gfx950): AgentX fast paths, all on by default. Each
+    # variable is the off-switch of one optimization; the paths are shape-gated, so
+    # they only engage on the Muse Spark shapes they were measured on.
+    # aiter attention backend (head_dim 64, GQA 8, page 16, SWA KV pool):
+    # extend reuses the page tables / query offsets init_forward_metadata built.
+    SGLANG_MUSE_REUSE_EXTEND_METADATA = EnvBool(True)
+    # target-verify KV lengths once per batch / per graph replay, not per layer.
+    SGLANG_MUSE_REUSE_VERIFY_LENGTHS = EnvBool(True)
+    # FP8 Q (per-tensor dynamic scale) for full-layer extend of >= 256 tokens.
+    SGLANG_MUSE_EXTEND_FP8_Q = EnvBool(True)
+    # aiter patch 05 tiles: long-prefill 2D config, unmasked interior 2D tiles,
+    # 64-row verify tiles with an exact q-block grid and 256 split-KV segments.
+    SGLANG_MUSE_PREFILL_2D_TILES = EnvBool(True)
+    SGLANG_MUSE_UNMASKED_INTERIOR = EnvBool(True)
+    SGLANG_MUSE_VERIFY_BM64 = EnvBool(True)
+    # Verify kernels: sliding layers split-KV (<= 8 requests) / GQA-folded
+    # (> 8); full layers two-KV-head kernel, else GQA-folded from 8 requests.
+    SGLANG_MUSE_VERIFY_SWA_SPLITKV = EnvBool(True)
+    SGLANG_MUSE_VERIFY_SWA_GQA = EnvBool(True)
+    SGLANG_MUSE_VERIFY_FULL_V2 = EnvBool(True)
+    SGLANG_MUSE_VERIFY_FULL_GQA = EnvBool(True)
+    # Triton extend: DFlash draft block (8 x 8 heads, 1 KV head, HD128) split-KV.
+    SGLANG_MUSE_DFLASH_SPLITKV = EnvBool(True)
+    # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
+    # registers (O projection, MoE pooler, DFlash draft MLP).
+    SGLANG_MUSE_DENSE_TILED = EnvBool(True)
+    # ROCm Muse Spark model (sglang.srt.rocm_muse_spark): fused QKV projection /
+    # QK norm / RoPE / FP8 cache write, QK norm / RoPE / cache write, unpooler +
+    # FFN-boundary fusion, compact A4 verify MoE, a4w4 prefill MoE, sequence-
+    # parallel prefill, Ulysses attention, tuned verify-width dense GEMMs, shared
+    # and joint router/pooler projections.
+    SGLANG_MUSE_FUSED_QKV_CACHE = EnvBool(True)
+    SGLANG_MUSE_QK_ROPE_CACHE = EnvBool(True)
+    SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY = EnvBool(True)
+    SGLANG_MUSE_COMPACT_A4_VERIFY = EnvBool(True)
+    SGLANG_MUSE_A4W4_MOE = EnvBool(True)
+    SGLANG_MUSE_PREFILL_SP = EnvBool(True)
+    SGLANG_MUSE_PREFILL_ULYSSES = EnvBool(True)
+    SGLANG_MUSE_DENSE_TUNED = EnvBool(True)
+    SGLANG_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
+    SGLANG_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )

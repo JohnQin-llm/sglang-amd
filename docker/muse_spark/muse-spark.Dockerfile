@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 # Muse Spark serving image (CUDA targets: 9.0, 10.0a, 10.3a).
-# Build from the repository root; application source is cloned from upstream:
+# Build from the repository root with this checkout as the context:
 #   docker buildx build --platform linux/amd64 --load \
 #     -f docker/muse_spark/muse-spark.Dockerfile -t muse-spark:local-test .
 FROM lmsysorg/sglang:v0.5.21@sha256:2dbe4c7f53230b09aaa8fa41891c13c51d9d2e253f486a70822aaf08783fff75 AS base
@@ -11,13 +11,12 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG TORCH_CUDA_ARCH_LIST="9.0;10.0a;10.3a"
 ARG MAX_JOBS=16
 
-# Replace the stock SGLang with the upstream muse-spark branch.
-# This branch must include the Muse Spark Docker patch helpers used below.
-# Align the runtime with Muse Spark's PyTorch pin before compiling its extensions.
+# Replace the stock SGLang with the Muse Spark dev checkout supplied as context.
+# The build context must be the repository root, not this Dockerfile's directory.
+# Align the runtime with dev's PyTorch build pin before compiling its extensions.
 # The base has Torch 2.13 and matching older TorchVision/DeepEP binaries.
 WORKDIR /sgl-workspace
-RUN git clone --depth 1 --single-branch --branch muse-spark \
-    https://github.com/sgl-project/sglang.git /sgl-workspace/sglang-muse-spark
+COPY . /sgl-workspace/sglang-muse-spark
 RUN python3 -m pip uninstall -y sglang \
     && python3 -m pip install --no-cache-dir \
         torch==2.14.1 torchvision==0.29.1 sgl-deep-ep==0.1.2.post1 \
@@ -50,7 +49,7 @@ RUN apt-get update \
 # DeepGEMM dev includes PR #92: TRT-LLM weights and scales are shared upstream.
 # Retain Muse post-expert norm and tuning on top of that API; the wheel version
 # 0.2.1.post1+muse.cbe1727 satisfies the SGLang pin and identifies this source.
-# Use the patch and checksum helper from the same muse-spark checkout as SGLang.
+# Use the patch and checksum helper from the same dev checkout as SGLang.
 # Pin the source revision required by the helper; rebuild the extension and JIT headers.
 RUN git clone https://github.com/sgl-project/DeepGEMM.git /tmp/muse-deep-gemm \
     && cd /tmp/muse-deep-gemm \
@@ -60,10 +59,10 @@ RUN git clone https://github.com/sgl-project/DeepGEMM.git /tmp/muse-deep-gemm \
         bash build_sgl_deep_gemm.sh \
     && python3 -m pip install --no-cache-dir --no-deps --force-reinstall dist/sgl_deep_gemm-*.whl \
     && cd /sgl-workspace \
-    && python3 -c "from importlib.metadata import version; from sglang.srt.layers.muse_spark.muse_spark_megamoe import require_muse_megamoe_patch; assert version('sgl-deep-gemm') == '0.2.1.post1+muse.cbe1727'; require_muse_megamoe_patch()" \
+    && python3 -c "from importlib.metadata import version; from sglang.srt.layers.moe.muse_spark_megamoe import require_muse_megamoe_patch; assert version('sgl-deep-gemm') == '0.2.1.post1+muse.cbe1727'; require_muse_megamoe_patch()" \
     && rm -rf /tmp/muse-deep-gemm
 
-# The muse-spark branch also requires NVSHMEM Python bindings absent from the base.
+# The dev branch also requires NVSHMEM Python bindings absent from the base.
 RUN python3 -m pip install --no-cache-dir nvshmem4py-cu13==0.3.1
 
 WORKDIR /sgl-workspace/sglang-muse-spark

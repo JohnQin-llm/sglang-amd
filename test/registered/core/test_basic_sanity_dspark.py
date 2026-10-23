@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.utils import is_sm100_supported, is_xpu, kill_process_tree
+from sglang.srt.utils import is_sm100_supported, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
@@ -27,14 +27,14 @@ DRAFT_MODEL = "deepseek-ai/dspark_qwen3_14b_block7"
 
 # trtllm_mha prefill requires SM100 (Blackwell); use the Hopper-native pair elsewhere.
 if is_sm100_supported():
-    CUDA_ATTENTION_BACKEND = "trtllm_mha"
-    CUDA_DRAFT_ATTENTION_BACKEND = "fa4"
+    ATTENTION_BACKEND = "trtllm_mha"
+    DRAFT_ATTENTION_BACKEND = "fa4"
 else:
-    CUDA_ATTENTION_BACKEND = "fa3"
-    CUDA_DRAFT_ATTENTION_BACKEND = "fa3"
+    ATTENTION_BACKEND = "fa3"
+    DRAFT_ATTENTION_BACKEND = "fa3"
 
 
-class _DSparkSanityMixin(
+class TestBasicSanityDSpark(
     BasicAPIContractMixin,
     BasicDecodeCorrectnessMixin,
     BasicSchedulerStressMixin,
@@ -44,12 +44,8 @@ class _DSparkSanityMixin(
     SpecGrammarKit,
     SpecLogprobKit,
     SpecSamplingMaskKit,
+    CustomTestCase,
 ):
-    """DSpark sanity coverage shared by every backend pairing. Concrete
-    subclasses add CustomTestCase, set the (attention_backend,
-    draft_attention_backend) pair, and any per-backend launch overrides.
-    Not a TestCase itself, so it is never collected on its own."""
-
     served_model_name = TARGET_MODEL
     model = TARGET_MODEL
 
@@ -60,18 +56,8 @@ class _DSparkSanityMixin(
     mmlu_score_threshold = 0.70
     mmlu_accept_length_thres = 3.0
 
-    # Set per concrete subclass.
-    attention_backend: str = None
-    draft_attention_backend: str = None
-    page_size: str = "1"
-    mem_fraction_static: str = "0.7"
-    # None leaves the scheduler uncapped; XPU classes cap it (see below).
-    max_running_requests: str = None
-    # None keeps the server default (4096). return_logprob over a long prompt
-    # materializes a [chunk_tokens, vocab] logits tensor; XPU classes shrink the
-    # chunk so that transient fits the 24GB B60 (see below).
-    chunked_prefill_size: str = None
-    extra_launch_args: list = []
+    attention_backend = ATTENTION_BACKEND
+    draft_attention_backend = DRAFT_ATTENTION_BACKEND
 
     process = None
 
@@ -95,22 +81,11 @@ class _DSparkSanityMixin(
                 "--cuda-graph-max-bs-decode",
                 "4",
                 "--mem-fraction-static",
-                cls.mem_fraction_static,
+                "0.7",
                 "--page-size",
-                cls.page_size,
+                "1",
                 "--enable-metrics",
                 "--cuda-graph-backend-prefill=disabled",
-                *(
-                    ["--max-running-requests", cls.max_running_requests]
-                    if cls.max_running_requests is not None
-                    else []
-                ),
-                *(
-                    ["--chunked-prefill-size", cls.chunked_prefill_size]
-                    if cls.chunked_prefill_size is not None
-                    else []
-                ),
-                *cls.extra_launch_args,
             ],
             env={
                 "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
@@ -122,12 +97,6 @@ class _DSparkSanityMixin(
     def tearDownClass(cls):
         if cls.process is not None:
             kill_process_tree(cls.process.pid)
-
-
-@unittest.skipIf(is_xpu(), "CUDA/AMD backend pairing; XPU is covered separately")
-class TestBasicSanityDSpark(_DSparkSanityMixin, CustomTestCase):
-    attention_backend = CUDA_ATTENTION_BACKEND
-    draft_attention_backend = CUDA_DRAFT_ATTENTION_BACKEND
 
 
 if __name__ == "__main__":

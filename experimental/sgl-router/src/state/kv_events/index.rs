@@ -1195,13 +1195,13 @@ async fn pump_loop(
                             RankOutcome::Overflow,
                         );
                     } else {
-                        // Only LoRA ingestion needs tokens to translate opaque IDs;
-                        // shed base tokens to keep the existing bootstrap memory bound.
+                        // The cap counts batches, not bytes, and `token_ids` is
+                        // the unbounded part of a batch (one entry per prompt
+                        // token) that `apply_batch` never reads. Shed it so a
+                        // long-context fleet cannot hold gigabytes at boot.
                         for event in &mut batch.events {
                             if let KvCacheEvent::BlockStored(b) = event {
-                                if b.lora_name.is_none() {
-                                    b.token_ids = Vec::new();
-                                }
+                                b.token_ids = Vec::new();
                             }
                         }
                         if let Some(queue) = held.get_mut(&worker) {
@@ -1348,7 +1348,12 @@ fn apply_batch(
                     b.medium.as_deref(),
                     b.block_hashes.len(),
                 );
-                tree.store_event(worker, b);
+                tree.insert_tiered(
+                    worker,
+                    b.parent_block_hash,
+                    &b.block_hashes,
+                    Tiers::for_store(b.medium.as_deref()),
+                );
             }
             KvCacheEvent::BlockRemoved(b) => {
                 tally.record(
@@ -1356,7 +1361,7 @@ fn apply_batch(
                     b.medium.as_deref(),
                     b.block_hashes.len(),
                 );
-                tree.remove_event(
+                tree.remove_tiered(
                     worker,
                     &b.block_hashes,
                     Tiers::for_remove(b.medium.as_deref()),

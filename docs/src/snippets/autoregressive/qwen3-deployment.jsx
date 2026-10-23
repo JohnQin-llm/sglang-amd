@@ -338,6 +338,7 @@ export const Qwen3Deployment = () => {
     }
 
     if (hardware === 'b300') {
+      cmd += ' \\\n  --attention-backend flashinfer';
       cmd += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
     }
 

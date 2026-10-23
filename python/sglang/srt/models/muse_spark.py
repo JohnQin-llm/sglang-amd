@@ -40,10 +40,10 @@ from sglang.kernels.ops.muse_spark.router_gemm import (
     MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
 )
 from sglang.srt.configs.muse_spark import (
-    MuseSpark1xTextConfig,
+    MuseSparkTextConfig,
     should_skip_weight_loading,
 )
-from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers import layernorm_sp
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
@@ -216,7 +216,7 @@ class MuseSpark1xRouter(nn.Module):
 
 
 class MuseSpark1xAttention(nn.Module):
-    def __init__(self, config: MuseSpark1xTextConfig, layer_idx: int, prefix: str):
+    def __init__(self, config: MuseSparkTextConfig, layer_idx: int, prefix: str):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
@@ -398,7 +398,7 @@ class MuseSpark1xAttention(nn.Module):
 
 
 class MuseSpark1xMLP(nn.Module):
-    def __init__(self, config: MuseSpark1xTextConfig, prefix: str):
+    def __init__(self, config: MuseSparkTextConfig, prefix: str):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=config.hidden_size,
@@ -425,7 +425,7 @@ class MuseSpark1xMLP(nn.Module):
 class MuseSpark1xMoE(nn.Module):
     def __init__(
         self,
-        config: MuseSpark1xTextConfig,
+        config: MuseSparkTextConfig,
         layer_idx: int,
         nvfp4_checkpoint: bool,
         prefix: str,
@@ -509,7 +509,7 @@ class MuseSpark1xMoE(nn.Module):
             and torch.cuda.is_available()
             and torch.cuda.get_device_capability() == (10, 3)
         ):
-            ca_comm = get_tp_group().ca_comm
+            ca_comm = get_parallel().tp_group.ca_comm
             reserve_projection_workspace(
                 ca_comm, max(self.expert_hidden_size, self.hidden_size)
             )
@@ -643,7 +643,7 @@ class MuseSpark1xMoE(nn.Module):
             and not get_forward().sp_active
             and hidden_states.dtype == torch.bfloat16
             and 0 < hidden_states.shape[0] <= ar_workspace.max_tokens
-            and ar_workspace.can_fuse(get_tp_group(), hidden_states.shape[0])
+            and ar_workspace.can_fuse(get_parallel().tp_group, hidden_states.shape[0])
         ):
             if (
                 forward_batch is not None
@@ -687,7 +687,7 @@ class MuseSpark1xMoE(nn.Module):
             if _is_cpu:
                 output, _ = self.post_expert_proj(output)
                 return output
-            comm = get_tp_group().ca_comm if self.tp_size > 1 else None
+            comm = get_parallel().tp_group.ca_comm if self.tp_size > 1 else None
             if not getattr(get_forward(), "sp_active", False) and gemm_ag_supported(
                 comm, output, self.post_expert_proj.weight
             ):
@@ -713,7 +713,7 @@ class MuseSpark1xMoE(nn.Module):
     ) -> torch.Tensor:
         # Every rank runs the experts on the same DP-replicated global batch,
         # so the full-TP all-reduce below stays correct.
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         global_hidden = get_global_dp_buffer(tp_group)
         dp_gather_replicate(global_hidden, hidden_states, forward_batch)
         output = self._forward_experts(global_hidden)
@@ -767,7 +767,7 @@ class MuseSpark1xMoE(nn.Module):
         elif _is_cpu:
             expert_input, _ = self.pre_expert_proj(hidden_states)
         else:
-            comm = get_tp_group().ca_comm if self.tp_size > 1 else None
+            comm = get_parallel().tp_group.ca_comm if self.tp_size > 1 else None
             if (
                 self.tp_size in (4, 8)
                 and not sp_active
@@ -881,7 +881,7 @@ class MuseSpark1xMoE(nn.Module):
 class MuseSpark1xDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: MuseSpark1xTextConfig,
+        config: MuseSparkTextConfig,
         layer_idx: int,
         nvfp4_checkpoint: bool,
         prefix: str,
@@ -950,7 +950,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
         self._fused_ffn_boundary = None
 
     @staticmethod
-    def _is_moe_layer(config: MuseSpark1xTextConfig, layer_idx: int) -> bool:
+    def _is_moe_layer(config: MuseSparkTextConfig, layer_idx: int) -> bool:
         return config.mlp_layer_types[layer_idx] == "sparse"
 
     def bind_next_pre_attn_norm(self, next_pre_attn_norm: MuseSpark1xRMSNorm) -> None:
@@ -991,7 +991,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
         # A TP-sliced branch means the unpooler gather was deferred to the FFN boundary.
         if ffn_output.shape[-1] != stream.shape[-1]:
             next_attn_input, stream = self._fused_ffn_boundary.forward_with_ag(
-                stream, ffn_output, get_tp_group().ca_comm
+                stream, ffn_output, get_parallel().tp_group.ca_comm
             )
             return stream, next_attn_input
         if self._fused_ffn_boundary is None:
@@ -1009,7 +1009,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
 
 # Register the input norm at the decoder layer, as in the HF checkpoint.
 def _install_pre_attn_norm(
-    config: MuseSpark1xTextConfig, layer: MuseSpark1xDecoderLayer
+    config: MuseSparkTextConfig, layer: MuseSpark1xDecoderLayer
 ) -> None:
     layer.input_layernorm = MuseSpark1xRMSNorm(
         config.hidden_size,
@@ -1023,7 +1023,7 @@ def _install_pre_attn_norm(
 class MuseSpark1xModel(nn.Module):
     def __init__(
         self,
-        config: MuseSpark1xTextConfig,
+        config: MuseSparkTextConfig,
         quant_config: Optional[QuantizationConfig],
         prefix: str,
     ):
@@ -1071,7 +1071,7 @@ class MuseSpark1xModel(nn.Module):
                 CustomAllReduceV2,
             )
 
-            tp_group = get_tp_group()
+            tp_group = get_parallel().tp_group
             if (
                 get_parallel().tp_size not in (4, 8)
                 or get_parallel().moe_ep_size != get_parallel().tp_size
@@ -1134,7 +1134,7 @@ class MuseSpark1xModel(nn.Module):
 
                 first_moe = moe_layers[0]
                 self._sp_moe_dispatcher = FlashinferDispatcher(
-                    group=get_tp_group().device_group,
+                    group=get_parallel().tp_group.device_group,
                     router_topk=first_moe.top_k,
                     num_experts=first_moe.num_experts,
                     num_local_experts=first_moe.num_local_experts,
@@ -1203,7 +1203,7 @@ class MuseSparkModel(nn.Module):
         return self.language_model.layers
 
 
-class MuseSpark1xForCausalLM(nn.Module):
+class MuseSparkTextForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1211,7 +1211,7 @@ class MuseSpark1xForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: MuseSpark1xTextConfig,
+        config: MuseSparkTextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -1598,12 +1598,10 @@ class MuseSpark1xForCausalLM(nn.Module):
 # The independently validated MI355 implementation keeps the fused boundaries,
 # Quark loader, and kernel rounding points that were measured together.
 if is_hip():
-    from sglang.srt.rocm_muse_spark.model import MuseSpark1xForCausalLM
+    from sglang.srt.rocm_muse_spark.model import MuseSparkTextForCausalLM
 
-
-EntryClass = [MuseSpark1xForCausalLM]
 
 __all__ = [
-    "MuseSpark1xForCausalLM",
-    "MuseSpark1xTextConfig",
+    "MuseSparkTextForCausalLM",
+    "MuseSparkTextConfig",
 ]
