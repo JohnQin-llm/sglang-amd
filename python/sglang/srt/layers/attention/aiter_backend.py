@@ -744,6 +744,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.muse_unified_attention_kwargs.update(
                     verify_block_m=_MUSE_VERIFY_BLOCK_M,
                     verify_num_segments=_MUSE_VERIFY_NUM_SEGMENTS,
+                    query_metadata_prevalidated=True,
                 )
         if self.use_muse_attention_paths:
             logger.info(

@@ -159,7 +159,16 @@ class MonoSpec(msgspec.Struct, frozen=True):
 
 
 # backend name -> HF architecture -> the "module:attribute" path of its spec
-_REGISTRY: dict[str, dict[str, str]] = {}
+_REGISTRY: dict[str, dict[str, str]] = {
+    "flydsl": {
+        "MuseSparkForConditionalGeneration": (
+            "sglang.srt.rocm_muse_spark.mono.sglang_spec:MONO_SPEC"
+        ),
+        "MuseSpark1xForCausalLM": (
+            "sglang.srt.rocm_muse_spark.mono.sglang_spec:MONO_SPEC"
+        ),
+    }
+}
 
 
 def register(*, backend: str, architecture: str, path: str) -> None:

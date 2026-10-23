@@ -1895,6 +1895,8 @@ class Envs:
     SGLANG_MUSE_VERIFY_FULL_GQA = EnvBool(True)
     # Triton extend: DFlash draft block (8 x 8 heads, 1 KV head, HD128) split-KV.
     SGLANG_MUSE_DFLASH_SPLITKV = EnvBool(True)
+    # C1 DFlash8 draft attention with persistent split-KV scratch.
+    SGLANG_MUSE_DFLASH_WINDOW_SPLIT = EnvBool(False)
     # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
     # registers (O projection, MoE pooler, DFlash draft MLP).
     SGLANG_MUSE_DENSE_TILED = EnvBool(True)
