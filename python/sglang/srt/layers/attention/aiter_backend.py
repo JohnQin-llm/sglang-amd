@@ -708,6 +708,11 @@ class AiterAttnBackend(AttentionBackend):
             and self.head_dim == 64
             and self.num_head == 8 * self.num_kv_head
         )
+        # Unified verify sizes from the page table, so spec_v2 overlap can resolve
+        # seq_lens on the forward stream instead of a host sync every step.
+        self.needs_cpu_seq_lens = not (
+            self.use_muse_attention_paths and self._use_unified_verify
+        )
         self.muse_reuse_extend_metadata = (
             self.use_muse_attention_paths
             and envs.SGLANG_MUSE_REUSE_EXTEND_METADATA.get()
