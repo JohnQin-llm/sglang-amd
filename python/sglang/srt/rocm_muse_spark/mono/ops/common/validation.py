@@ -235,13 +235,27 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
     )
 
     peer = k2.peer_layout()
-    assert set(peer) == {"ar", *moe.peer_pairs(k2.MAX_TOKENS)}
+    assert set(peer) == {
+        "ar",
+        *moe.peer_pairs(k2.MAX_TOKENS),
+        "rlog_parts",
+        "xg",
+        "xsq",
+    }
+    # Appended regions: every original peer region keeps its offset.
+    appended = ("rlog_parts", "xg", "xsq")
+    assert max(o + n for name, (o, n) in peer.items() if name not in appended) <= (
+        min(peer[name][0] for name in appended)
+    )
     _assert_layout(peer, k2._half())
     _assert_pairs(
         peer,
         {
             "ar": oproj.ar_pairs(k2.MAX_TOKENS),
             **moe.peer_pairs(k2.MAX_TOKENS),
+            "rlog_parts": k2.TP * moe.R_PARTS * k2.MAX_TOKENS * moe.EPR,
+            "xg": k2.MAX_TOKENS * k2.seam.H // 2,
+            "xsq": k2.MAX_TOKENS * k2.NSL,
         },
     )
     assert k2.peer_bytes() == 2 * k2._half()
@@ -254,6 +268,22 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
         assert blocks == 512
         assert list(range(BLOCKS)) == [bid for bid in range(blocks) if bid < BLOCKS]
     _assert_owned(moe.R_TASKS, k2.R0)
+    if quarter:
+        # 64 router tasks: (group, part) from the task's low four bits, the
+        # token pair from the rest; every (group, part, token) exactly once.
+        router_ctas = list(range(k2.R0, k2.R0 + moe.R_TASKS)) + list(
+            range(k2.RX0, BLOCKS)
+        )
+        assert len(router_ctas) == moe.R_TASKS_Q8
+        assert not set(router_ctas) & set(range(k2.P0, k2.P0 + moe.P_TASKS))
+        items = set()
+        for task, _cta in enumerate(router_ctas):
+            group, part = (task % moe.R_TASKS) // moe.R_PARTS, task % moe.R_PARTS
+            for t in range(moe.ROUTER_PAIR):
+                token = (task // moe.R_TASKS) * moe.ROUTER_PAIR + t
+                assert (group, part, token) not in items
+                items.add((group, part, token))
+        assert len(items) == moe.R_GROUPS * moe.R_PARTS * s
     _assert_owned(moe.P_TASKS, k2.P0)
     _assert_owned(32 if quarter else k2.NSL)
     _assert_owned(s)
@@ -441,22 +471,12 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
     )
     assert (last_w2_scale_dword + 1) * 4 == moe.W2_SCALE_BYTES
 
+    # The q8 seam keeps the default seam's order: x sum, norm 1, norm 2.
     seam_nodes = (
-        (
-            "seam_msq1_put",
-            "seam_rstd1_put",
-            "seam_rstd1_load",
-            "seam_msq2_put",
-            "seam_rstd2_put",
-            "seam_rstd2_load",
-        )
-        if quarter
-        else (
-            "seam_msq1_put",
-            "seam_msq1_sum",
-            "seam_msq2_put",
-            "seam_msq2_sum",
-        )
+        "seam_msq1_put",
+        "seam_msq1_sum",
+        "seam_msq2_put",
+        "seam_msq2_sum",
     )
     nodes = (
         "oproj_ar_publish",
@@ -475,28 +495,15 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
         *(("fin_receive",) if s == 8 else ()),
         "up_weight_load",
         "up_compute",
-        *(("up_partial_publish", "up_combine") if quarter else ()),
         "branch_publish",
         "gather",
     )
     seam_edges = (
-        (
-            ("oproj_ar_publish", "seam_msq1_put"),
-            ("seam_msq1_put", "seam_rstd1_put"),
-            ("seam_rstd1_put", "seam_rstd1_load"),
-            ("seam_rstd1_load", "seam_msq2_put"),
-            ("seam_msq2_put", "seam_rstd2_put"),
-            ("seam_rstd2_put", "seam_rstd2_load"),
-            ("seam_rstd2_load", "ffn_publish"),
-        )
-        if quarter
-        else (
-            ("oproj_ar_publish", "seam_msq1_put"),
-            ("seam_msq1_put", "seam_msq1_sum"),
-            ("seam_msq1_sum", "seam_msq2_put"),
-            ("seam_msq2_put", "seam_msq2_sum"),
-            ("seam_msq2_sum", "ffn_publish"),
-        )
+        ("oproj_ar_publish", "seam_msq1_put"),
+        ("seam_msq1_put", "seam_msq1_sum"),
+        ("seam_msq1_sum", "seam_msq2_put"),
+        ("seam_msq2_put", "seam_msq2_sum"),
+        ("seam_msq2_sum", "ffn_publish"),
     )
     _assert_dag(
         nodes,
@@ -531,16 +538,9 @@ def validate_k2(key: k2.K2Build) -> dict[str, int]:
             ),
             ("down_publish", "up_weight_load"),
             ("up_weight_load", "up_compute"),
-            *(
-                (
-                    ("fin_receive", "up_weight_load"),
-                    ("up_compute", "up_partial_publish"),
-                    ("up_partial_publish", "up_combine"),
-                    ("up_combine", "branch_publish"),
-                )
-                if quarter
-                else (("up_compute", "branch_publish"),)
-            ),
+            # q8: the full-K unpool's weights are issued after the late expert
+            # CTAs finish, independent of FIN.
+            ("up_compute", "branch_publish"),
             ("branch_publish", "gather"),
         ),
     )
@@ -596,7 +596,6 @@ def validate_k2_trace(key: k2.K2Build, trace: Record) -> bool:
             "finalize",
             *(("fin_gather",) if key.tokens == 8 else ()),
             "up",
-            *(("up",) if key.experimental_two_cta else ()),
             "gather",
             "finish",
         ),
@@ -608,30 +607,53 @@ def validate_k2_trace(key: k2.K2Build, trace: Record) -> bool:
         {
             ("oproj", "ar", Space.PEER, "put"),
             ("router", "xrdy", Space.SCRATCH, "poll"),
-            ("router", "rpart", Space.SCRATCH, "put"),
-            ("router", "rpart", Space.SCRATCH, "poll"),
-            ("router", "rlog", Space.PEER, "put"),
+            *(
+                {("router", "rlog_parts", Space.PEER, "put")}
+                if key.experimental_two_cta
+                else {
+                    ("router", "rpart", Space.SCRATCH, "put"),
+                    ("router", "rpart", Space.SCRATCH, "poll"),
+                    ("router", "rlog", Space.PEER, "put"),
+                }
+            ),
             ("pool", "xrdy", Space.SCRATCH, "poll"),
             ("pool", "ppart", Space.SCRATCH, "put"),
             ("pool", "ppart", Space.SCRATCH, "poll"),
             ("pool", "pool", Space.PEER, "put"),
             ("seam", "ar", Space.PEER, "poll"),
-            ("seam", "msq1", Space.SCRATCH, "put"),
-            ("seam", "msq1", Space.SCRATCH, "poll"),
-            ("seam", "msq2", Space.SCRATCH, "put"),
-            ("seam", "msq2", Space.SCRATCH, "poll"),
+            *(
+                set()
+                if key.experimental_two_cta
+                else {
+                    ("seam", "msq1", Space.SCRATCH, "put"),
+                    ("seam", "msq1", Space.SCRATCH, "poll"),
+                }
+            ),
+            *(
+                set()
+                if key.experimental_two_cta
+                else {
+                    ("seam", "msq2", Space.SCRATCH, "put"),
+                    ("seam", "msq2", Space.SCRATCH, "poll"),
+                }
+            ),
             *(
                 {
-                    ("seam", "rstd1", Space.SCRATCH, "put"),
-                    ("seam", "rstd1", Space.SCRATCH, "poll"),
-                    ("seam", "rstd2", Space.SCRATCH, "put"),
-                    ("seam", "rstd2", Space.SCRATCH, "poll"),
+                    ("seam", "xg", Space.PEER, "put"),
+                    ("seam", "xg", Space.PEER, "poll"),
+                    ("seam", "xsq", Space.PEER, "put"),
+                    ("seam", "xsq", Space.PEER, "poll"),
                 }
                 if key.experimental_two_cta
                 else set()
             ),
             ("seam", "xrdy", Space.SCRATCH, "put"),
-            ("route", "rlog", Space.PEER, "poll"),
+            (
+                "route",
+                "rlog_parts" if key.experimental_two_cta else "rlog",
+                Space.PEER,
+                "poll",
+            ),
             ("route", "route", Space.SCRATCH, "put"),
             ("xq", "pool", Space.PEER, "poll"),
             ("xq", "xqrdy", Space.SCRATCH, "put"),
@@ -665,14 +687,6 @@ def validate_k2_trace(key: k2.K2Build, trace: Record) -> bool:
                 }
             ),
             ("up", "frdy", Space.SCRATCH, "poll"),
-            *(
-                {
-                    ("up", "up_partial_ready", Space.SCRATCH, "put"),
-                    ("up", "up_partial_ready", Space.SCRATCH, "poll"),
-                }
-                if key.experimental_two_cta
-                else set()
-            ),
             ("up", "br", Space.PEER, "put"),
             ("gather", "br", Space.PEER, "poll"),
             ("finish", "finish", Space.SCRATCH, "put"),

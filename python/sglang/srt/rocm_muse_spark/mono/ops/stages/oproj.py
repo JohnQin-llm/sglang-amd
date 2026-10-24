@@ -18,7 +18,9 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from sglang.srt.rocm_muse_spark.mono.ops.common.ops import (
+    CM_NT,
     bf16_round,
+    mfma_bf16,
     row_sum,
     rsrc,
     traced,
@@ -169,6 +171,82 @@ def stage_o(c, rg, ops):
         at = (c["rank"] * s + tt) * H + rg * ROWS + 4 * rq
         for p in range_constexpr(TP):
             c["put_bf"](c["ar_peer"][p], at, vs)
+    gpu.barrier()
+
+
+O_PREFETCH = 4  # 128-K chunks of W_o in flight per wave (16 dwordx4)
+
+
+def o_chunk_loads(c, rg, ch, active):
+    """``o_loads_full``'s chunk ``ch`` for tile ``rg`` (the same addresses and
+    cache policy), masked for waves without a tile."""
+    lane = c["lane"]
+    r_w = rsrc(c["args"]["w_o"], H * CORE * 2)
+    row = rg * ROWS + lane % ROWS
+    base = (row * CORE + ch * gemv.KCH + (lane // ROWS) * 8) // 2
+    return [
+        fx.Vector(
+            bo.buffer_load(
+                r_w,
+                base + 16 * q,
+                vec_width=4,
+                dtype=T.i32,
+                cache_modifier=CM_NT,
+                mask=active,
+            )
+        )
+        for q in range(4)
+    ]
+
+
+@traced
+def stage_oproj_deep(c, bid):
+    """Rows 5..8 o_proj (q8 two-CTA build) with a deep weight stream.
+
+    Waves 0/1 own tiles ``bid`` and ``bid + 256``; each keeps the original
+    single K = 1024 accumulator chain (``gemv.mfmas_full`` order).
+    """
+    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
+    n = CORE // gemv.KCH
+    active = wave < O_ROUNDS
+    rg = bid + BLOCKS * fx.min(wave, O_ROUNDS - 1)
+    ops = [o_chunk_loads(c, rg, ch, active) for ch in range(O_PREFETCH)]
+    rocdl.sched_barrier(0)
+    load_core(c)
+    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+    if wave < O_ROUNDS:
+        g = lane // ROWS
+        t = fx.min(lane % ROWS, s - 1)
+        # A branch-local list: the traced branch must not mutate ``ops``.
+        stream = [ops[i] for i in range(O_PREFETCH)]
+        for ch in range_constexpr(n):
+            if const_expr(ch + O_PREFETCH < n):
+                stream.append(o_chunk_loads(c, rg, ch + O_PREFETCH, active))
+            rocdl.sched_barrier(0)
+            kk = ch * gemv.KCH + g * 8
+            for q in range_constexpr(4):
+                xb = fx.Vector(
+                    fx.ptr_load(
+                        c["xl"] + (t * CORE_ROW + kk + 32 * q) // 2,
+                        result_type=fx.Vector.make_type(4, fx.Int32),
+                    )
+                )
+                acc = mfma_bf16(
+                    stream[ch][q].bitcast(fx.BFloat16), xb.bitcast(fx.BFloat16), acc
+                )
+            rocdl.sched_barrier(0)
+    fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
+    gpu.barrier()
+    for j in range_constexpr(O_ROUNDS):
+        if tid < s * (ROWS // 4):
+            tt = tid // (ROWS // 4)
+            rq = tid % (ROWS // 4)
+            vs = [
+                bf16_round(row_sum(red, 4 * rq + d, tt, waves=(j,))) for d in range(4)
+            ]
+            at = (c["rank"] * s + tt) * H + (bid + BLOCKS * j) * ROWS + 4 * rq
+            # Reduce-scatter: only the column owner sums this tile's columns.
+            c["put_bf"](c["ar_owner"][j], at, vs)
     gpu.barrier()
 
 

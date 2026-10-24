@@ -60,12 +60,12 @@ from sglang.srt.rocm_muse_spark.mono.ops.common.ops import (
     hw_exp2,
     hw_rsq,
     lanes_below,
-    mfma_bf16,
     popcount,
     row_sum,
     rsrc,
     traced,
     uniform,
+    wave_incl_scan,
     wave_sum,
 )
 from sglang.srt.rocm_muse_spark.mono.ops.common.plan import (
@@ -110,6 +110,11 @@ R_GROUPS = EPR // WAVES  # 4: 8 experts a task, one a wave
 R_PARTS = 4  # K quarters
 R_K = H // R_PARTS  # 2048
 R_TASKS = R_GROUPS * R_PARTS  # 16
+# q8 two-CTA build: each router task computes two tokens; four token groups
+# give 64 tasks (the default builds keep 16 tasks of every token).
+ROUTER_PAIR = 2
+R_TOKEN_GROUPS_Q8 = 8 // ROUTER_PAIR  # 4
+R_TASKS_Q8 = R_TASKS * R_TOKEN_GROUPS_Q8  # 64
 POOL_N = MH // TP  # 512 pooled columns a rank
 P_GROUPS = POOL_N // ROWS  # 32
 P_PARTS = 4
@@ -342,6 +347,64 @@ def router_compute(c, i, q, ops):
     gpu.barrier()
 
 
+@traced
+def router_compute_pair(c, i, q, tg, ops):
+    """Router task (i, q) for tokens 2 tg and 2 tg + 1 (q8 two-CTA build).
+
+    Exactly ``router_compute``'s arithmetic for those two tokens: the same
+    lane chains over the K quarter, wave sums, RPART slots and part order
+    into RLOG.  Only the token rows staged and computed per CTA shrink.
+    """
+    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    t0 = tg * ROUTER_PAIR
+    if tid < ROUTER_PAIR:
+        c["poll"]([(c["xrdy"], (t0 + tid) * R_PARTS + q, 1)])
+    gpu.barrier()
+    gemv.rows_to_lds(
+        tid,
+        c["xbuf"] + fx.Int64(t0 * (H * 2)),
+        R_K,
+        ROUTER_PAIR,
+        c["xl"],
+        R_K + gemv.LDS_PAD,
+        CM_DEV,
+        ldk=H,
+        k0=q * R_K,
+    )
+    xrow = EARLY_K + gemv.LDS_PAD
+    for t in range_constexpr(ROUTER_PAIR):
+        acc = fx.Float32(0.0)
+        for j in range_constexpr(R_K // 256):
+            xv = fx.Vector(
+                fx.ptr_load(
+                    c["xl"] + (t * xrow + 256 * j + lane * 4) // 2,
+                    result_type=fx.Vector.make_type(2, fx.Int32),
+                )
+            )
+            w = ops[j]
+            acc = acc + bf_lo(xv[0]) * w[0]
+            acc = acc + bf_hi(xv[0]) * w[1]
+            acc = acc + bf_lo(xv[1]) * w[2]
+            acc = acc + bf_hi(xv[1]) * w[3]
+        v = wave_sum(acc)
+        if lane == 0:
+            fx.ptr_store(v, c["av"] + (t * WAVES + wave))
+    gpu.barrier()
+    if tid < ROUTER_PAIR * WAVES:
+        # Each K quarter's partial goes to every rank as is; the route CTA adds
+        # the four parts in part order, as part 0 did through RPART.
+        v = fx.ptr_load(c["av"] + tid)
+        t = t0 + tid // WAVES
+        w = tid % WAVES
+        for p in range_constexpr(TP):
+            c["put"](
+                c["peer"]["rlog_parts"][p],
+                ((c["rank"] * R_PARTS + q) * s + t) * EPR + i * WAVES + w,
+                v,
+            )
+    gpu.barrier()
+
+
 def pool_loads(c, i, q):
     """Pooler task (i, q): rows rank 512 + 16 i .., K quarter q."""
     return gemv.loads(
@@ -409,17 +472,41 @@ def stage_route(c, t):
     (summed in slot order, IEEE 1 / sum) -> ROUTE."""
     lane, wave, red = c["lane"], c["wave"], c["red"]
     a = c["args"]
+    # Read outside the traced branch: a method call on ``c`` inside it would
+    # make the rewriter carry ``c`` as branch state.
+    use_parts = c.get("rlog_parts", False)
     if wave == 0:
         s = c["S"]
         per = E // 64
         bias = [bo_ld_f32(a["expert_bias"], lane + 64 * i) for i in range(per)]
         specs = []
-        for i in range_constexpr(per):
-            e = lane + 64 * i
-            specs.append(
-                (c["peer"]["rlog_own"], ((e // EPR) * s + t) * EPR + e % EPR, 1)
-            )
-        got = c["poll"](specs)
+        if const_expr(use_parts):
+            # q8 two-CTA: the four K-quarter partials of each logit, summed in
+            # part order exactly as the router's part 0 did.
+            for i in range_constexpr(per):
+                e = lane + 64 * i
+                for qq in range_constexpr(R_PARTS):
+                    specs.append(
+                        (
+                            c["peer"]["rlog_parts_own"],
+                            (((e // EPR) * R_PARTS + qq) * s + t) * EPR + e % EPR,
+                            1,
+                        )
+                    )
+            parts = c["poll"](specs, batch=per * R_PARTS)
+            got = []
+            for i in range_constexpr(per):
+                v = f32_of(parts[i * R_PARTS][0])
+                for qq in range_constexpr(1, R_PARTS):
+                    v = v + f32_of(parts[i * R_PARTS + qq][0])
+                got.append([v.bitcast(fx.Int32)])
+        else:
+            for i in range_constexpr(per):
+                e = lane + 64 * i
+                specs.append(
+                    (c["peer"]["rlog_own"], ((e // EPR) * s + t) * EPR + e % EPR, 1)
+                )
+            got = c["poll"](specs)
         keys, sigs = [], []
         for i in range_constexpr(per):
             # Current SGLang applies the model's output multiplier to the raw
@@ -490,9 +577,63 @@ def stage_route(c, t):
 
 
 @traced
+def _load_route_q8(c):
+    """``load_route`` for the q8 two-CTA build: the same tables, built by wave 0.
+
+    The table resets do not depend on ROUTE and precede its wait.  Wave 0's 64
+    lanes are the 64 picks: they mark ``flag``; each lane then scans four
+    flags in expert order (``wave_incl_scan``), so slots are assigned in
+    ascending expert id exactly as the CTA scan did.  LDS operations of one
+    wave complete in order; two CTA barriers bracket the wave's work.
+    """
+    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    rt = c["rt"]
+    for i in range_constexpr((MAX_U * 8 + THREADS - 1) // THREADS):
+        j = tid + THREADS * i
+        if j < MAX_U * 8:
+            fx.ptr_store(fx.Int32(-1), rt["kof"] + j)
+    if tid < MAX_U:
+        fx.ptr_store(fx.Int32(0), rt["expert"] + tid)
+    for i in range_constexpr((E + THREADS - 1) // THREADS):
+        e = tid + THREADS * i
+        if e < E:
+            fx.ptr_store(fx.Int32(0), rt["flag"] + e)
+    n = s * 2 * TOPK
+    if tid < n:
+        v = c["poll"]([(c["route"], tid, 1)])[0][0]
+        fx.ptr_store(v, rt["route"] + tid)
+    gpu.barrier()
+    if wave == 0:
+        t = lane // TOPK
+        k = lane % TOPK
+        e = fx.max(fx.min(fx.ptr_load(rt["route"] + (t * 2 * TOPK + k)), E - 1), 0)
+        fx.ptr_store(fx.Int32(1), rt["flag"] + e)
+        per = E // 64
+        fs = [fx.ptr_load(rt["flag"] + (lane * per + d)) for d in range(per)]
+        cnt = fs[0]
+        for d in range_constexpr(1, per):
+            cnt = cnt + fs[d]
+        incl = wave_incl_scan(cnt, lane)
+        off = incl - cnt
+        for d in range_constexpr(per):
+            if fs[d] == 1:
+                fx.ptr_store(off, rt["flag"] + (lane * per + d))
+                fx.ptr_store(fx.Int32(lane * per + d), rt["expert"] + off)
+            off = off + fs[d]
+        slot = fx.ptr_load(rt["flag"] + e)
+        fx.ptr_store(fx.Int32(k), rt["kof"] + (slot * 8 + t))
+        if lane == 63:
+            fx.ptr_store(incl, c["scan"])
+    gpu.barrier()
+    return uniform(fx.ptr_load(c["scan"]))
+
+
+@traced
 def load_route(c):
     """ROUTE -> LDS (ids, weights); the union U: slot_of[e], expert_of[slot],
     kof[slot][t] (the token's top-k index, -1 if not picked); returns |U|."""
+    if const_expr(c["experimental_two_cta"] and c["S"] == 8):
+        return _load_route_q8(c)
     s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
     rt = c["rt"]
     n = s * 2 * TOPK
@@ -1348,6 +1489,37 @@ def up_loads(c, j):
     )
 
 
+def up_loads_masked(c, j, live):
+    """``up_loads`` with a CTA predicate, for issue at the top level ahead of
+    FRDY: the same addresses (every K chunk is in range at K = 4096) and cache
+    policy; a masked lane's offset falls outside the bounded descriptor."""
+    lane, wave = c["lane"], c["wave"]
+    r_w = rsrc(c["args"]["w_unpool"], H * MH * 2)
+    row = c["rank"] * UP_N + fx.max(fx.min(j, UP_TASKS - 1), 0) * ROWS + lane % ROWS
+    g = lane // ROWS
+    per, n = gemv.chunks(MH)
+    assert per * WAVES == n
+    out = []
+    for i in range(per):
+        base = (row * MH + (wave + WAVES * i) * gemv.KCH + g * 8) // 2
+        out.append(
+            [
+                fx.Vector(
+                    bo.buffer_load(
+                        r_w,
+                        base + 16 * q,
+                        vec_width=4,
+                        dtype=T.i32,
+                        cache_modifier=CM_NT,
+                        mask=live,
+                    )
+                )
+                for q in range(4)
+            ]
+        )
+    return out
+
+
 @traced
 def stage_up(c, j, ops):
     """Branch columns rank 1024 + 16 j ..: FIN (after every FRDY) GEMV -> bf16
@@ -1361,118 +1533,6 @@ def stage_up(c, j, ops):
     acc = gemv.mfmas(lane, wave, c["xl"], lrow, MH, s, ops)
     fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
     gpu.barrier()
-    if tid < (ROWS // 4) * s:
-        rq = tid % (ROWS // 4)
-        tt = tid // (ROWS // 4)
-        vs = [bf16_round(row_sum(red, 4 * rq + d, tt)) for d in range(4)]
-        col = c["rank"] * UP_N + j * ROWS + 4 * rq
-        for p in range_constexpr(TP):
-            c["put_bf"](c["peer"]["br"][p], tt * H + col, vs)
-    gpu.barrier()
-
-
-@traced
-def stage_up_partial(c, j, shard):
-    """Produce one of four exact split-K partials for a q8 unpool task.
-
-    ``shard`` owns original GEMV waves ``2 * shard`` and ``2 * shard + 1``.
-    Their eight 128-wide K chunks are compacted into a 1024-wide LDS row before
-    the original weight loads and MFMA order are replayed unchanged.
-    """
-    tid, lane, wave = c["tid"], c["lane"], c["wave"]
-    if tid < FIN_TASKS:
-        c["poll"]([(c["frdy"], tid, 1)])
-    gpu.barrier()
-
-    xrow = UP_N + gemv.LDS_PAD
-    vectors = 8 * UP_N // 8
-    for i in range_constexpr((vectors + THREADS - 1) // THREADS):
-        e0 = tid + THREADS * i
-        e = fx.min(e0, vectors - 1)
-        token = e // (UP_N // 8)
-        kk = e % (UP_N // 8) * 8
-        source_kk = (2 * shard + (kk // 128) % 2 + 8 * (kk // 256)) * 128 + kk % 128
-        v = fx.Vector(
-            bo.buffer_load(
-                rsrc(c["fin"]),
-                (token * MH + source_kk) // 2,
-                vec_width=4,
-                dtype=T.i32,
-                cache_modifier=CM_DEV,
-            )
-        )
-        if e0 < vectors:
-            fx.ptr_store(v, c["xl"] + (token * xrow + kk) // 2)
-    gpu.barrier()
-
-    if wave < 2:
-        original_wave = 2 * shard + wave
-        ops = gemv.loads(
-            lane,
-            original_wave,
-            c["args"]["w_unpool"],
-            c["rank"] * UP_N + j * ROWS,
-            MH,
-        )
-        token = fx.min(lane % ROWS, 7)
-        group = lane // ROWS
-        acc = fx.Vector.filled(4, 0.0, fx.Float32)
-        for i in range_constexpr(4):
-            local_k_chunk = wave + 2 * i
-            kk = local_k_chunk * 128 + group * 8
-            for q in range_constexpr(4):
-                xb = fx.Vector(
-                    fx.ptr_load(
-                        c["xl"] + (token * xrow + kk + 32 * q) // 2,
-                        result_type=fx.Vector.make_type(4, fx.Int32),
-                    )
-                )
-                acc = mfma_bf16(
-                    ops[i][q].bitcast(fx.BFloat16),
-                    xb.bitcast(fx.BFloat16),
-                    acc,
-                )
-        if lane % ROWS < 8:
-            base = ((j * WAVES + original_wave) * 8 + token) * ROWS + 4 * (lane // ROWS)
-            bo.buffer_store(
-                acc.bitcast(fx.Int32),
-                rsrc(c["up_partial"]),
-                base,
-                cache_modifier=CM_DEV,
-            )
-
-    publish(
-        c["put"],
-        c["up_partial_ready"],
-        shard * UP_TASKS + j,
-        fx.Int32(1),
-        tid == 0,
-    )
-
-
-@traced
-def stage_up_combine(c, j):
-    """Combine four q8 split-K producers through the original unpool epilogue."""
-    s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
-    if tid < UP_PARALLEL_SHARDS:
-        c["poll"]([(c["up_partial_ready"], tid * UP_TASKS + j, 1)])
-    gpu.barrier()
-
-    token = fx.min(lane % ROWS, 7)
-    row_group = 4 * (lane // ROWS)
-    base = ((j * WAVES + wave) * 8 + token) * ROWS + row_group
-    partial = fx.Vector(
-        bo.buffer_load(
-            rsrc(c["up_partial"]),
-            base,
-            vec_width=4,
-            dtype=T.i32,
-            cache_modifier=CM_DEV,
-        )
-    ).bitcast(fx.Float32)
-    fx.ptr_store(partial, red + (wave * 64 + lane) * 4)
-    gpu.barrier()
-
     if tid < (ROWS // 4) * s:
         rq = tid % (ROWS // 4)
         tt = tid // (ROWS // 4)
