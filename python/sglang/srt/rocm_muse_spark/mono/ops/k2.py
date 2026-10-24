@@ -43,7 +43,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, rocdl
+from flydsl.expr import const_expr, gpu, rocdl
 from flydsl.expr.typing import Int32, Int64
 
 from sglang.srt.rocm_muse_spark.mono.ops.common.debug import (
@@ -99,9 +99,16 @@ K2_SLOT0 = 128  # K2 of layer i is slot 128 + i (K1: slot i)
 NSL = seam.NSL  # 64 seam slices: CTAs 0 ..
 R0 = NSL  # router CTAs
 P0 = R0 + moe.R_TASKS  # pooler CTAs
+# q8 two-CTA build: router tasks 16 .. 63 run on the o_proj producers after
+# the pooler's, which have no other early task.
+RX0 = P0 + moe.P_TASKS  # 208
+assert RX0 + moe.R_TASKS_Q8 - moe.R_TASKS == BLOCKS
 FIN0 = 0  # finalize CTAs
 G0 = 128  # gather CTAs
 U0 = BLOCKS - moe.UP_TASKS  # 192: unpooler CTAs
+# q8 two-CTA unpooler CTAs: their CU partners (b + 256) are idle while the
+# finalizers (480 .. 511, partners of 224 .. 255) poll.
+U0_Q8 = 32
 EXPERT_TAIL0 = U0 + BLOCKS  # 448: late expert producer paired with U0
 EXPERT_TAIL_PAIRS = moe.UP_TASKS
 assert P0 + moe.P_TASKS <= BLOCKS
@@ -135,7 +142,21 @@ REGIONS = (
 FINISH_FANIN = 8
 FINISH_GROUPS = (BLOCKS + FINISH_FANIN - 1) // FINISH_FANIN
 FINISH_ROOTS = (FINISH_GROUPS + FINISH_FANIN - 1) // FINISH_FANIN
-_PEER_REGIONS = ("ar", "rlog", "pool", "yr", "br", "owned_fmsq", "owned_fin")
+_PEER_REGIONS = (
+    "ar",
+    "rlog",
+    "pool",
+    "yr",
+    "br",
+    "owned_fmsq",
+    "owned_fin",
+    "rlog_parts",
+    "xg",
+    "xsq",
+)
+# q8 two-CTA router partials [src][K quarter][t][32] fp32, appended after the
+# original peer regions so their offsets are unchanged.
+RLOG_PARTS_PAIRS = TP * moe.R_PARTS * MAX_TOKENS * moe.EPR
 _SCRATCH_REGIONS = ("msq1", "msq2", "xrdy", "finish") + tuple(moe.scratch_pairs(1))
 _SCRATCH_PLAIN = tuple(moe.scratch_plain(1))
 
@@ -265,18 +286,30 @@ def finish_consensus(c, done, health, alarm):
     blocks = c["blocks"]
     finish_groups = c["finish_groups"]
     finish_roots = c["finish_roots"]
-    if (bid < finish_groups) & (tid == 0):
-        lo = bid * FINISH_FANIN
-        c["poll_terminal"]([(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)])
-        c["put"](c["finish"], blocks + bid, 1)
-    if (bid < finish_roots) & (tid == 0):
-        lo = blocks + bid * FINISH_FANIN
-        c["poll_terminal"]([(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)])
-        c["put"](c["finish"], blocks + finish_groups + bid, 1)
+    if const_expr(c["experimental_two_cta"]):
+        # One flag a thread: CTA 0 observes every CTA's terminal pair in one
+        # device-scope round instead of the three-level fan-in tree.
+        assert blocks == THREADS
+        if bid == 0:
+            c["poll_terminal"]([(c["finish"], tid, 1)])
+        gpu.barrier()
+    else:
+        if (bid < finish_groups) & (tid == 0):
+            lo = bid * FINISH_FANIN
+            c["poll_terminal"]([(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)])
+            c["put"](c["finish"], blocks + bid, 1)
+        if (bid < finish_roots) & (tid == 0):
+            lo = blocks + bid * FINISH_FANIN
+            c["poll_terminal"]([(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)])
+            c["put"](c["finish"], blocks + finish_groups + bid, 1)
     if (bid == 0) & (tid == 0):
-        c["poll_terminal"](
-            [(c["finish"], blocks + finish_groups + i, 1) for i in range(finish_roots)]
-        )
+        if const_expr(not c["experimental_two_cta"]):
+            c["poll_terminal"](
+                [
+                    (c["finish"], blocks + finish_groups + i, 1)
+                    for i in range(finish_roots)
+                ]
+            )
         c["put"](done, c["rank"], 1)
         rocdl.s_waitcnt(vmcnt=0)
         c["poll_terminal"]([(done, r, 1) for r in range(TP)])
@@ -288,7 +321,15 @@ def peer_layout() -> dict:
     """One parity's peer regions (name -> (byte offset, bytes)), laid out for
     MAX_TOKENS rows whatever the build's width: a parity's half never moves
     when the width changes between steps."""
-    pairs = {"ar": oproj.ar_pairs(MAX_TOKENS), **moe.peer_pairs(MAX_TOKENS)}
+    pairs = {
+        "ar": oproj.ar_pairs(MAX_TOKENS),
+        **moe.peer_pairs(MAX_TOKENS),
+        "rlog_parts": RLOG_PARTS_PAIRS,
+        # q8 two-CTA AR#1 all-gather: the owners' bf16 x rows [t][H / 2]
+        "xg": MAX_TOKENS * seam.H // 2,
+        # q8 two-CTA: the owners' per-slice sums of x^2 [t][64]
+        "xsq": MAX_TOKENS * NSL,
+    }
     return pair_layout(pairs.items(), align=256)
 
 
@@ -483,8 +524,10 @@ def _make(key: K2Build):
         name += (
             f"_f{key.fault_rank}_{key.fault_epoch}_{key.fault_layer}_{key.fault_ticks}"
         )
-    debug_regions = REGIONS + (
-        ("expert_tail_done", "up_partial_ready") if key.experimental_two_cta else ()
+    debug_regions = (
+        REGIONS
+        + ("rlog_parts", "xg", "xsq")
+        + (("expert_tail_done", "up_partial_ready") if key.experimental_two_cta else ())
     )
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -563,6 +606,7 @@ def _make(key: K2Build):
             "finish_roots": finish_roots,
             "experimental_two_cta": key.experimental_two_cta,
             "quarter_seam": key.experimental_two_cta,
+            "rlog_parts": key.experimental_two_cta,
             "tid": tid,
             "bid": bid,
             "lane": tid % 64,
@@ -633,6 +677,25 @@ def _make(key: K2Build):
             c["yr_owner"] = shift(
                 preg(owner_base, off, "yr", extent), fx.Int64(par) * half
             )
+        if const_expr(key.experimental_two_cta):
+            # AR#1 reduce-scatter: tile j of this CTA goes to its column owner.
+            off, extent = play["ar"]
+            c["ar_owner"] = [
+                shift(
+                    preg(
+                        load_ptr64(
+                            peers,
+                            ((bid % BLOCKS + BLOCKS * j) * oproj.ROWS)
+                            // (oproj.H // TP),
+                        ),
+                        off,
+                        "ar",
+                        extent,
+                    ),
+                    fx.Int64(par) * half,
+                )
+                for j in range(oproj.O_ROUNDS)
+            ]
         for region in _SCRATCH_REGIONS:
             c[region] = sreg(scratch, lay[region][0], region, lay[region][1])
         if const_expr(key.experimental_two_cta):
@@ -654,18 +717,29 @@ def _make(key: K2Build):
         pb = bid - P0
         is_r = (bid >= R0) & (eb < moe.R_TASKS)
         is_p = (pb >= 0) & (pb < moe.P_TASKS)
+        if const_expr(key.experimental_two_cta):
+            rx = (bid >= RX0) & (bid < BLOCKS)
+            r_task = is_r.select(eb, bid - RX0 + moe.R_TASKS)
+            is_r = is_r | rx
         enter_stage("oproj")
         if const_expr(key.experimental_two_cta):
             if bid < BLOCKS:
-                oproj.stage_oproj(c, bid)
+                oproj.stage_oproj_deep(c, bid)
         else:
             oproj.stage_oproj(c, bid)
         stamp(on, tls, tid, 1)
         if is_r:
             enter_stage("router")
-            ri = eb // moe.R_PARTS
-            rq = eb % moe.R_PARTS
-            moe.router_compute(c, ri, rq, moe.router_loads(c, ri, rq))
+            if const_expr(key.experimental_two_cta):
+                ri = (r_task % moe.R_TASKS) // moe.R_PARTS
+                rq = r_task % moe.R_PARTS
+                moe.router_compute_pair(
+                    c, ri, rq, r_task // moe.R_TASKS, moe.router_loads(c, ri, rq)
+                )
+            else:
+                ri = eb // moe.R_PARTS
+                rq = eb % moe.R_PARTS
+                moe.router_compute(c, ri, rq, moe.router_loads(c, ri, rq))
         if is_p:
             enter_stage("pool")
             pi = pb // moe.P_PARTS
@@ -676,7 +750,9 @@ def _make(key: K2Build):
         if const_expr(key.experimental_two_cta):
             if bid < 32:
                 enter_stage("seam")
-                quarter_seam.stage_seam(c, bid)
+                quarter_seam.stage_ar_owner_sum(c, bid)
+                if bid < s:
+                    quarter_seam.stage_seam_token(c, bid)
                 stamp(on, tls, tid, 3)
                 if bid < s:
                     enter_stage("route")
@@ -727,17 +803,12 @@ def _make(key: K2Build):
                     fx.Int32(1),
                     tid == 0,
                 )
-            if bid < moe.UP_PARALLEL_TASKS:
-                if c["lane"] == 0:
-                    c["poll"](
-                        [
-                            (
-                                c["expert_tail_done"],
-                                bid % moe.UP_TASKS,
-                                1,
-                            )
-                        ]
-                    )
+            # The 64 unpool CTAs wait for every late expert CTA (448 .. 511),
+            # then issue their W_unpool operands ahead of FRDY.
+            if (bid >= U0_Q8) & (bid < U0_Q8 + moe.UP_TASKS):
+                if tid < EXPERT_TAIL_PAIRS:
+                    c["poll"]([(c["expert_tail_done"], tid, 1)])
+                gpu.barrier()
         else:
             enter_stage("ug")
             if const_expr(s == 8):
@@ -762,6 +833,9 @@ def _make(key: K2Build):
                 owner = bid - fin_base
                 j = rank * moe.OWNED_FIN_TASKS + owner // s
                 moe.stage_fin_routes(c, j, owner % s)
+            up_ops = moe.up_loads_masked(
+                c, bid - U0_Q8, (bid >= U0_Q8) & (bid < U0_Q8 + moe.UP_TASKS)
+            )
         else:
             if bid < FIN0 + fin_tasks:
                 enter_stage("finalize")
@@ -778,12 +852,9 @@ def _make(key: K2Build):
                 moe.stage_fin_gather(c, bid - FIN0)
         stamp(on, tls, tid, 9)
         if const_expr(key.experimental_two_cta):
-            if bid < moe.UP_PARALLEL_TASKS:
+            if (bid >= U0_Q8) & (bid < U0_Q8 + moe.UP_TASKS):
                 enter_stage("up")
-                moe.stage_up_partial(c, bid % moe.UP_TASKS, bid // moe.UP_TASKS)
-            if (bid >= U0) & (bid < U0 + moe.UP_TASKS):
-                enter_stage("up")
-                moe.stage_up_combine(c, bid - U0)
+                moe.stage_up(c, bid - U0_Q8, up_ops)
         else:
             if (bid >= U0) & (bid < U0 + moe.UP_TASKS):
                 enter_stage("up")
