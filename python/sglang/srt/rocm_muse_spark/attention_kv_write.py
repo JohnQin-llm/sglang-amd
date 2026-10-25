@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 QK_ROPE_CACHE = envs.SGLANG_MUSE_QK_ROPE_CACHE.get()
 FUSED_QKV_CACHE = envs.SGLANG_MUSE_FUSED_QKV_CACHE.get()
+TP4_QK_ROPE_CACHE = envs.SGLANG_MUSE_TP4_QK_ROPE_CACHE.get()
+TP4_FUSED_QKV_CACHE = envs.SGLANG_MUSE_TP4_FUSED_QKV_CACHE.get()
 _logged: set = set()
 
 
@@ -46,11 +48,14 @@ class _KVWriteTarget(NamedTuple):
     cos_sin: torch.Tensor | None
 
 
-def _attention_shape_ok(attention, forward_batch: ForwardBatch) -> bool:
+def _attention_shape_ok(
+    attention, forward_batch: ForwardBatch, *, projection: bool = False
+) -> bool:
+    heads = (attention.num_heads, attention.num_kv_heads)
+    tp4_enabled = TP4_FUSED_QKV_CACHE if projection else TP4_QK_ROPE_CACHE
     return (
         attention.head_dim == 64
-        and attention.num_heads == 16
-        and attention.num_kv_heads == 2
+        and (heads == (16, 2) or (heads == (32, 4) and tp4_enabled))
         and attention.use_qk_norm
         and not attention.use_attn_temperature_tuning
         and (
@@ -128,19 +133,22 @@ def qkv_proj_norm_rope_kv_write(
 ):
     """(q, k, v, o_gate) with K/V already in the cache, or None when the fused projection does not apply."""
     projection = attention.qkv_proj
+    # At Q32/KV4, native projection plus the QK/cache fusion wins above M=16.
+    max_tokens = 16 if attention.num_heads == 32 else 32
     if not (
         x.ndim == 2
-        and 0 < x.shape[0] <= 32
+        and 0 < x.shape[0] <= max_tokens
         and x.shape[1] == 8192
         and x.dtype == torch.bfloat16
         and x.is_contiguous()
-        and projection.weight.shape == (2304, 8192)
+        and projection.weight.shape
+        == (2 * (attention.num_heads + attention.num_kv_heads) * 64, 8192)
         and projection.weight.dtype == torch.bfloat16
         and projection.weight.is_contiguous()
         and projection.bias is None
         and not projection.gather_output
         and attention.use_o_gate
-        and _attention_shape_ok(attention, forward_batch)
+        and _attention_shape_ok(attention, forward_batch, projection=True)
     ):
         return None
     target = _kv_write_target(attention, forward_batch)
@@ -160,6 +168,8 @@ def qkv_proj_norm_rope_kv_write(
         attention.scale_query_by,
         target.k_scale,
         target.v_scale,
+        num_q_heads=attention.num_heads,
+        num_kv_heads=attention.num_kv_heads,
     )
 
 
@@ -172,8 +182,10 @@ def qk_norm_rope_kv_write(
     forward_batch: ForwardBatch,
 ):
     """(q, k) normalized and rotated with K/V already in the cache, or None when the kernel does not apply."""
+    # Include C16 target verification with eight draft tokens per request.
+    max_tokens = 128 if attention.num_heads == 32 else 64
     if not (
-        0 < q.shape[0] <= 64
+        0 < q.shape[0] <= max_tokens
         and q.dtype == k.dtype == v.dtype == torch.bfloat16
         and q.stride(1) == k.stride(1) == v.stride(1) == 1
         and _attention_shape_ok(attention, forward_batch)

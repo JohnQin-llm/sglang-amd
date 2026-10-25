@@ -15,6 +15,13 @@ from sglang.srt.utils.network import NetworkAddress
 logger = logging.getLogger(__name__)
 
 
+def _assert_weight_export_supported(model):
+    for module in model.modules():
+        reason = getattr(module, "_weight_export_error", None)
+        if reason is not None:
+            raise RuntimeError(reason)
+
+
 @dataclass(slots=True, kw_only=True)
 class WeightExporter:
     tp_rank: int
@@ -81,6 +88,7 @@ class WeightExporter:
         ports,
         group_name,
     ):
+        _assert_weight_export_supported(self.get_model())
         assert torch.distributed.is_initialized(), (
             "Default torch process group must be initialized"
         )
@@ -124,6 +132,7 @@ class WeightExporter:
         return success, message
 
     def save_remote_model(self: WeightExporter, url: str):
+        _assert_weight_export_supported(self.get_model())
         from sglang.srt.model_loader.loader import RemoteModelLoader
 
         logger.info(f"Saving model to {url}")
@@ -135,6 +144,7 @@ class WeightExporter:
         pattern: Optional[str] = None,
         max_size: Optional[int] = None,
     ):
+        _assert_weight_export_supported(self.get_model())
         from sglang.srt.model_loader.loader import ShardedStateLoader
 
         logger.info(
@@ -150,6 +160,7 @@ class WeightExporter:
         Only used for unit test with an unoptimized performance.
         For optimized performance, please use torch.save and torch.load.
         """
+        _assert_weight_export_supported(self.get_model())
         # TODO: (chenyang) Add support for Qwen models.
         try:
             return self.get_model().get_weights_by_name(

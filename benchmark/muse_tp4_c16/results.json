@@ -1,0 +1,164 @@
+{
+  "scope": "One 180-second sending-window diagnostic. Accepted by the task owner for PR preparation as approximately 150 tok/s/user; not a measured >=150 result or a one-hour qualification.",
+  "source_manifest_sha256": "f7183a59238ec3eebbb07e0d7b5da26bc78a9c8be1e4273a80ec035bfe5b54e8",
+  "performance": {
+    "dashboard_interactivity_tps": 149.92503748125938,
+    "p90_full_response_itl_ms": 6.667382223412785,
+    "per_chip_tps": {
+      "input": 5766.317276292659,
+      "output": 111.61958637126472,
+      "total": 5877.936862663923
+    },
+    "retained_record_span_seconds": 204.168916414,
+    "record_population": {
+      "records_total": 239,
+      "records_profiled": 62,
+      "records_dropped_total": 177,
+      "records_warmup_dropped": 177,
+      "records_error_dropped": 0,
+      "error_categories": {}
+    },
+    "gates": {
+      "request": true,
+      "record": true,
+      "execution": true,
+      "source_unchanged": true,
+      "cleanup": true,
+      "startup_source": true,
+      "ledger": true,
+      "duration": true,
+      "export_population": true
+    }
+  },
+  "completed_requests": 62,
+  "cancelled_requests": 0,
+  "request_errors": 0,
+  "fullmodel": {
+    "cases": [
+      {
+        "case": "b1-p32768",
+        "errors": [],
+        "same_verify_input_and_prefix_identity": true,
+        "finite": true,
+        "max_per_row_relative_l2": 0.0,
+        "per_row_relative_l2": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "top1_all_rows_equal": true,
+        "byteexact": true,
+        "max_abs_diff": 0.0,
+        "raw_dtype_and_bytes_equal": true,
+        "numerical_all128_greedy_tokens_equal": true,
+        "natural_all128_greedy_tokens_equal": true
+      },
+      {
+        "case": "b6-p32768",
+        "errors": [],
+        "same_verify_input_and_prefix_identity": true,
+        "finite": true,
+        "max_per_row_relative_l2": 0.0,
+        "per_row_relative_l2": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "top1_all_rows_equal": true,
+        "byteexact": true,
+        "max_abs_diff": 0.0,
+        "raw_dtype_and_bytes_equal": true,
+        "numerical_all128_greedy_tokens_equal": true,
+        "natural_all128_greedy_tokens_equal": true
+      }
+    ],
+    "raw_logits_rows": 56,
+    "baseline_reused": true,
+    "source_content_equivalence_only": true,
+    "scope": "B1 and B6 at prefix32768; 128 greedy continuation tokens each. Broader shapes/concurrencies are not qualified by these two cases.",
+    "kernel_calls_per_rank": {
+      "prefill_qkv_layout": 1736,
+      "prefill_maxscale": 448
+    }
+  },
+  "component": {
+    "qkv_projection_and_pack_M4096_us": {
+      "before": 1052.210665,
+      "after": 966.794944,
+      "paired_reduction_percent": 8.22856,
+      "byteexact": true
+    },
+    "full_prefill_Q16384_prefix69856_us": {
+      "before": 9774.185,
+      "after": 9157.307,
+      "paired_reduction_percent": 6.29115,
+      "byteexact": true
+    }
+  },
+  "previous_short_reference": {
+    "interactivity_tps": 149.2537313432836,
+    "total_tps_per_chip": 5745.043674632551,
+    "interactivity_change_percent": 0.4497751124437732,
+    "total_change_percent": 2.313179769514484,
+    "controlled_AB": false
+  },
+  "evidence_sha256": {
+    "plan.json": "3fa2498b027b77753a5bd4592ddc44a45cf6be3dbf016354a729c7a857031bee",
+    "freeze.json": "7a1915dcf5a76d7bd4a8ad9c01ca4a9cf8b73ad13ec5ec2ca96b94cd39633139",
+    "results/diagnostic-v1/execution.json": "d0c6737990999be3bc6b1ad91a1f2d7466cee6465f412564d33f23e1c45169ae",
+    "results/diagnostic-v1/client.log": "1f99df716a8af2092fc0f236d8f3bac7aa87c942a6dd5a4ff0edfe211cf009a5",
+    "results/diagnostic-v1/aiperf_artifacts/profile_export.jsonl": "604ed4f7723131be072aff47a1171f47ace93e966aa8a8a24c4c62fceada5100",
+    "results/diagnostic-v1/aiperf_artifacts/profile_export_aiperf.json": "cdac9835577a937675e89660a218066793f901d60e18844487378b706da390b9"
+  },
+  "fullmodel_results_sha256": "c0a79a5b103ad4ad724c66fcb4129bf502f7fb93247849715e35ebc8ebd8716a"
+}

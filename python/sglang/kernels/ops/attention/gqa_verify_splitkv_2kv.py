@@ -387,3 +387,181 @@ def gqa_verify_splitkv_2kv(
         num_warps=2,
     )
     return out
+
+
+@triton.jit
+def _vv4_partials(
+    Q,
+    K,
+    V,
+    SEQ,
+    TABLE,
+    PARTIAL,
+    MAXIMUM,
+    DENOM,
+    K_SCALE,
+    q_stride_0,
+    q_stride_1,
+    kv_s0: tl.constexpr,
+    kv_s1: tl.constexpr,
+    table_stride,
+    SPLITS: tl.constexpr,
+    SCALE: tl.constexpr,
+    BN: tl.constexpr,
+):
+    # A second grid axis selects an independent adjacent pair of KV heads.
+    # Keep the original two-head tile, reductions and rounding boundaries.
+    # HEADS=32 changes only the token stride of the shared scratch buffers;
+    # the pair offset supplies their global head coordinate.
+    pair = tl.program_id(1)
+    _vv2_partials(
+        Q + pair * 16 * q_stride_1,
+        K + pair * 128,
+        V + pair * 128,
+        SEQ,
+        TABLE,
+        PARTIAL + pair * 16 * SPLITS * 64,
+        MAXIMUM + pair * 16 * SPLITS,
+        DENOM + pair * 16 * SPLITS,
+        K_SCALE,
+        q_stride_0,
+        q_stride_1,
+        kv_s0,
+        kv_s1,
+        table_stride,
+        32,
+        16,
+        SPLITS,
+        SCALE,
+        BN,
+        False,
+        False,
+        8,
+        False,
+        False,
+    )
+
+
+def can_gqa_verify_splitkv_4kv(
+    q, k, v, out, seqused_k, block_table, k_descale, v_descale
+):
+    """Metadata-only guard for the TP4 full-verify layout; never reads device data.
+
+    Page/token strides may include padding. Adjacent KV heads still occupy
+    64 elements each, as in the original two-head implementation. Q/output
+    token and head strides may include padding; innermost dimensions must be
+    contiguous. Other layouts remain on the incumbent attention path.
+    """
+    if not (
+        q.ndim == out.ndim == 3
+        and k.ndim == v.ndim == 4
+        and seqused_k.ndim == 1
+        and block_table.ndim == 2
+        and q.device.type == "cuda"
+        and all(x.device == q.device for x in (k, v, out, seqused_k, block_table))
+        and q.dtype == out.dtype == torch.bfloat16
+        and k.dtype == v.dtype == torch.float8_e4m3fn
+        and q.shape == out.shape
+        and q.shape[1:] == (32, 64)
+        and k.shape == v.shape
+        and k.shape[1:] == (16, 4, 64)
+        and 1 <= seqused_k.numel() <= 16
+        and q.shape[0] == seqused_k.numel() * 8
+        and block_table.shape[0] == seqused_k.numel()
+        and block_table.shape[1] > 0
+        and seqused_k.dtype in (torch.int32, torch.int64)
+        and block_table.dtype in (torch.int32, torch.int64)
+        and seqused_k.stride(0) == 1
+        and block_table.stride(1) == 1
+        and block_table.stride(0) >= block_table.shape[1]
+        and k.stride() == v.stride()
+        and k.stride(2) == 64
+        and k.stride(3) == 1
+        and k.stride(1) >= 4 * 64
+        and k.stride(0) >= 16 * k.stride(1)
+    ):
+        return False
+    for x in (q, out):
+        if not (
+            x.stride(2) == 1 and x.stride(1) >= 64 and x.stride(0) >= 32 * x.stride(1)
+        ):
+            return False
+    return all(
+        scale is None
+        or (
+            isinstance(scale, torch.Tensor)
+            and scale.device == q.device
+            and scale.dtype == torch.float32
+            and scale.numel() == 1
+        )
+        for scale in (k_descale, v_descale)
+    )
+
+
+def gqa_verify_splitkv_4kv(
+    q,
+    k,
+    v,
+    out,
+    seqused_k,
+    block_table,
+    softmax_scale,
+    k_descale,
+    v_descale,
+    *,
+    splits=None,
+    bn=64,
+    num_warps=4,
+    num_stages=2,
+):
+    """Opt-in Q32/KV4 verify: two independent pairs in one producer launch.
+
+    Uses the unchanged Q16 two-head arithmetic and reducer. No input copies,
+    host reads of lengths, custom collectives or persistent mutable scratch.
+    Scratch allocation follows the original wrapper's graph-pool lifecycle.
+    """
+    assert can_gqa_verify_splitkv_4kv(
+        q, k, v, out, seqused_k, block_table, k_descale, v_descale
+    )
+    num_seqs = seqused_k.numel()
+    splits = splits or pick_splits_v2(num_seqs)
+    assert splits > 0 and splits & (splits - 1) == 0
+    state_shape = (q.shape[0], 32, splits)
+    partial = torch.empty((*state_shape, HD), dtype=torch.float32, device=q.device)
+    maximum = torch.empty(state_shape, dtype=torch.float32, device=q.device)
+    denom = torch.empty(state_shape, dtype=torch.float32, device=q.device)
+    _vv4_partials[(num_seqs * splits, 2)](
+        q,
+        k,
+        v,
+        seqused_k,
+        block_table,
+        partial,
+        maximum,
+        denom,
+        k_descale,
+        q.stride(0),
+        q.stride(1),
+        k.stride(0),
+        k.stride(1),
+        block_table.stride(0),
+        splits,
+        float(softmax_scale),
+        bn,
+        num_warps=num_warps,
+        num_stages=num_stages,
+        matrix_instr_nonkdim=16,
+    )
+    _vv2_reduce[(q.shape[0], 32)](
+        partial,
+        maximum,
+        denom,
+        out,
+        v_descale,
+        32,
+        splits,
+        out.stride(0),
+        out.stride(1),
+        num_warps=2,
+    )
+    return out

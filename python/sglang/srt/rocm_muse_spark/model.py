@@ -63,7 +63,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.rocm_muse_spark import mxfp4_moe, router_pooler
+from sglang.srt.rocm_muse_spark import mxfp4_moe, router_pooler, single_layout
 from sglang.srt.rocm_muse_spark.attention_kv_write import (
     FUSED_QKV_CACHE,
     QK_ROPE_CACHE,
@@ -161,6 +161,7 @@ def _run_fused_moe(
     post_expert_norm: nn.Module | None,
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
+    single_layout: bool = False,
 ) -> torch.Tensor:
     if _moe_backend() == "flydsl":
         from sglang.srt.rocm_muse_spark.muse_moe_flydsl import (
@@ -174,6 +175,12 @@ def _run_fused_moe(
     weight, gain, has_norm = _post_expert_norm_args(post_expert_norm)
     eps = float(post_expert_norm.eps) if post_expert_norm is not None else 0.0
     kwargs = {}
+    if single_layout:
+        if _moe_backend() != "flydsl":
+            raise RuntimeError(
+                "Shuffled Muse weights require the single-layout FlyDSL consumer"
+            )
+        kwargs["single_layout"] = True
     if w13_scale is not None or w2_scale is not None:
         kwargs["w13_scale"] = w13_scale
         kwargs["w2_scale"] = w2_scale
@@ -320,6 +327,7 @@ _tgemm = None
 # tuned BF16 GEMM (searched hipBLASLt solutions); the FP32 router runs a tuned
 # split-K GEMM (configs in kernels/ops/gemm/configs).
 _DENSE_TUNED = envs.SGLANG_MUSE_DENSE_TUNED.get()
+_TP4_VERIFY_ROUTER_POOLER = envs.SGLANG_MUSE_TP4_VERIFY_ROUTER_POOLER.get()
 # Tiled 17..64-row GEMMs: the pooler here, unquantized linear layers through
 # register_gfx950_unquantized_gemm_shapes (the O projection, the DFlash draft MLP).
 _DENSE_TILED = envs.SGLANG_MUSE_DENSE_TILED.get()
@@ -737,7 +745,7 @@ class MuseSpark1xNativeExperts(nn.Module):
         return output
 
 
-class MuseSpark1xMxfp4Experts(nn.Module):
+class MuseSpark1xMxfp4Experts(single_layout.SingleLayoutStateDictGuard, nn.Module):
     """AMD Quark MXFP4 experts with packed E2M1 weights and E8M0 scales."""
 
     def __init__(
@@ -747,6 +755,7 @@ class MuseSpark1xMxfp4Experts(nn.Module):
         intermediate_size: int,
     ):
         super().__init__()
+        single_layout.initialize(self, envs.SGLANG_MUSE_MOE_SINGLE_LAYOUT.get())
         self.num_local_experts = num_local_experts
         self.expert_hidden_size = expert_hidden_size
         self.intermediate_size = intermediate_size
@@ -795,6 +804,7 @@ class MuseSpark1xMxfp4Experts(nn.Module):
         local_expert_start: int,
         post_expert_norm: nn.Module | None,
     ) -> torch.Tensor:
+        shared = mxfp4_moe.single_layout_enabled(self)
         if hidden_states.shape[0] == 0:
             return hidden_states
         if not _want_fused_moe():
@@ -811,6 +821,7 @@ class MuseSpark1xMxfp4Experts(nn.Module):
             post_expert_norm,
             w13_scale=self.w13_weight_scale,
             w2_scale=self.w2_weight_scale,
+            single_layout=shared,
         )
 
     _forward_capturable = forward
@@ -942,7 +953,9 @@ class MuseSpark1xMoE(nn.Module):
         """MoE on ``hidden_states``; under sequence parallelism (``sp``) they are this
         rank's token shard and so is the result. ``skip_post_expert_proj`` returns the
         reduced expert output before the unpooler (fused into the next boundary)."""
-        topk_scores, topk_ids, expert_input = self.route(hidden_states)
+        topk_scores, topk_ids, expert_input = self.route(
+            hidden_states, target_verify=target_verify and sp is None
+        )
         rows = topk_ids.shape[0] if sp is None else sp.padded
         use_a4w4 = self.uses_a4w4(rows, target_verify)
         quantized = None
@@ -970,8 +983,19 @@ class MuseSpark1xMoE(nn.Module):
             return output
         return self.unpool(output)
 
-    def route(self, hidden_states: torch.Tensor):
+    def route(self, hidden_states: torch.Tensor, *, target_verify: bool = False):
         """Router top-k and the expert input (pooler + pre-expert norm) of these rows."""
+        if (
+            _TP4_VERIFY_ROUTER_POOLER
+            and target_verify
+            and _DENSE_TUNED
+            and _USE_ROUTER_GEMV
+            and router_pooler.SHARED_ROUTER_POOLER
+            and router_pooler.can_route_tp4_high_m(self, hidden_states)
+        ):
+            return router_pooler.route_with_tp4_high_m(
+                self, hidden_states, pooler_fn=_dense_linear
+            )
         if (
             router_pooler.SHARED_ROUTER_POOLER
             and _USE_ROUTER_GEMV
@@ -1009,6 +1033,8 @@ class MuseSpark1xMoE(nn.Module):
         return topk_scores, topk_ids, expert_input
 
     def uses_a4w4(self, rows: int, target_verify: bool) -> bool:
+        if self.mxfp4_checkpoint:
+            mxfp4_moe.single_layout_enabled(self.experts)
         return (
             mxfp4_moe.A4W4_ENABLED
             and not target_verify
@@ -1045,8 +1071,15 @@ class MuseSpark1xMoE(nn.Module):
             mxfp4_moe.COMPACT_A4_ENABLED
             and target_verify
             and self.mxfp4_checkpoint
-            and self.tp_size == self.ep_size == 8
-            and self.num_local_experts == 32
+            and (
+                (self.tp_size == self.ep_size == 8 and self.num_local_experts == 32)
+                or (
+                    mxfp4_moe.TP4_COMPACT_A4_ENABLED
+                    and self.tp_size == self.ep_size == 4
+                    and self.num_local_experts == 64
+                    and expert_input.shape[0] in mxfp4_moe.COMPACT_A4_TP4_ROWS
+                )
+            )
             and self.top_k == 8
             and expert_input.shape[0] % 8 == 0
             and 0 < expert_input.shape[0] <= mxfp4_moe.COMPACT_A4_MAX_ROWS
@@ -1433,7 +1466,7 @@ class MuseSparkModel(nn.Module):
         return self.language_model(*args, **kwargs)
 
 
-class MuseSparkTextForCausalLM(nn.Module):
+class MuseSparkTextForCausalLM(single_layout.SingleLayoutStateDictGuard, nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1446,6 +1479,7 @@ class MuseSparkTextForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        single_layout.initialize(self, envs.SGLANG_MUSE_MOE_SINGLE_LAYOUT.get())
         # Unquantized linear shapes tuned on MI355X at TP8, registered before any
         # weights load: tiled small-M GEMMs for the attention O projection and the
         # DFlash draft's MLP (the draft loads after the target, in this process),
@@ -1738,7 +1772,66 @@ class MuseSparkTextForCausalLM(nn.Module):
         target.copy_(loaded_weight)
         return True
 
+    def _single_layout_modules(self):
+        modules = [
+            m for m in self.model.modules() if isinstance(m, MuseSpark1xMxfp4Experts)
+        ]
+        requested = envs.SGLANG_MUSE_MOE_SINGLE_LAYOUT.get()
+        if not requested and not self._single_layout_mode:
+            return []
+        # Preflight EVERY layer before any buffer is transformed. An unsupported
+        # later layer must not leave earlier layers with a different layout.
+        mxfp4_moe.single_layout_enabled(self, ready=False)
+        if not modules or not self.mxfp4_checkpoint:
+            raise ValueError("Single-layout requires Muse MXFP4 expert layers")
+        parallel = get_parallel()
+        for module in modules:
+            mxfp4_moe.single_layout_enabled(module, ready=False)
+            device = module.w13_weight.device
+            arch = (
+                torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+                if device.type == "cuda" and _is_rocm()
+                else "unsupported"
+            )
+            single_layout.validate_scope(
+                module,
+                tp=parallel.tp_size,
+                ep=parallel.moe_ep_size,
+                moe_tp=parallel.moe_tp_size,
+                arch=arch,
+            )
+        for module in self.model.modules():
+            if isinstance(module, MuseSpark1xMoE) and module.mxfp4_checkpoint:
+                if module.top_k != 8:
+                    raise ValueError("Muse single-layout requires topk=8")
+        return modules
+
+    @torch.no_grad()
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        modules = self._single_layout_modules()
+        if not modules:
+            return self._load_weights_native(weights)
+        if getattr(self, "_single_layout_load_active", False):
+            raise RuntimeError(
+                "Concurrent/reentrant Muse single-layout reload is unsupported"
+            )
+        self._single_layout_load_active = True
+        try:
+            for module in modules:
+                single_layout.begin_load(module)
+            return self._load_weights_native(weights)
+        except BaseException:
+            # A partial checkpoint or interrupted asynchronous transform cannot
+            # safely be served or repaired by a partial retry. Restart required.
+            self._single_layout_state = "failed"
+            for module in modules:
+                module._single_layout_state = "failed"
+                module.a4w4_weights = None
+            raise
+        finally:
+            self._single_layout_load_active = False
+
+    def _load_weights_native(self, weights: Iterable[tuple[str, torch.Tensor]]):
         params = dict(self.named_parameters())
         params.update(
             {name: value for name, value in self.named_buffers() if name not in params}
@@ -1837,6 +1930,12 @@ class MuseSparkTextForCausalLM(nn.Module):
 
     @torch.no_grad()
     def post_load_weights(self) -> None:
+        shared_modules = self._single_layout_modules()
+        for module in shared_modules:
+            if module._single_layout_state == "loading":
+                if not getattr(self, "_single_layout_load_active", False):
+                    raise RuntimeError("Interrupted Muse single-layout load")
+                single_layout.finish_load(module)
         moe_layers = [
             layer.mlp
             for layer in self.model.layers
@@ -1849,6 +1948,22 @@ class MuseSparkTextForCausalLM(nn.Module):
             for module in self.model.modules():
                 if isinstance(module, MuseSpark1xMxfp4Experts):
                     mxfp4_moe.prepare_a4w4_weights(module)
+        if shared_modules:
+            storage_bytes = 0
+            for module in shared_modules:
+                for name, alias in zip(single_layout.NAMES, module.a4w4_weights):
+                    weight = getattr(module, name)
+                    if alias.data_ptr() != weight.data_ptr():
+                        raise RuntimeError(
+                            "Muse single-layout A4 weights must alias parameters"
+                        )
+                    storage_bytes += weight.numel() * weight.element_size()
+            logger.info(
+                "Muse MXFP4 single layout ready: %d layers, %.3f GiB expert "
+                "storage per rank; A4W4 prefill aliases parameters",
+                len(shared_modules),
+                storage_bytes / (1024**3),
+            )
         if _DENSE_TILED:
             for moe in moe_layers:
                 for proj in (moe.pre_expert_proj, moe.post_expert_proj):

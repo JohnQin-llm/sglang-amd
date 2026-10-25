@@ -1,0 +1,178 @@
+{
+  "base_commit": "93406f598d109f1991c34ac9e938dad51c05c34b",
+  "measured_overlay_manifest_sha256": "f7183a59238ec3eebbb07e0d7b5da26bc78a9c8be1e4273a80ec035bfe5b54e8",
+  "binding": "The 30 SGLang module bytes are identical to the measured source overlay. The new Git commit itself was not benchmarked.",
+  "sglang_modules": {
+    "sglang.kernels.ops.moe.mxfp4_compact_a4_moe": {
+      "path": "python/sglang/kernels/ops/moe/mxfp4_compact_a4_moe.py",
+      "sha256": "0d122d97d06606f5253b73f77ba9c3972dd28868af5220d19283c4458716db88"
+    },
+    "sglang.srt.environ": {
+      "path": "python/sglang/srt/environ.py",
+      "sha256": "88c00bbbefcf54d728c4dae429d73999fa762a6f45c4699d99d74fda2d776964"
+    },
+    "sglang.srt.model_executor.model_runner_components.weight_exporter": {
+      "path": "python/sglang/srt/model_executor/model_runner_components/weight_exporter.py",
+      "sha256": "f3e50f7a369a80a225b3d036eb3c10044dc35fd46c49e22a38d2f58ca9166891"
+    },
+    "sglang.srt.rocm_muse_spark.model": {
+      "path": "python/sglang/srt/rocm_muse_spark/model.py",
+      "sha256": "1f4e55e6727e17263a0bcd28c07085406a7982c72625f467511d7aa610e3264c"
+    },
+    "sglang.srt.rocm_muse_spark.muse_moe_flydsl": {
+      "path": "python/sglang/srt/rocm_muse_spark/muse_moe_flydsl.py",
+      "sha256": "b6f6d86f358bbc9b2a08cff9106af5e86ab8687760b705d1bff2cd91152b43ba"
+    },
+    "sglang.srt.rocm_muse_spark.mxfp4_moe": {
+      "path": "python/sglang/srt/rocm_muse_spark/mxfp4_moe.py",
+      "sha256": "ee5ef816b1e6babda3470a0a19d560159b72922ac880d3a7c3945e437b3bc1a5"
+    },
+    "sglang.srt.rocm_muse_spark.muse_moe_single_layout_gemm": {
+      "path": "python/sglang/srt/rocm_muse_spark/muse_moe_single_layout_gemm.py",
+      "sha256": "ecc4801b1b5314984df6c3d169911544e77ce58b9da15c4373bd21f2bf807d3e"
+    },
+    "sglang.srt.rocm_muse_spark.single_layout": {
+      "path": "python/sglang/srt/rocm_muse_spark/single_layout.py",
+      "sha256": "ab6d463375cb142d797905939b50f4ec34db84b9b69c4687481f653b9d8e6f2b"
+    },
+    "sglang.srt.mem_cache.kv_index_translator": {
+      "path": "python/sglang/srt/mem_cache/kv_index_translator.py",
+      "sha256": "e344e05446e7f8674c411f293655f98771c59b2584750ec56abfa5740cc7107f"
+    },
+    "sglang.srt.rocm_muse_spark.attention_kv_write": {
+      "path": "python/sglang/srt/rocm_muse_spark/attention_kv_write.py",
+      "sha256": "d0d68976a6de25a554f2c97b6ebcce56f8b7371a15086217835f711a9d3d8bae"
+    },
+    "sglang.kernels.ops.attention.qk_norm_rope_cache": {
+      "path": "python/sglang/kernels/ops/attention/qk_norm_rope_cache.py",
+      "sha256": "787bf2f873661e38cefc0ec94f9fbfb72e996ba2054d6ae4db95dad2e2ed00f6"
+    },
+    "sglang.kernels.ops.gemm.bf16_splitk_gemm": {
+      "path": "python/sglang/kernels/ops/gemm/bf16_splitk_gemm.py",
+      "sha256": "fb36e20ee8878dcae9dbd9edf133096f129889808e4ad3a6928c4732bfdcc4b9"
+    },
+    "sglang.srt.layers.attention.aiter_backend": {
+      "path": "python/sglang/srt/layers/attention/aiter_backend.py",
+      "sha256": "3e53d485a37dc8ec9f8d68671bb42b2ee756505104d817763c9e6f49d88f980f"
+    },
+    "sglang.kernels.ops.attention.gqa_verify_splitkv_2kv": {
+      "path": "python/sglang/kernels/ops/attention/gqa_verify_splitkv_2kv.py",
+      "sha256": "5d9ff8865ce40858fb016127264392c364a6c3484f9bf6eb166902e5b293242e"
+    },
+    "sglang.kernels.ops.attention.swa_verify_splitkv": {
+      "path": "python/sglang/kernels/ops/attention/swa_verify_splitkv.py",
+      "sha256": "46187f5cb142ae95942d588866119f615da5f597fb2de8002a53cd8a077692d9"
+    },
+    "sglang.kernels.ops.attention.gqa_verify_splitkv": {
+      "path": "python/sglang/kernels/ops/attention/gqa_verify_splitkv.py",
+      "sha256": "b0563a10d2c7fba09b2bb5cdbb7bb118a10b13af2c2248d8578443aae50b176d"
+    },
+    "sglang.kernels.ops.moe.router_pooler_topk": {
+      "path": "python/sglang/kernels/ops/moe/router_pooler_topk.py",
+      "sha256": "1686dda68e4e4cf3bb8a02d4195a287e6f659ef7869f14bdc395d060f4ca9e35"
+    },
+    "sglang.srt.rocm_muse_spark.router_pooler": {
+      "path": "python/sglang/srt/rocm_muse_spark/router_pooler.py",
+      "sha256": "828d79f3ad3227f467185b8fda4b089cb6b34c820b5f9c0b34feeaf6e09b2dbf"
+    },
+    "sglang.srt.rocm_muse_spark.muse_aiter_a16_g1": {
+      "path": "python/sglang/srt/rocm_muse_spark/muse_aiter_a16_g1.py",
+      "sha256": "daba81d38f540cd68ecd723f0f89e7b036d6e2aa3d71da90e7609a157c8c132c"
+    },
+    "sglang.srt.rocm_muse_spark.muse_aiter_a16_g1_kernels": {
+      "path": "python/sglang/srt/rocm_muse_spark/muse_aiter_a16_g1_kernels.py",
+      "sha256": "d890dffa88753a268d16e717a3df844f445e9689e26f52037c039dc3dc9d003f"
+    },
+    "sglang.srt.rocm_muse_spark.muse_aiter_a16_g1g2_slot": {
+      "path": "python/sglang/srt/rocm_muse_spark/muse_aiter_a16_g1g2_slot.py",
+      "sha256": "88fd571cc9b2fe6b1e7f25cb458444337f24be93cf72bd61173706c88f868214"
+    },
+    "sglang.srt.rocm_muse_spark.muse_aiter_a16_g2_slot_kernel": {
+      "path": "python/sglang/srt/rocm_muse_spark/muse_aiter_a16_g2_slot_kernel.py",
+      "sha256": "5593956eb787f0152c9d3ed980a4d782edb96270e77ead3242746c14c44d8f8a"
+    },
+    "sglang.srt.rocm_muse_spark.muse_aiter_native_order_g1": {
+      "path": "python/sglang/srt/rocm_muse_spark/muse_aiter_native_order_g1/__init__.py",
+      "sha256": "a48dc8c104562ca3212ec35560d7f087423f28c07ebd40340970a526f2ec038e"
+    },
+    "sglang.srt.rocm_muse_spark.muse_aiter_native_order_g1.act": {
+      "path": "python/sglang/srt/rocm_muse_spark/muse_aiter_native_order_g1/act.py",
+      "sha256": "6a0e35420adc09ead5985e88ddbc3605eff0d53daff357fd06e531116ebfd57f"
+    },
+    "sglang.srt.rocm_muse_spark.muse_aiter_native_order_g1.gemm1": {
+      "path": "python/sglang/srt/rocm_muse_spark/muse_aiter_native_order_g1/gemm1.py",
+      "sha256": "4c1a70ff03325a92a0ce041544eb27167f3943ad6b5736b91fb4103898ee1fcc"
+    },
+    "sglang.srt.rocm_muse_spark.muse_aiter_native_order_g1.gemm2": {
+      "path": "python/sglang/srt/rocm_muse_spark/muse_aiter_native_order_g1/gemm2.py",
+      "sha256": "b37f33e38496fdc848a623a268f20440873b0b9e90a9b6302bfec231f3f3dca2"
+    },
+    "sglang.srt.rocm_muse_spark.muse_aiter_native_order_g1.utils": {
+      "path": "python/sglang/srt/rocm_muse_spark/muse_aiter_native_order_g1/utils.py",
+      "sha256": "5e5af68ab35d4b0bc51f245b1255d5ce8805a8aa8e90dead5fbd881f3dccf50b"
+    },
+    "sglang.srt.rocm_muse_spark.prefill_maxscale": {
+      "path": "python/sglang/srt/rocm_muse_spark/prefill_maxscale.py",
+      "sha256": "299e028392f07b7cb9706cc51ee876e362fcef14ec666800ff6b1923bc54d2e2"
+    },
+    "sglang.srt.rocm_muse_spark.prefill_qkv_layout": {
+      "path": "python/sglang/srt/rocm_muse_spark/prefill_qkv_layout.py",
+      "sha256": "e03976e87ecb231d49737f9c94e3d328978afcb7cfeea064e38344767d134c9b"
+    },
+    "sglang.srt.rocm_muse_spark.sequence_parallel": {
+      "path": "python/sglang/srt/rocm_muse_spark/sequence_parallel.py",
+      "sha256": "25b5dc7207e6d44fb7e11f2d469637173e722ec38ba479c2393f3691ef24619d"
+    }
+  },
+  "aiter_wrapper": {
+    "baseline_wrapper_sha256": "6419893c6fced2a1a71ea29cea3773219fc277762d3ac052daf5f72c0273b02f",
+    "candidate_manifest_sha256": "5e0293a7e46ad6d1c2c4fc012d6f90d675498dcafd5feb277e4b08e743820b9a",
+    "candidate_wrapper_sha256": "7e7c7d305ffff48ba7f5ee0fe5d1f541948025e3bce07305341cb2fcb5fe4782",
+    "device_sha256": "cd2f9cb29358b5582c98d299808a2eecbf643488cfcbc0fd8350bfdc1a494bfa"
+  },
+  "aiter_runtime_pins": {
+    "aiter/__init__.py": "03c515527393267601aecf3c6ac7d98a88e27a26edf7a0864155fd0782004c0c",
+    "aiter/fused_moe.py": "181dfc53206adca3faec707f7f6e054fa6cbf56ba2d671a8d01266c4dc6f8ff1",
+    "aiter/jit/core.py": "97998734a817f5444fa539e1811932f7529db8427a48a5bd73112763dbde768a",
+    "aiter/ops/flydsl/kernels/buffer_ops.py": "8a2eb2035f33332abcbbb8f55cf3bdbf7b05530e40cb54014add11854dfdf038",
+    "aiter/ops/flydsl/kernels/kernels_common.py": "40c660901f8445a60a802eb72690223d1b20dd0810bda03e6f7880fbfdd0d091",
+    "aiter/ops/flydsl/kernels/layout_utils.py": "c31a14195e7abdcac527c37effff8fd2240d7d609402f50395871a60423a0db1",
+    "aiter/ops/flydsl/kernels/mfma_epilogues.py": "411dfec00e8bf1ed0642c93d2cf908c744dd8ff188ba3daf63c9a42cf28303c6",
+    "aiter/ops/flydsl/kernels/mfma_preshuffle_pipeline.py": "80c14a2dcc40a15b712f4c00987e9d460b0309dc34faa988f423ce3686f3f0ee",
+    "aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage.py": "7ab78bf4195364aad7778532844a4b8c01e9dfe82a728c3322381162b428ac37",
+    "aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage_common.py": "7c43585c51bfee5506515d0efec908611c93ac8d0583addb437296d442a91a91",
+    "aiter/ops/flydsl/kernels/mxfp4_gemm_common.py": "8972e9d4f3b1611d945ffa4b6d4200b2402e5bd2e4149cd6995b851f0232d33d",
+    "aiter/ops/flydsl/kernels/tensor_shim.py": "1b6fe9f728f8818da5e1e9d11d44ba9d8118c92908798ef51f27786a44fba16e",
+    "aiter/ops/flydsl/kernels/vector.py": "f63210b5089c797a484c5d8c4f310c17fd4fc965e44cbcbd464bd7fd37b67ba1",
+    "aiter/ops/flydsl/moe_common.py": "49e6d7c4c1c65e4a918425ec1985ec4dc077039b0e47aca4749d5f1ba611f719",
+    "aiter/ops/flydsl/moe_kernels.py": "d08339bc94dfabd3529d415857e49d0383f9efe2ef62be9a84916c55c5857e68",
+    "aiter/ops/flydsl/muse_moe_finalize.py": "48af597a54827b3e7f9340dada68f74759bee80213df01fbe8f95c4e95fe6d2b",
+    "aiter/ops/moe_sorting.py": "8b5ecd5252375da4bf6e08a6d56f5710a52ae6e29e6687d8309ae5acbc18d731",
+    "aiter/ops/moe_sorting_opus.py": "9de9541dc750c642b5a329d012d1c9a7c3246e5e9bb7ddb4d53387aca7cf5b9d",
+    "aiter/ops/quant.py": "e1357e07e555c8458dc41687ca6bbb89d2dfca3aa9808a759e67fcdf972a7bc5",
+    "aiter/ops/shuffle.py": "38f41cd233c529cba6d18f0654c267c3279df75d50295263ffa3f0df8f427b0b",
+    "aiter/utility/dtypes.py": "1c473c70a7033aeefde72f021b8e35abfb067fefc27027815c7635ca4644f04a",
+    "aiter/utility/fp4_utils.py": "6f4ecb4dd9eb22d30653264c851d000ce95b0ec8bc1fb40718b72c96eb3b70eb",
+    "csrc/include/mx_quant_utils.h": "7075a50fde8b7415179a45936dad3c694639ab61c352bd0caba17aa8d8325e89",
+    "csrc/include/quant.h": "58f6d43e8da1029cbe8a2d2a1a932f32d0826b7a1d39df9d9a376932a6662979",
+    "csrc/include/quant_utils.cuh": "3577b2cd4f0f6489b3643416890982f06b24fffeb9ec8761ab6e27e9c6602618",
+    "csrc/kernels/quant_kernels.cu": "5c9d1e56d978d45ccdc099806267d75aad9074ab837b07cca32b8ae21dcccfec",
+    "csrc/pybind/quant_pybind.cu": "f0fe65559c092b929cf4d4fecf2ad0c0467030a217712a24a4230d6bc123dc4e",
+    "csrc/py_itfs_cu/moe_sorting_opus_kernels.cu": "523f253a6fe63b0825421958e227c995c44956b2992c0b061d5a98e148a201d8",
+    "csrc/pybind/moe_sorting_opus_pybind.cu": "c50fba19722d36359559c4a64b99ad8de974253c1bde7e9ebbbe4fba3a1e5f91",
+    "csrc/include/moe_sorting_opus.h": "2630b120ab621157e66fb91dab39efa0abefadc0a06aeaa74541ed9388d4729f",
+    "csrc/include/aiter_hip_common.h": "a22a4c6118421e4ecaeac658077d4fbd34dc99752a4568309a164d67fd4630b8",
+    "csrc/include/aiter_stream.h": "ae68356d35e2670af86e4884e7c687e6e384d072cd27bfa5063102e740ab9b41",
+    "csrc/include/aiter_tensor.h": "735e1e5597674a36b1ed5485083b5b10db5b0f5578c55ace33777f70197a60b7",
+    "csrc/include/rocm_ops.hpp": "242f677bdafd8dd1b9d4c7be6224f1d0e833756f014d840af913a2cc8be48af1",
+    "aiter/jit/optCompilerConfig.json": "06a3c8ec1e6a9013f38327d346946a7e8aeba59d0d36622268bbd4711fc568d3",
+    "aiter/ops/flydsl/muse_moe_gemm.py": "8bdebdca77615ff3c13ee79cdaf720f03921f13a9dd9f34f2b1684e1a6e65ed4",
+    "aiter/ops/flydsl/kernels/moe_2stage_a16wmix/__init__.py": "a48dc8c104562ca3212ec35560d7f087423f28c07ebd40340970a526f2ec038e",
+    "aiter/ops/flydsl/kernels/moe_2stage_a16wmix/gemm1.py": "09c0c7967a2b5d26055bea321a2a534eca2a151f0c666c075f6df4a76efeebfa",
+    "aiter/ops/flydsl/kernels/moe_2stage_a16wmix/gemm2.py": "b37f33e38496fdc848a623a268f20440873b0b9e90a9b6302bfec231f3f3dca2",
+    "aiter/ops/flydsl/kernels/moe_2stage_a16wmix/utils.py": "7b501832fdf6ff716e5bf7d3798ad40381489b778f2695579b47862bc50faef0",
+    "aiter/ops/flydsl/kernels/act.py": "0602318cdc3ee64fcef18ad79d731848f26f479c7a2badb65046e7727e10ddee"
+  },
+  "aiter_base_revision": "4ad99832823dde2315b361cbd3b54b1c5c12acd5",
+  "triton_version": "3.7.0"
+}

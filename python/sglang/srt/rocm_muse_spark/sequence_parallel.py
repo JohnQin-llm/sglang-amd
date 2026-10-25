@@ -17,6 +17,8 @@ Attention and the experts still see every token:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+import os
 
 import torch
 import torch.distributed as dist
@@ -27,6 +29,9 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 SP_MIN_TOKENS = 2048
+_PREFILL_QKV_LAYOUT = os.environ.get("SGLANG_MUSE_TP4_PREFILL_QKV_LAYOUT", "0") == "1"
+if _PREFILL_QKV_LAYOUT:
+    from sglang.srt.rocm_muse_spark.prefill_qkv_layout import run as _qkv_layout_run
 
 _PREFILL_SP = envs.SGLANG_MUSE_PREFILL_SP.get()
 _PREFILL_ULYSSES = envs.SGLANG_MUSE_PREFILL_ULYSSES.get()
@@ -105,6 +110,28 @@ def _all_to_all(x: torch.Tensor, group) -> torch.Tensor:
     return out
 
 
+@lru_cache(maxsize=8)
+def _qkv_layout_platform(device):
+    return bool(torch.version.hip) and torch.cuda.get_device_properties(device).gcnArchName.startswith('gfx950')
+
+
+def _qkv_layout_supported(attention, x, world):
+    if not _PREFILL_QKV_LAYOUT or world!=4:
+        return False
+    from sglang.srt.runtime_context import get_parallel
+    weight=attention.ulysses_qkv_weight
+    return (get_parallel().moe_ep_size==4 and x.ndim==2 and x.is_cuda
+            and x.dtype==torch.bfloat16 and x.is_contiguous()
+            and x.shape[0]==4096 and x.shape[1]==8192
+            and weight.shape==(18432,8192) and weight.dtype==torch.bfloat16
+            and weight.is_contiguous() and weight.device==x.device
+            and _qkv_layout_platform(x.device))
+
+
+def _qkv_rank_major_layout(x, weight):
+    return _qkv_layout_run(x,weight)
+
+
 def ulysses_attention(
     attention,
     x: torch.Tensor,
@@ -116,8 +143,12 @@ def ulysses_attention(
     group = get_tp_group()
     world, rows = group.world_size, x.shape[0]
     # [rows, hidden] shard -> all-to-all -> [world * rows, q|k|v|gate of this rank's heads]
-    qkv = F.linear(x, attention.ulysses_qkv_weight).view(rows, world, -1)
-    qkv = _all_to_all(qkv.transpose(0, 1).contiguous(), group).view(world * rows, -1)
+    if _qkv_layout_supported(attention, x, world):
+        qkv = _qkv_rank_major_layout(x, attention.ulysses_qkv_weight)
+    else:
+        qkv = F.linear(x, attention.ulysses_qkv_weight).view(rows, world, -1)
+        qkv = qkv.transpose(0, 1).contiguous()
+    qkv = _all_to_all(qkv, group).view(world * rows, -1)
     q, k, v, o_gate = qkv[: sp.num_tokens].split(
         [attention.q_size, attention.kv_size, attention.kv_size, attention.q_size],
         dim=-1,

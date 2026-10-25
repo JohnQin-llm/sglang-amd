@@ -327,3 +327,79 @@ def joint_router_pooler_topk(x, packed, bias, norm, multiplier, scale, eps):
         num_warps=4,
     )
     return scores, ids, expert_input
+
+
+# These are padded verify row counts, not an interval. Small-M and EP8 callers
+# continue to use the original entry points above.
+TP4_HIGH_M_ROWS = (80, 96, 112, 128)
+TP4_HIGH_M_ROUTER_CONFIG = {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 32,
+    "SPLIT_K": 32,
+    "num_warps": 4,
+    "num_stages": 2,
+}
+
+
+def router_pooler_topk_high_m(
+    x, router_weight, bias, norm_weight, multiplier, scale, eps, *, pooler
+):
+    """Fuse the *tuned* high-M router reduction with routing and pooler norm.
+
+    ``pooler(x)`` must be the caller's original dense projection, returning its
+    completed BF16 output. No new tiled-weight copy, GEMV schedule, or pooler
+    arithmetic is introduced. The host's TP4 target-verify guard must pass first.
+    The original SK32 sequential router sum and BF16-before-RMS boundary remain.
+    """
+    from sglang.kernels.ops.gemm.router_gemm_fp32 import (
+        _router_partial,
+        get_router_gemm_fp32_configs,
+    )
+
+    m, k = x.shape
+    assert m in TP4_HIGH_M_ROWS and k == 8192
+    assert (get_router_gemm_fp32_configs(256, k) or {}).get(
+        m
+    ) == TP4_HIGH_M_ROUTER_CONFIG
+    rp = torch.empty((32, m, 256), device=x.device, dtype=torch.float32)
+    # Match router_gemm_tuned, including its distinct contiguous kernel entry.
+    _router_partial[(2, 32, triton.cdiv(m, 16))](
+        x,
+        router_weight,
+        rp,
+        m,
+        256,
+        k,
+        16,
+        128,
+        32,
+        32,
+        num_warps=4,
+        num_stages=2,
+    )
+    dp = pooler(x)
+    assert dp.shape == (m, 4096) and dp.dtype == torch.bfloat16
+    assert dp.is_contiguous() and dp.device == x.device
+    scores = torch.empty((m, 8), device=x.device, dtype=torch.float32)
+    ids = torch.empty((m, 8), device=x.device, dtype=torch.int32)
+    expert_input = torch.empty((m, 4096), device=x.device, dtype=torch.bfloat16)
+    _route_preproject_epilogue[(2 * m,)](
+        rp,
+        dp,
+        bias,
+        norm_weight,
+        scores,
+        ids,
+        expert_input,
+        m,
+        4096,
+        1,
+        32,
+        multiplier,
+        scale,
+        1,
+        eps,
+        num_warps=4,
+    )
+    return scores, ids, expert_input
