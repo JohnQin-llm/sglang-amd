@@ -1,6 +1,6 @@
 # Muse TP4/EP4 C16 measured preset
 
-This package preserves the best measured 180-second C16 candidate: **149.925 tok/s/user P90 interactivity**, **5,877.937 total tok/s/chip** on four MI355X GPUs. The task owner accepted this as approximately the 150 tok/s/user target for PR preparation. The measured value remains 149.925; there is no one-hour qualification.
+This package preserves the best measured 180-second C16 candidate: **149.925 tok/s/user P90 interactivity**, **5,877.937 total tok/s/chip** on four MI355X GPUs. A same-source 3600-second follow-up produced **90.580 tok/s/user** and **19,555.917 total tok/s/chip** from its completed requests. It cancelled one request at the original 30-second drain deadline, so it fails the required zero-cancellation hour and the 150 tok/s/user target. The short result did not hold over the longer workload.
 
 The PR is an aggregate against `optimize/muse-official1020-base` (`93406f598d10`). It includes the shared-layout work from #9, the KV-index integration associated with #10, and the five-line sync-free sequence-length change from #14. Those PRs are overlapping components, not extra patches to apply on top of this branch. The measured preset adds native-order AITER MoE, bounded attention launch tuning, QK/cache fusion, and the two prefill optimizations below.
 
@@ -37,7 +37,21 @@ The selected AgentX run completed 62 profiling requests with zero cancellations 
 
 Full-model evidence covers B1 and B6 at prefix32768: all 56 captured logit rows byte-exact, per-row relative L2 zero, identical top-1 and identical 128-token natural-acceptance continuations. Kernel witnesses on all four ranks recorded 1,736 QKV and 448 maxscale calls per rank. The baseline outputs were reused from a previously completed baseline arm; the baseline GPU arm was not rerun. This does not establish all-shape correctness or long-duration stability.
 
-`results.json` contains the sanitized measurements and original evidence hashes. `source-binding.json` binds all 30 production module files to the measured overlay. The PR packages content-equivalent source; the new Git commit itself has not been benchmarked. The AITER wrapper patch is part of the measured stack and must not be omitted. Raw workload data and internal machine paths are not published here.
+### 3600-second follow-up
+
+| Metric | MI355X completed requests, unqualified run | Official B200 C16 TP4/EP4 |
+| --- | ---: | ---: |
+| P90 interactivity, tok/s/user | 90.580 | 151.286 |
+| Input throughput, tok/s/chip | 19,413.642 | 23,986.816 |
+| Output throughput, tok/s/chip | 142.275 | 160.905 |
+| Total throughput, tok/s/chip | 19,555.917 | 24,147.721 |
+| Completed / cancelled / errored requests | 2,159 / 1 / 0 | 2,383 / 0 / 0 |
+
+The MI355X run sent requests for 3600.001 seconds without `--unsafe-override`. All 2,159 successful records exported normally; the retained successful-record span is 3619.893 seconds. Raw P90 full-response ITL is 11.038976 ms. The client exited normally, source identity and cleanup checks passed, and the original cancellation ledger retained the one cancelled request separately. It was not converted into a successful record. Thus these numbers describe completed requests from an **unqualified** hour, not a valid target result.
+
+Against [the B200 source artifact](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39449248229/artifacts/12284243734), observed interactivity is 40.13% lower and total throughput is 19.02% lower. This comparison uses different hardware, FP4 implementations, backends and engine recipes; it is not an isolated hardware or kernel A/B. The unchanged MI355X recipe and zero-cancellation requirement remain the optimization target. C4/C8 results and the separate heavy-load profile are pending.
+
+`results.json` contains the short-run measurements; `hour-results.json` records the follow-up failure and completed-record metrics. Both include original evidence hashes. `source-binding.json` binds all 30 production module files to the measured overlay. The PR packages content-equivalent source; the new Git commit itself has not been benchmarked. The AITER wrapper patch is part of the measured stack and must not be omitted. Raw workload data and internal machine paths are not published here.
 
 ## Reproduce the selected configuration
 
@@ -53,7 +67,7 @@ export DRAFT_MODEL_PATH=/models/Muse-Spark-Open-DFlash2
 bash benchmark/muse_tp4_c16/serve.sh
 ```
 
-The AITER patch installer refuses unknown dependency or wrapper bytes. It is idempotent on the measured wrapper. The launcher uses TP4/EP4, HiCache 253 GiB, SWA/full ratio 0.2, draft window 2048, eight draft tokens, prefill/decode and scheduler receive intervals 20, and seed42. Keep the image's other launch defaults, including its decode graph buckets. Check GPU availability before starting a separate run.
+The AITER patch installer refuses unknown dependency or wrapper bytes. It is idempotent on the measured wrapper. The launcher uses TP4/EP4, HiCache 253 decimal GB per rank for the target model (draft host cache is additional), SWA/full ratio 0.2, draft window 2048, eight draft tokens, prefill/decode and scheduler receive intervals 20, and seed42. Keep the image's other launch defaults, including its decode graph buckets. Check GPU availability before starting a separate run.
 
 For performance comparison the preset simulates acceptance length 4.05 with `match-expected` and `real-draft-token`. This matches the recorded diagnostic setup. Quality comparisons used natural acceptance. Do not treat simulated acceptance as model accuracy evidence.
 
@@ -63,5 +77,7 @@ With AgentX 1.0.12 and the pinned trace/tokenizer available, run the client sepa
 export OUTPUT_DIR=/results/muse-tp4-c16-fresh-run
 bash benchmark/muse_tp4_c16/client.sh
 ```
+
+The client defaults to the 180-second diagnostic. Set `DURATION=3600` for the hour protocol; this removes the diagnostic unsafe override and retains the original 30-second drain behavior.
 
 There is no new GPU run required to inspect or reproduce the source binding. The existing CPU guard/layout tests are under `test/registered/kernels/ops/muse_spark/`. Repository CI and broader numerical coverage remain separate from the saved two-case evidence.

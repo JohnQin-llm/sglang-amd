@@ -1,0 +1,81 @@
+{
+  "scope": "Same-source3600-second sending window; unqualified because one request was cancelled at the unchanged30-second drain deadline. Metrics cover completed requests only. Not a valid150 result or an isolated kernel/hardware A/B.",
+  "source_manifest_sha256": "f7183a59238ec3eebbb07e0d7b5da26bc78a9c8be1e4273a80ec035bfe5b54e8",
+  "formal_score_eligible": false,
+  "target150_valid_hour": false,
+  "performance": {
+    "p90_interactivity_tps": 90.57971014492755,
+    "raw_p90_full_response_itl_ms": 11.038975828571427,
+    "per_chip_tps": {
+      "input": 19413.642454473164,
+      "output": 142.27491230992962,
+      "total": 19555.91736678309
+    },
+    "retained_record_span_seconds": 3619.893287146
+  },
+  "sending_window_seconds": 3600.000866354,
+  "concurrency": 16,
+  "tp": 4,
+  "ep": 4,
+  "chips": 4,
+  "unsafe_override": false,
+  "completed_requests": 2159,
+  "cancelled_requests": 1,
+  "request_errors": 0,
+  "client_exit_code": 0,
+  "execution_exit_code": 2,
+  "gates": {
+    "request": false,
+    "record": true,
+    "execution": false,
+    "source_unchanged": true,
+    "cleanup": true,
+    "startup_source": true,
+    "ledger": true,
+    "duration": true,
+    "export_population": true,
+    "client_submission_valid": true
+  },
+  "source_and_configuration_unchanged_from_short": true,
+  "B200_reference": {
+    "p90_interactivity_tps": 151.285930408472,
+    "per_chip_tps": {
+      "input": 23986.816021593884,
+      "output": 160.90512005445385,
+      "total": 24147.721141648337
+    },
+    "completed_requests": 2383,
+    "cancelled_requests": 0,
+    "artifact_url": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39449248229/artifacts/12284243734"
+  },
+  "gap_pct_vs_B200": {
+    "input_throughput": -19.0653630853039,
+    "output_throughput": -11.578380935435339,
+    "total_throughput": -19.01547457803634
+  },
+  "p90_gap_pct_vs_B200": -40.12681159420289,
+  "throughput_decomposition": {
+    "request_rate_ratio": 0.905161872263663,
+    "mean_input_tokens_ratio": 0.8941454495016643,
+    "mean_output_tokens_ratio": 0.9768597393904422,
+    "input_throughput_ratio": 0.809346369146961,
+    "output_throughput_ratio": 0.8842161906456466,
+    "formula": "input/output throughput ratio = request-rate ratio * mean-input/output-token ratio"
+  },
+  "cancelled_request_diagnostic": {
+    "observed_duration_seconds": 77.15539633,
+    "time_to_first_observed_response_seconds": 64.196190199,
+    "observed_stream_duration_seconds": 12.957963756,
+    "last_response_before_cancel_ms": 1.242375,
+    "scope": "Recorded SSE objects were still arriving at cancellation; generated token count unknown."
+  },
+  "evidence_sha256": {
+    "plan.json": "577ccc8257c5d3888276f71ca53d7e9cf2762ce790d577870164cb6b06c45292",
+    "freeze.json": "20afe4a2e0815f2493bcb10cd8e9a2ed842c8e1fd002ab971fe7a022d34314f1",
+    "results/diagnostic-v1/execution.json": "0a2c5135009ce18075057f1011c5c36a50b7fae8b79ebd8206058b16038d39d8",
+    "results/diagnostic-v1/client.log": "9b1efbe6e8a946afefac9b447b817eb4f143e203325fdb248af6ab737c051ea1",
+    "results/diagnostic-v1/aiperf_artifacts/profile_export.jsonl": "21c04937eb48abf094ddba0cd5a20b15adf8c02047ba0939684e1e74f144f649",
+    "results/diagnostic-v1/aiperf_artifacts/profile_export_aiperf.json": "9ed8a51ceb10841d569e7ad0adb08fcac8212809802fd3579630e85f0095f4e5"
+  },
+  "analysis_sha256": "ae5165cafd49ebcdea93e92e67d6868204a21fce0fdf820f6aeacf778cb96759"
+}
