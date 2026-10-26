@@ -49,7 +49,18 @@ Full-model evidence covers B1 and B6 at prefix32768: all 56 captured logit rows 
 
 The MI355X run sent requests for 3600.001 seconds without `--unsafe-override`. All 2,159 successful records exported normally; the retained successful-record span is 3619.893 seconds. Raw P90 full-response ITL is 11.038976 ms. The client exited normally, source identity and cleanup checks passed, and the original cancellation ledger retained the one cancelled request separately. It was not converted into a successful record. Thus these numbers describe completed requests from an **unqualified** hour, not a valid target result.
 
-Against [the B200 source artifact](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39449248229/artifacts/12284243734), observed interactivity is 40.13% lower and total throughput is 19.02% lower. This comparison uses different hardware, FP4 implementations, backends and engine recipes; it is not an isolated hardware or kernel A/B. The unchanged MI355X recipe and zero-cancellation requirement remain the optimization target. C4/C8 results and the separate heavy-load profile are pending.
+Against [the B200 source artifact](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39449248229/artifacts/12284243734), observed interactivity is 40.13% lower and total throughput is 19.02% lower. This comparison uses different hardware, FP4 implementations, backends and engine recipes; it is not an isolated hardware or kernel A/B. The unchanged MI355X recipe and zero-cancellation requirement remain the optimization target. Additional same-source C4/C8 results follow below.
+
+### C4 and C8 hour follow-ups
+
+| Concurrency | P90 interactivity (tok/s/user) | Input tok/s/chip | Output tok/s/chip | Total tok/s/chip | Completed / cancelled / errored | Valid hour |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| C4 | 146.413 | 5,880.565 | 44.104 | 5,924.668 | 504 / 0 / 0 | Yes |
+| C8 | 136.986 | 11,710.732 | 89.439 | 11,800.171 | 1,150 / 0 / 0 | Yes |
+
+These are separate 3600-second runs using the same 30 production-module hashes, image and serving recipe as the selected C16 stack. Throughput uses each run's retained completed-record span, divided by four chips. `concurrency-hour-results.json` records the request, source, export and cleanup gates and original evidence hashes.
+
+The user-supplied InferenceX CSV's B200 TP4/EP4 C8 row reports 226.244 tok/s/user P90 and 14,296.144 total tok/s/chip. The observed MI355X C8 differences are -39.45% and -17.46%, respectively. Hardware, implementations and serving recipes differ; this is not a controlled A/B. The CSV has no B200 TP4/EP4 C4 row, so no TP8 row is substituted. Neither run establishes the C16 target or expands the existing two-case full-model accuracy evidence.
 
 `results.json` contains the short-run measurements; `hour-results.json` records the follow-up failure and completed-record metrics. Both include original evidence hashes. `source-binding.json` binds all 30 production module files to the measured overlay. The PR packages content-equivalent source; the new Git commit itself has not been benchmarked. The AITER wrapper patch is part of the measured stack and must not be omitted. Raw workload data and internal machine paths are not published here.
 
@@ -78,6 +89,6 @@ export OUTPUT_DIR=/results/muse-tp4-c16-fresh-run
 bash benchmark/muse_tp4_c16/client.sh
 ```
 
-The client defaults to the 180-second diagnostic. Set `DURATION=3600` for the hour protocol; this removes the diagnostic unsafe override and retains the original 30-second drain behavior.
+The client defaults to the 180-second diagnostic at C16. Set `DURATION=3600` for the hour protocol; this removes the diagnostic unsafe override and retains the original 30-second drain behavior. Use `CONCURRENCY=4` or `CONCURRENCY=8` to reproduce the additional concurrency settings. The launcher accepts integer concurrency from 2 through 64; acceptance does not imply measured performance or accuracy coverage at every setting.
 
 There is no new GPU run required to inspect or reproduce the source binding. The existing CPU guard/layout tests are under `test/registered/kernels/ops/muse_spark/`. Repository CI and broader numerical coverage remain separate from the saved two-case evidence.
