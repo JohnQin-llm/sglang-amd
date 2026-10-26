@@ -8,6 +8,7 @@ then weighted sum) are FlyDSL kernels.
 """
 
 import functools
+import os
 
 import torch
 
@@ -50,7 +51,15 @@ def _require_flydsl():
     return fx, _run_compiled
 
 
-def _pick_flydsl_config(M: int, topk: int, E: int, mxfp4: bool) -> dict:
+def _pick_flydsl_config(
+    M: int,
+    topk: int,
+    E: int,
+    mxfp4: bool,
+    single_layout: bool = False,
+    *,
+    shape: tuple[int, int, int] | None = None,
+) -> dict:
     rows = M * topk
     table = (
         {"small": _SMALL_M_FP4, "mid": _MID_M_FP4, "large": _LARGE_M_FP4}
@@ -112,6 +121,12 @@ def _pick_flydsl_config(M: int, topk: int, E: int, mxfp4: bool) -> dict:
         cfg["BLOCK_N"] = 32 if M <= 4 else (64 if M <= 16 else 128)
         cfg["num_warps"] = 2
         cfg["FLYDSL_K_UNROLL"] = 16
+        if single_layout and M > 512:
+            # Shuffled scales require byte gathers. At BM32, a K512 tile
+            # spills both gate/up and down registers on gfx950. K256
+            # keeps this register-resident schedule spill-free; preserve
+            # the smaller-row and native-layout schedules.
+            cfg["FLYDSL_K_UNROLL"] = 8
         if M > 128:
             # Down projection re-reads the intermediate once per N tile, and
             # that traffic grows with the routed rows while the weight stream
@@ -119,6 +134,18 @@ def _pick_flydsl_config(M: int, topk: int, E: int, mxfp4: bool) -> dict:
             # climbs. Halving the re-reads is worth 5-9% from M=256 up; below
             # M=64 the narrower weight stream matters more and this loses.
             cfg["GEMM2_BLOCK_N"] = 256
+    if (
+        mxfp4
+        and single_layout
+        and E == 64
+        and topk == 8
+        and M in (24, 32, 40, 48, 56, 64, 72, 80, 96, 112, 128)
+        and shape == (4096, 4096, 4096)  # K, I, H
+    ):
+        # The qualified A16 single-layout gate/up schedule uses K256 to
+        # reduce live register fragments. Keep down projection at K512
+        # and preserve legacy selector calls that do not provide dimensions.
+        cfg["GEMM1_FLYDSL_K_UNROLL"] = 8
     return cfg
 
 
@@ -160,8 +187,26 @@ def _launch_gemm(
     mxfp4,
     cfg,
     split_k=1,
+    single_layout=False,
 ):
-    from aiter.ops.flydsl.muse_moe_gemm import launch_muse_moe_gemm
+    # Default-OFF; all ABI/topology checks live in the shared dispatch leaf.
+    # G2 and split-K use the exact original native path below.
+    if fuse_silu and split_k == 1 and os.environ.get("SGLANG_MUSE_AITER_A16_G1", "0") == "1":
+        from sglang.srt.rocm_muse_spark.muse_aiter_a16_g1 import try_launch
+
+        if try_launch(
+            a, b, b_scale, c, sorted_ids, expert_ids, num_post_padded,
+            N, K, num_valid, topk, a_row_div_topk, fuse_silu, mxfp4, cfg,
+            split_k, single_layout,
+        ):
+            return
+
+    if single_layout:
+        from sglang.srt.rocm_muse_spark.muse_moe_single_layout_gemm import (
+            launch_muse_moe_gemm,
+        )
+    else:
+        from aiter.ops.flydsl.muse_moe_gemm import launch_muse_moe_gemm
 
     # Gate/up carries twice as many accumulator fragments as down projection,
     # so one tile is not generally optimal for both stages.  Preserve the
@@ -208,8 +253,9 @@ def muse_moe_flydsl(
     has_norm: bool = True,
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
+    single_layout: bool = False,
 ) -> torch.Tensor:
-    """Muse MoE with native-layout FlyDSL grouped GEMMs and finalize."""
+    """Muse MoE with FlyDSL grouped GEMMs and unchanged per-slot finalize."""
     fx, _run_compiled = _require_flydsl()
 
     if hidden_states.ndim != 2 or topk_ids.ndim != 2 or w13.ndim != 3 or w2.ndim != 3:
@@ -286,7 +332,9 @@ def muse_moe_flydsl(
     else:
         assert K == kw and I == iw, "shape mismatch between w13/w2/hidden"
     if cfg is None:
-        cfg = _pick_flydsl_config(M, topk, E, mxfp4)
+        cfg = _pick_flydsl_config(
+            M, topk, E, mxfp4, single_layout=single_layout, shape=(K, I, H)
+        )
     assert (
         K % cfg["BLOCK_K"] == 0 and I % cfg["BLOCK_K"] == 0 and cfg["BLOCK_K"] % 32 == 0
     )
@@ -307,84 +355,101 @@ def muse_moe_flydsl(
     num_valid = M * topk
     split_k = int(cfg.get("FLYDSL_SPLIT_K", 1))
 
-    inter = torch.empty(
-        (num_valid, I), dtype=hidden_states.dtype, device=hidden_states.device
-    )
-    if split_k > 1:
-        part1 = torch.empty(
-            (split_k, num_valid, 2 * I),
-            dtype=torch.float32,
-            device=hidden_states.device,
+    # Per-call workspace stays live through the unchanged common finalize.
+    pair_workspace = None
+    pair_result = None
+    if os.environ.get("SGLANG_MUSE_AITER_A16_G1G2_SLOT", "0") == "1":
+        from sglang.srt.rocm_muse_spark.muse_aiter_a16_g1g2_slot import try_launch_pair
+
+        pair_result = try_launch_pair(
+            hidden_states, w13, w13_scale, w2, w2_scale,
+            (sorted_ids, expert_ids, num_post), cfg,
+            topk=topk, split_k=split_k, single_layout=single_layout,
         )
+    if pair_result is not None:
+        y, pair_workspace = pair_result
+    else:
+        inter = torch.empty(
+            (num_valid, I), dtype=hidden_states.dtype, device=hidden_states.device
+        )
+        if split_k > 1:
+            part1 = torch.empty(
+                (split_k, num_valid, 2 * I),
+                dtype=torch.float32,
+                device=hidden_states.device,
+            )
+            _launch_gemm(
+                hidden_states,
+                w13,
+                w13_scale,
+                part1,
+                sorted_ids,
+                expert_ids,
+                num_post,
+                I,
+                K,
+                num_valid,
+                topk,
+                True,
+                True,
+                mxfp4,
+                cfg,
+                split_k,
+                single_layout=single_layout,
+            )
+            stream = fx.Stream(torch.cuda.current_stream(hidden_states.device).cuda_stream)
+            _run_compiled(
+                _cached_splitk_silu_launch(int(I), split_k),
+                part1,
+                inter,
+                int(num_valid),
+                int(num_valid * ((I + 1023) // 1024)),
+                stream,
+            )
+            y = torch.empty(
+                (split_k, num_valid, H), dtype=torch.float32, device=hidden_states.device
+            )
+        else:
+            _launch_gemm(
+                hidden_states,
+                w13,
+                w13_scale,
+                inter,
+                sorted_ids,
+                expert_ids,
+                num_post,
+                I,
+                K,
+                num_valid,
+                topk,
+                True,
+                True,
+                mxfp4,
+                cfg,
+                single_layout=single_layout,
+            )
+            y = torch.empty(
+                (num_valid, H), dtype=hidden_states.dtype, device=hidden_states.device
+            )
         _launch_gemm(
-            hidden_states,
-            w13,
-            w13_scale,
-            part1,
+            inter,
+            w2,
+            w2_scale,
+            y,
             sorted_ids,
             expert_ids,
             num_post,
+            H,
             I,
-            K,
             num_valid,
             topk,
-            True,
-            True,
+            False,
+            False,
             mxfp4,
             cfg,
             split_k,
+            single_layout=single_layout,
         )
-        stream = fx.Stream(torch.cuda.current_stream(hidden_states.device).cuda_stream)
-        _run_compiled(
-            _cached_splitk_silu_launch(int(I), split_k),
-            part1,
-            inter,
-            int(num_valid),
-            int(num_valid * ((I + 1023) // 1024)),
-            stream,
-        )
-        y = torch.empty(
-            (split_k, num_valid, H), dtype=torch.float32, device=hidden_states.device
-        )
-    else:
-        _launch_gemm(
-            hidden_states,
-            w13,
-            w13_scale,
-            inter,
-            sorted_ids,
-            expert_ids,
-            num_post,
-            I,
-            K,
-            num_valid,
-            topk,
-            True,
-            True,
-            mxfp4,
-            cfg,
-        )
-        y = torch.empty(
-            (num_valid, H), dtype=hidden_states.dtype, device=hidden_states.device
-        )
-    _launch_gemm(
-        inter,
-        w2,
-        w2_scale,
-        y,
-        sorted_ids,
-        expert_ids,
-        num_post,
-        H,
-        I,
-        num_valid,
-        topk,
-        False,
-        False,
-        mxfp4,
-        cfg,
-        split_k,
-    )
 
     out = torch.empty((M, H), dtype=hidden_states.dtype, device=hidden_states.device)
     has_scale = has_norm and post_norm_weight is not None

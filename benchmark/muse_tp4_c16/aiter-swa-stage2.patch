@@ -1,0 +1,48 @@
+--- a/aiter/ops/triton/attention/unified_attention.py
++++ b/aiter/ops/triton/attention/unified_attention.py
+@@ -527,6 +527,45 @@
+                 shuffled_kv_cache,
+                 prefill_config=prefill_2d_config,
+             )
++            # Validated Muse-shaped uniform verify on gfx950. Keep the native
++            # 2D kernel, arithmetic and grid; overlap its KV loop with stage2.
++            # No change for ordinary prefill/decode, EP8-shaped Q16, or other ABI.
++            if (
++                DEVICE_ARCH == "gfx950"
++                and uniform_verify
++                and int(max_seqlen_q) == 8
++                and num_seqs in (1, 2, 3, 4, 5, 6, 7, 8)
++                and num_tokens == num_seqs * 8
++                and num_query_heads == 32
++                and num_kv_heads == 4
++                and head_size == 64
++                and block_size == 16
++                and q_dtype == torch.bfloat16
++                and kv_cache_dtype == e4m3_dtype
++                and v.dtype == kv_cache_dtype
++                and q.shape == out.shape
++                and k.shape == v.shape
++                and q.stride() == out.stride() == (2048, 64, 1)
++                and k.stride() == v.stride() == (4096, 256, 64, 1)
++                and SLIDING_WINDOW == 2047
++                and not ALL_DECODE
++                and not shuffled_kv_cache
++                and softcap == 0
++                and sinks is None
++                and alibi_slopes is None
++                and qq_bias is None
++                and output_scale is None
++                and q_descale is None
++                and k_descale is not None
++                and v_descale is not None
++                and k_descale.dtype == v_descale.dtype == torch.float32
++                and k_descale.numel() == v_descale.numel() == 1
++                and config == {
++                    "BLOCK_M": 16, "BLOCK_Q": 2, "TILE_SIZE": 64,
++                    "num_warps": 2, "num_stages": 1, "waves_per_eu": 2,
++                }
++            ):
++                config = dict(config, num_stages=2)
+             assert config["BLOCK_Q"] >= 1
+             if ALL_DECODE:
+                 total_num_q_blocks = num_seqs

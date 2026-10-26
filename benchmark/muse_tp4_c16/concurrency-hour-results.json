@@ -1,0 +1,126 @@
+{
+  "scope": "Separate same-source TP4/EP4 AgentX 1.0.12 hour runs on four MI355X GPUs at each concurrency. Original 30-second drain, no unsafe override or change to serving recipe. These runs do not establish the C16 150 target or all-shape correctness. Not a controlled A/B with B200.",
+  "runs": [
+    {
+      "concurrency": 4,
+      "tp": 4,
+      "ep": 4,
+      "chips": 4,
+      "status": "passed_clean_hour",
+      "formal_score_eligible": true,
+      "source_manifest_sha256": "f7183a59238ec3eebbb07e0d7b5da26bc78a9c8be1e4273a80ec035bfe5b54e8",
+      "performance": {
+        "p90_interactivity_tps": 146.41288433382138,
+        "raw_p90_full_response_itl_ms": 6.831096598779094,
+        "per_chip_tps": {
+          "input": 5880.564623392046,
+          "output": 44.103872207889985,
+          "total": 5924.668495599936
+        },
+        "retained_record_span_seconds": 3603.770871882
+      },
+      "sending_window_seconds": 3599.999836005,
+      "completed_requests": 504,
+      "cancelled_requests": 0,
+      "request_errors": 0,
+      "gates": {
+        "request": true,
+        "record": true,
+        "execution": true,
+        "source_unchanged": true,
+        "cleanup": true,
+        "startup_source": true,
+        "ledger": true,
+        "duration": true,
+        "export_population": true,
+        "client_submission_valid": true
+      },
+      "evidence_sha256": {
+        "plan.json": "c96b275be1a508f868953ed5413f76aa07101fcd90f3cf57b5446cc8586478f1",
+        "freeze.json": "6797429954f71dfce01abef74690755c3a333592d2f8ff5d199f56a7e8fbf3dd",
+        "results/diagnostic-v1/execution.json": "a49ccf496cd03dc0f95ac0911757c12d36f6d291d827d34a4e110c464d8c5026",
+        "results/diagnostic-v1/client.log": "88cd6ba34b5a0849d480e61712476f267ddc3d0b9e63191d14d5e1c1ddd499ad",
+        "results/diagnostic-v1/aiperf_artifacts/profile_export.jsonl": "e50b191355a75bff4f461f8cc62fe76b21e3f72fd940dfebffe9fdf8aec2a5ba",
+        "results/diagnostic-v1/aiperf_artifacts/profile_export_aiperf.json": "9eb893ea961deccf3a043c8ad0524f0b8b07c176ef332475e1ffe3783acf4fc3"
+      },
+      "analysis_sha256": "ff8a7984d962ff023ea30dc0d592c6764859b7371ac1d58a89ec97caec8bb955",
+      "client_decode_occupancy": {
+        "effective_decode_concurrency_average": 1.0651915801408,
+        "scope": "Client-estimated simultaneous decoding requests; not configured concurrency or GPU graph batch size."
+      },
+      "B200_reference": {
+        "available": false,
+        "reason": "No B200 TP4/EP4 row at this concurrency in user-supplied CSV; no substitution with TP8."
+      }
+    },
+    {
+      "concurrency": 8,
+      "tp": 4,
+      "ep": 4,
+      "chips": 4,
+      "status": "passed_clean_hour",
+      "formal_score_eligible": true,
+      "source_manifest_sha256": "f7183a59238ec3eebbb07e0d7b5da26bc78a9c8be1e4273a80ec035bfe5b54e8",
+      "performance": {
+        "p90_interactivity_tps": 136.986301369863,
+        "raw_p90_full_response_itl_ms": 7.29779732108821,
+        "per_chip_tps": {
+          "input": 11710.731761766234,
+          "output": 89.43936654403566,
+          "total": 11800.17112831027
+        },
+        "retained_record_span_seconds": 3601.129597015
+      },
+      "sending_window_seconds": 3600.000620669,
+      "completed_requests": 1150,
+      "cancelled_requests": 0,
+      "request_errors": 0,
+      "gates": {
+        "request": true,
+        "record": true,
+        "execution": true,
+        "source_unchanged": true,
+        "cleanup": true,
+        "startup_source": true,
+        "ledger": true,
+        "duration": true,
+        "export_population": true,
+        "client_submission_valid": true
+      },
+      "evidence_sha256": {
+        "plan.json": "0bb00ba2843529878adbe17f743107f65a7cc1eaa5170e146ba484f9f9465fa3",
+        "freeze.json": "90c97ce5ca4cd1e0e64bf842ad5207059e2d4f74775216a472377ecb3aedf20d",
+        "results/diagnostic-v1/execution.json": "1a3a99866fcafcc3a76f6934fbdcab8e8cd248d5ae6772f80f251236118a934b",
+        "results/diagnostic-v1/client.log": "0a33366b33d920c0df3d33915fdf0b9ddd54c591e6227a842b630ec2a9c52eb0",
+        "results/diagnostic-v1/aiperf_artifacts/profile_export.jsonl": "165f537be1f0c095f55bea923bf11153a15344a90b9e8183e38af1748effcc52",
+        "results/diagnostic-v1/aiperf_artifacts/profile_export_aiperf.json": "0692e6ee117a7d94794212d3253d0bd62a55fc791ad779364255fa228fa8557f"
+      },
+      "analysis_sha256": "d9bf2c6e1b9550a64d4e115773b623849a2330be9bab446bbb82326981c14334",
+      "client_decode_occupancy": {
+        "effective_decode_concurrency_average": 2.034016128585609,
+        "scope": "Client-estimated simultaneous decoding requests; not configured concurrency or GPU graph batch size."
+      },
+      "B200_reference": {
+        "attribution": "InferenceX / SemiAnalysis; Apache-2.0",
+        "source_file": "InferenceX_Muse-Spark-Open_interactivity.csv",
+        "source_sha256": "0e1b5e66c14924064b0c9908716611b057f96041a91e910b33f187629ce91543",
+        "row": {
+          "Hardware": "b200",
+          "Framework": "sglang",
+          "TP": "4",
+          "EP": "4",
+          "Concurrency": "8",
+          "Date": "2026-10-22",
+          "P90 Interactivity (tok/s/user)": "226.2443438914027",
+          "Token Throughput per Chip (tok/s/chip)": "14296.14419",
+          "Output Throughput/Chip (tok/s)": "103.49165",
+          "Input Throughput/Chip (tok/s)": "14192.65254",
+          "Run URL": "https://github.com/SemiAnalysisAI/InferenceX/actions/runs/39449248229/attempts/1"
+        },
+        "p90_delta_pct": -39.45205479452054,
+        "total_throughput_delta_pct": -17.45906468567683,
+        "controlled_AB": false
+      }
+    }
+  ]
+}
