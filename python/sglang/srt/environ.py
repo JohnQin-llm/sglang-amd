@@ -1924,6 +1924,8 @@ class Envs:
     SGLANG_MUSE_MXFP4_BF16_EXPERTS = EnvBool(False)
     SGLANG_MUSE_PREFILL_SP = EnvBool(True)
     SGLANG_MUSE_PREFILL_ULYSSES = EnvBool(True)
+    # Ulysses prefill: BF16 Q + FP8 K/V in the QKV all-to-all, bitwise equal.
+    SGLANG_MUSE_ULYSSES_LEAN_A2A = EnvBool(False)
     SGLANG_MUSE_DENSE_TUNED = EnvBool(True)
     SGLANG_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
     # Opt-in TP4/EP4 target-verify router/pooler at the larger decode graph buckets.
