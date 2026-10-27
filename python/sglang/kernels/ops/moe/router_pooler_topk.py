@@ -7,8 +7,8 @@ split-K), sigmoid scores, bias-corrected top-8 selection with normalized weights
 * ``router_pooler_topk``: three ordered launches, router partials, pooler partials (both split-K) and one
   epilogue kernel whose programs either route a row or normalize a row. Above 16 rows the pooler output comes
   completed from hipBLASLt (or the tiled small-M GEMM when its copy is given) and only the epilogue is shared.
-* ``joint_router_pooler_topk``: one split-K GEMM over a packed ``[pooler; router_hi; router_lo]`` BF16 weight
-  (the FP32 router as high + low BF16 parts) and the same epilogue; 8 / 16 / 24-row verify batches.
+* ``joint_router_pooler_topk``: one GEMM over a packed ``[pooler; router_hi; router_lo]`` BF16 weight (the FP32
+  router as high + low BF16 parts) into FP32 partials, and the same epilogue; verify widths of 8..128 rows.
 
 Router ids follow the unfused routing sequence; the pooler and router projections differ from it only in
 FP32 summation order (and, for the joint form, the two-part BF16 router weights).
@@ -18,7 +18,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.gemm.bf16_splitk_gemm import _dense_partial, bf16_splitk_gemm_partials
+from sglang.kernels.ops.gemm.bf16_splitk_gemm import (
+    _dense_partial,
+    bf16_splitk_gemm_partials,
+)
 from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
     tiled_gemm,
     tiled_gemm_applies,
@@ -293,24 +296,34 @@ def pack_joint_router_pooler_weight(router, pooler):
     return torch.cat([pooler, high, low], dim=0).contiguous()
 
 
-# Split-K row tile (block M, warps) by row bound: one row tile covers all rows, so each weight slice is read
-# once. Measured end to end with the epilogue against AITER gemm_a16w16 (analysis/joint_widths.py, MI355X,
-# cold weights): 1.7-3.2 us faster at 24..64 rows, the same routes; the 8- and 16-row tile is the original.
-_JOINT_ROW_TILES = {16: (16, 4), 32: (32, 4), 56: (64, 4), 64: (64, 8)}
+# Joint GEMM per verify width, timed with the epilogue on MI355X (cold weights, CUDA graph). Split-K with one
+# row tile over all rows up to 40 rows, where no hipBLASLt solution is 0.2 us faster; hipBLASLt BF16 -> FP32
+# from 48 rows: 0.5-1.3 us faster than split-K at 48..64, 5.2-7.9 us faster than the TP4 high-M route at 80..128.
+# Solution ids from hipb_findallsols on gfx950; re-tune them when hipBLASLt changes.
+_JOINT_SPLITK_TILES = {8: (16, 4), 16: (16, 4), 24: (32, 4), 32: (32, 4), 40: (64, 4)}
+_JOINT_HIPBLASLT_SOLUTIONS = {
+    **dict.fromkeys((48, 56, 64), 442670),
+    **dict.fromkeys((72, 80, 88), 442661),
+    **dict.fromkeys((96, 104, 112, 120, 128), 442158),
+}
+JOINT_ROWS = (*_JOINT_SPLITK_TILES, *_JOINT_HIPBLASLT_SOLUTIONS)
 
 
 def joint_router_pooler_topk(x, packed, bias, norm, multiplier, scale, eps):
     """Same outputs as ``router_pooler_topk`` from the packed joint weight, for verify widths of 8..128 rows."""
     m, k = x.shape
-    assert 0 < m <= 128 and m % 8 == 0 and k == 8192 and packed.shape == (4608, 8192)
-    if m >= 80:
-        from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+    assert m in JOINT_ROWS and k == 8192 and packed.shape == (4608, 8192)
+    if m in _JOINT_HIPBLASLT_SOLUTIONS:
+        from aiter import hipb_mm
 
-        partial = gemm_a16w16(x, packed, dtype=torch.float32, skip_reduce=True)
-        sk = partial.shape[0] if partial.ndim == 3 else 1
+        # One FP32 partial; prepare_joint_router_pooler creates the hipBLASLt handle before graph capture.
+        partial = hipb_mm(
+            x, packed.t(), _JOINT_HIPBLASLT_SOLUTIONS[m], out_dtype=torch.float32
+        )
+        sk = 1
     else:
         sk = 8
-        block_m, warps = _JOINT_ROW_TILES[next(b for b in _JOINT_ROW_TILES if m <= b)]
+        block_m, warps = _JOINT_SPLITK_TILES[m]
         partial = torch.empty((sk, m, 4608), device=x.device, dtype=torch.float32)
         _dense_partial[(4608 // 64, triton.cdiv(m, block_m), sk)](
             x,
