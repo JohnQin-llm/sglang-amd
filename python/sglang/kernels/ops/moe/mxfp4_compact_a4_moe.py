@@ -1,12 +1,13 @@
 """Compact A4W4 MoE experts for small target-verify batches (MXFP4 weights and activations, gfx950).
 
-TP8 / EP8 Muse Spark layout: 32 local experts, top-8 routing, hidden 4096, intermediate 4096, Quark MXFP4
+Muse Spark layout: 32 local experts (TP8), or 64 (opt-in TP4 at M8..64, multiples of 8),
+top-8 routing, hidden 4096, intermediate 4096, Quark MXFP4
 checkpoint weights (per-32 E8M0 scales) used as stored. For M (a multiple of 8, up to MAX_ROWS) rows:
 
-1. ``_prepare_a4``: per-expert route counts -> 16-row block map, and per-row MXFP4 quantization of the input;
-2. ``_scatter_a4``: per local expert, rank its routes in token order into its blocks;
-3. ``_expert_a4`` (ACT): gate/up ``dot_scaled`` GEMMs, SiLU-and-mul rounded to BF16, MXFP4 re-quantization;
-4. ``_expert_a4``: down GEMM into unweighted per-(token, slot) BF16 rows.
+1. ``_prepare_a4``: per local expert, its 16-row blocks in the block map and its routes ranked in token
+   order into them; per row, MXFP4 quantization of the input;
+2. ``_expert_a4`` (ACT): gate/up ``dot_scaled`` GEMMs, SiLU-and-mul rounded to BF16, MXFP4 re-quantization;
+3. ``_expert_a4``: down GEMM into unweighted per-(token, slot) BF16 rows.
 
 ``compact_a4_experts`` returns those per-slot rows ``[M * 8, 4096]``; the caller's finalize applies the
 per-expert norm and the route-weighted sum. Quark MXFP4 declares dynamic MXFP4 activations, so A4 is the
@@ -19,6 +20,9 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 
 MAX_ROWS = 512
+# High-B admission follows production padded buckets, not a <=128 threshold.
+# Exact odd-B graphs (M72/88/104/120) deliberately retain the A16 fallback.
+TP4_ROWS = (8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128)
 BLOCK_M = 16  # BM 32 / 64 give wrong rows and are no faster
 
 
@@ -29,8 +33,8 @@ def _prepare_a4(
     QS,
     IDS,
     EXPERT,
+    SORTED,
     POST,
-    FIRST,
     M: tl.constexpr,
     START: tl.constexpr,
     NB: tl.constexpr,
@@ -38,32 +42,37 @@ def _prepare_a4(
     S: tl.constexpr,
     PER_E: tl.constexpr,
     BM: tl.constexpr,
+    E: tl.constexpr = 32,
 ):
-    # Program 0: per-expert route counts -> block offsets and the block->expert map; the rank scan and
-    # scatter run per expert in _scatter_a4. Programs 1..4M quantize activation rows.
+    # Programs 0..E-1: local expert `pid` fills its blocks of the block map and ranks its routes in token
+    # order into them (padding slots get M * 8); program 0 also marks the unused tail blocks.
+    # Programs E..E+4M-1 quantize activation rows. No two programs write the same entry.
     pid = tl.program_id(0)
-    if pid == 0:
+    if pid < E:
         r = tl.arange(0, S)
-        e = tl.arange(0, 32)
+        e = tl.arange(0, E)
         ids = tl.load(IDS + r, r < M * 8, other=-1)
         hits = (ids[None, :] == START + e[:, None]) & (r[None, :] < M * 8)
         blocks = tl.cdiv(tl.sum(hits.to(tl.int32), axis=1), BM)
-        first = tl.cumsum(blocks, axis=0) - blocks
-        b = tl.arange(0, NBB)
-        tl.store(EXPERT + b, -1, b < NB)
-        tl.store(FIRST + e, first)
-        # The later block-map writes may be owned by a different lane than initialization.
-        tl.debug_barrier()
+        first = tl.sum(tl.where(e < pid, blocks, 0), axis=0)
+        mine = tl.sum(tl.where(e == pid, blocks, 0), axis=0)
         eb = tl.arange(0, PER_E)
-        tl.store(
-            EXPERT + first[:, None] + eb[None, :],
-            e[:, None],
-            eb[None, :] < blocks[:, None],
-        )
-        tl.store(POST, tl.sum(blocks, axis=0) * BM)
+        tl.store(EXPERT + first + eb, pid, eb < mine)
+        if pid == 0:
+            total = tl.sum(blocks, axis=0)
+            b = tl.arange(0, NBB)
+            tl.store(EXPERT + b, -1, (b >= total) & (b < NB))
+            tl.store(POST, total * BM)
+        hit = (ids == START + pid) & (r < M * 8)
+        rank = tl.cumsum(hit.to(tl.int32), axis=0) - 1
+        c = tl.arange(0, PER_E * BM)
+        tl.store(SORTED + first * BM + c, M * 8, c < mine * BM)
+        # The scatter below may land on lanes other than the ones that wrote the sentinels.
+        tl.debug_barrier()
+        tl.store(SORTED + first * BM + rank, r, hit)
     else:
-        row = (pid - 1) // 4
-        tile = (pid - 1) % 4
+        row = (pid - E) // 4
+        tile = (pid - E) % 4
         col = tile * 1024 + tl.arange(0, 1024)
         x = tl.load(X + row * 4096 + col).to(tl.float32)
         q, qscale = _mxfp4_quant_op(x[None, :], 1024, 1, 32)
@@ -74,28 +83,30 @@ def _prepare_a4(
 
 
 @triton.jit
-def _scatter_a4(
-    IDS,
-    SORTED,
-    FIRST,
-    M: tl.constexpr,
-    START: tl.constexpr,
-    S: tl.constexpr,
-    PER_E: tl.constexpr,
-    BM: tl.constexpr,
+def _load_single_layout_weight(
+    W, base, n_block, BN: tl.constexpr, BK: tl.constexpr, tile
 ):
-    # One program per local expert: rank its routes in token order and fill its blocks (sentinel M*8).
-    e = tl.program_id(0)
-    s = tl.arange(0, S)
-    ids = tl.load(IDS + s, s < M * 8, other=-1)
-    hit = (ids == START + e) & (s < M * 8)
-    rank = tl.cumsum(hit.to(tl.int32), axis=0) - 1
-    nslots = tl.cdiv(tl.sum(hit.to(tl.int32), axis=0), BM) * BM
-    base = tl.load(FIRST + e) * BM
-    c = tl.arange(0, PER_E * BM)
-    tl.store(SORTED + base + c, M * 8, c < nslots)
-    tl.debug_barrier()
-    tl.store(SORTED + base + rank, s, hit)
+    # Physical axes: [N/16, Kbytes/16, N%16, Kbytes%16]. Read contiguous
+    # packed fragments, then present the original [Kbytes, N] dot operand.
+    r = tl.arange(0, BN * (BK // 2))
+    off = r // (16 * (BK // 2)) * (16 * 2048) + r % (16 * (BK // 2))
+    raw = tl.load(W + base + n_block * BN * 2048 + tile * (BK // 2) * 16 + off)
+    raw = tl.reshape(raw, (BN // 16, BK // 32, 16, 16))
+    return tl.reshape(tl.permute(raw, (1, 3, 0, 2)), (BK // 2, BN))
+
+
+@triton.jit
+def _load_single_layout_scale(
+    WS, base, n_block, BN: tl.constexpr, BK: tl.constexpr, tile
+):
+    # Physical axes: [N/32, Kscales/8, Kscales%4, N%16, Kscales/4%2, N/16%2].
+    # Reshape/permute preserves scale bytes and avoids scattered byte loads.
+    tl.static_assert(BN % 32 == 0 and BK % 256 == 0)
+    r = tl.arange(0, BN * (BK // 32))
+    off = r // (32 * (BK // 32)) * (32 * 128) + r % (32 * (BK // 32))
+    raw = tl.load(WS + base + n_block * BN * 128 + tile * (BK // 32) * 32 + off)
+    raw = tl.reshape(raw, (BN // 32, BK // 256, 4, 16, 2, 2))
+    return tl.reshape(tl.permute(raw, (0, 5, 3, 1, 4, 2)), (BN, BK // 32))
 
 
 @triton.jit
@@ -113,6 +124,7 @@ def _expert_a4(
     BK: tl.constexpr,
     ACT: tl.constexpr,
     BM: tl.constexpr,
+    SINGLE_LAYOUT: tl.constexpr,
 ):
     expert_block, n_block = tl.program_id(1), tl.program_id(0)
     expert = tl.load(EXPERT + expert_block)
@@ -138,36 +150,32 @@ def _expert_a4(
                 valid[:, None],
                 other=127,
             )
-            w = tl.load(
-                W
-                + expert * (wn * 2048)
-                + n[None, :] * 2048
-                + tile * (BK // 2)
-                + kp[:, None]
-            )
-            ws = tl.load(
-                WS
-                + expert * (wn * 128)
-                + n[:, None] * 128
-                + tile * (BK // 32)
-                + ks[None, :]
-            )
+            kb = tile * (BK // 2) + kp[:, None]
+            sb = tile * (BK // 32) + ks[None, :]
+            if SINGLE_LAYOUT:
+                w = _load_single_layout_weight(
+                    W, expert * (wn * 2048), n_block, BN, BK, tile
+                )
+                ws = _load_single_layout_scale(
+                    WS, expert * (wn * 128), n_block, BN, BK, tile
+                )
+            else:
+                wo = n[None, :] * 2048 + kb
+                so = n[:, None] * 128 + sb
+                w = tl.load(W + expert * (wn * 2048) + wo)
+                ws = tl.load(WS + expert * (wn * 128) + so)
             acc = tl.dot_scaled(a, asc, "e2m1", w, ws, "e2m1", acc)
             if ACT:
-                wu = tl.load(
-                    W
-                    + expert * (wn * 2048)
-                    + (n[None, :] + 4096) * 2048
-                    + tile * (BK // 2)
-                    + kp[:, None]
-                )
-                wsu = tl.load(
-                    WS
-                    + expert * (wn * 128)
-                    + (n[:, None] + 4096) * 128
-                    + tile * (BK // 32)
-                    + ks[None, :]
-                )
+                if SINGLE_LAYOUT:
+                    wu = _load_single_layout_weight(
+                        W, expert * (wn * 2048) + 4096 * 2048, n_block, BN, BK, tile
+                    )
+                    wsu = _load_single_layout_scale(
+                        WS, expert * (wn * 128) + 4096 * 128, n_block, BN, BK, tile
+                    )
+                else:
+                    wu = tl.load(W + expert * (wn * 2048) + 4096 * 2048 + wo)
+                    wsu = tl.load(WS + expert * (wn * 128) + 4096 * 128 + so)
                 up = tl.dot_scaled(a, asc, "e2m1", wu, wsu, "e2m1", up)
         if ACT:
             activated = (acc * tl.sigmoid(acc) * up).to(tl.bfloat16).to(tl.float32)
@@ -182,22 +190,24 @@ def _expert_a4(
 
 
 def compact_a4_applies(m: int, h: int, w13, w2, s13, s2) -> bool:
+    e = w13.shape[0] if len(w13.shape) == 3 else 0
     return (
         0 < m <= MAX_ROWS
         and m % 8 == 0
         and h == 4096
-        and w13.shape == (32, 8192, 2048)
-        and w2.shape == (32, 4096, 2048)
-        and s13.shape == (32, 8192, 128)
-        and s2.shape == (32, 4096, 128)
+        and (e == 32 or (e == 64 and m in TP4_ROWS))
+        and w13.shape == (e, 8192, 2048)
+        and w2.shape == (e, 4096, 2048)
+        and s13.shape == (e, 8192, 128)
+        and s2.shape == (e, 4096, 128)
         and all(
             t.dtype == torch.uint8 and t.is_contiguous() for t in (w13, w2, s13, s2)
         )
     )
 
 
-def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
-    """Per-(token, slot) expert outputs BF16 [M * 8, 4096] for the 32 local experts starting at ``local_start``."""
+def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start, single_layout=False):
+    """Per-slot BF16 [M * 8, 4096] for this rank's 32 or 64 local experts."""
     m, h = x.shape
     if not (
         compact_a4_applies(m, h, w13, w2, s13, s2)
@@ -205,10 +215,12 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
         and ids.shape == (m, 8)
     ):
         raise ValueError(
-            f"A4 requires M a multiple of 8 up to {MAX_ROWS}, native TP8 local32 checkpoint weights"
+            f"A4 requires H=I4096, top8, BF16 input and uint8 MXFP4 weights: "
+            f"E32 with M a multiple of 8 up to {MAX_ROWS}, or E64 with M in {TP4_ROWS}"
         )
+    e = w13.shape[0]
     bm = BLOCK_M
-    rows, cap = m * 8, m * 8 + 32 * (bm - 1)
+    rows, cap = m * 8, m * 8 + e * (bm - 1)
     nb = triton.cdiv(cap, bm)
     sid = torch.empty(cap, device=x.device, dtype=torch.int32)
     eid = torch.empty(nb, device=x.device, dtype=torch.int32)
@@ -218,19 +230,18 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
     inter = torch.empty((rows, 2048), device=x.device, dtype=torch.uint8)
     inter_scale = torch.empty((rows, 128), device=x.device, dtype=torch.uint8)
     y = torch.empty((rows, h), device=x.device, dtype=torch.bfloat16)
-    first = torch.empty(32, device=x.device, dtype=torch.int32)
     s_pow2, per_e = (
         triton.next_power_of_2(rows),
         triton.next_power_of_2(triton.cdiv(rows, bm)),
     )
-    _prepare_a4[(1 + m * 4,)](
+    _prepare_a4[(e + m * 4,)](
         x,
         q,
         qs,
         ids,
         eid,
+        sid,
         post,
-        first,
         m,
         local_start,
         nb,
@@ -238,12 +249,16 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
         s_pow2,
         per_e,
         bm,
+        E=e,
         num_warps=4,
     )
-    _scatter_a4[(32,)](ids, sid, first, m, local_start, s_pow2, per_e, bm, num_warps=4)
+    # Wider gate/up tiles amortize activation reads at the upper verify sizes.
+    # One pipeline stage keeps their LDS footprint bounded. Down projection
+    # and small batches retain the original N64, two-stage schedule.
+    gate_bn = 128 if single_layout and m >= 384 else 64
     grid = (4096 // 64, nb)
-    options = dict(num_warps=4, num_stages=2, matrix_instr_nonkdim=16)
-    _expert_a4[grid](
+    options = dict(num_warps=4, matrix_instr_nonkdim=16)
+    _expert_a4[(4096 // gate_bn, nb)](
         q,
         qs,
         w13,
@@ -253,13 +268,30 @@ def compact_a4_experts(x, ids, w13, w2, s13, s2, *, local_start):
         inter,
         inter_scale,
         rows,
-        64,
+        gate_bn,
         512,
         True,
         bm,
+        single_layout,
+        num_stages=1 if gate_bn == 128 else 2,
         **options,
     )
     _expert_a4[grid](
-        inter, inter_scale, w2, s2, sid, eid, y, y, rows, 64, 512, False, bm, **options
+        inter,
+        inter_scale,
+        w2,
+        s2,
+        sid,
+        eid,
+        y,
+        y,
+        rows,
+        64,
+        512,
+        False,
+        bm,
+        single_layout,
+        num_stages=2,
+        **options,
     )
     return y

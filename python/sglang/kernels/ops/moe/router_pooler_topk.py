@@ -18,7 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.gemm.bf16_splitk_gemm import bf16_splitk_gemm_partials
+from sglang.kernels.ops.gemm.bf16_splitk_gemm import _dense_partial, bf16_splitk_gemm_partials
 from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
     tiled_gemm,
     tiled_gemm_applies,
@@ -293,20 +293,40 @@ def pack_joint_router_pooler_weight(router, pooler):
     return torch.cat([pooler, high, low], dim=0).contiguous()
 
 
+# Split-K row tile (block M, warps) by row bound: one row tile covers all rows, so each weight slice is read
+# once. Measured end to end with the epilogue against AITER gemm_a16w16 (analysis/joint_widths.py, MI355X,
+# cold weights): 1.7-3.2 us faster at 24..64 rows, the same routes; the 8- and 16-row tile is the original.
+_JOINT_ROW_TILES = {16: (16, 4), 32: (32, 4), 56: (64, 4), 64: (64, 8)}
+
+
 def joint_router_pooler_topk(x, packed, bias, norm, multiplier, scale, eps):
-    """Same outputs as ``router_pooler_topk`` from the packed joint weight, for 8 / 16 / 24 rows."""
+    """Same outputs as ``router_pooler_topk`` from the packed joint weight, for verify widths of 8..128 rows."""
     m, k = x.shape
-    assert m in (8, 16, 24) and k == 8192 and packed.shape == (4608, 8192)
-    if m == 24:
+    assert 0 < m <= 128 and m % 8 == 0 and k == 8192 and packed.shape == (4608, 8192)
+    if m >= 80:
         from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
 
         partial = gemm_a16w16(x, packed, dtype=torch.float32, skip_reduce=True)
         sk = partial.shape[0] if partial.ndim == 3 else 1
     else:
         sk = 8
+        block_m, warps = _JOINT_ROW_TILES[next(b for b in _JOINT_ROW_TILES if m <= b)]
         partial = torch.empty((sk, m, 4608), device=x.device, dtype=torch.float32)
-        bf16_splitk_gemm_partials(
-            x, packed, partial, block_n=64, block_k=128, split_k=sk
+        _dense_partial[(4608 // 64, triton.cdiv(m, block_m), sk)](
+            x,
+            packed,
+            partial,
+            m,
+            4608,
+            8192,
+            block_m,
+            64,
+            128,
+            sk,
+            ".cg",
+            num_warps=warps,
+            num_stages=2,
+            matrix_instr_nonkdim=16,
         )
     assert partial.dtype == torch.float32 and sk & (sk - 1) == 0
     scores = torch.empty((m, 8), device=x.device, dtype=torch.float32)
@@ -323,6 +343,82 @@ def joint_router_pooler_topk(x, packed, bias, norm, multiplier, scale, eps):
         sk,
         multiplier,
         scale,
+        eps,
+        num_warps=4,
+    )
+    return scores, ids, expert_input
+
+
+# These are padded verify row counts, not an interval. Small-M and EP8 callers
+# continue to use the original entry points above.
+TP4_HIGH_M_ROWS = (80, 96, 112, 128)
+TP4_HIGH_M_ROUTER_CONFIG = {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 32,
+    "SPLIT_K": 32,
+    "num_warps": 4,
+    "num_stages": 2,
+}
+
+
+def router_pooler_topk_high_m(
+    x, router_weight, bias, norm_weight, multiplier, scale, eps, *, pooler
+):
+    """Fuse the *tuned* high-M router reduction with routing and pooler norm.
+
+    ``pooler(x)`` must be the caller's original dense projection, returning its
+    completed BF16 output. No new tiled-weight copy, GEMV schedule, or pooler
+    arithmetic is introduced. The host's TP4 target-verify guard must pass first.
+    The original SK32 sequential router sum and BF16-before-RMS boundary remain.
+    """
+    from sglang.kernels.ops.gemm.router_gemm_fp32 import (
+        _router_partial,
+        get_router_gemm_fp32_configs,
+    )
+
+    m, k = x.shape
+    assert m in TP4_HIGH_M_ROWS and k == 8192
+    assert (get_router_gemm_fp32_configs(256, k) or {}).get(
+        m
+    ) == TP4_HIGH_M_ROUTER_CONFIG
+    rp = torch.empty((32, m, 256), device=x.device, dtype=torch.float32)
+    # Match router_gemm_tuned, including its distinct contiguous kernel entry.
+    _router_partial[(2, 32, triton.cdiv(m, 16))](
+        x,
+        router_weight,
+        rp,
+        m,
+        256,
+        k,
+        16,
+        128,
+        32,
+        32,
+        num_warps=4,
+        num_stages=2,
+    )
+    dp = pooler(x)
+    assert dp.shape == (m, 4096) and dp.dtype == torch.bfloat16
+    assert dp.is_contiguous() and dp.device == x.device
+    scores = torch.empty((m, 8), device=x.device, dtype=torch.float32)
+    ids = torch.empty((m, 8), device=x.device, dtype=torch.int32)
+    expert_input = torch.empty((m, 4096), device=x.device, dtype=torch.bfloat16)
+    _route_preproject_epilogue[(2 * m,)](
+        rp,
+        dp,
+        bias,
+        norm_weight,
+        scores,
+        ids,
+        expert_input,
+        m,
+        4096,
+        1,
+        32,
+        multiplier,
+        scale,
+        1,
         eps,
         num_warps=4,
     )

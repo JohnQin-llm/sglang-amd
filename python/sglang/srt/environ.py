@@ -1890,8 +1890,12 @@ class Envs:
     # Verify kernels: sliding layers split-KV (<= 8 requests) / GQA-folded
     # (> 8); full layers two-KV-head kernel, else GQA-folded from 8 requests.
     SGLANG_MUSE_VERIFY_SWA_SPLITKV = EnvBool(True)
+    # TP4 Q32/KV4 target verify; also requires the global SWA split-KV switch.
+    SGLANG_MUSE_TP4_VERIFY_SWA_SPLITKV = EnvBool(False)
     SGLANG_MUSE_VERIFY_SWA_GQA = EnvBool(True)
     SGLANG_MUSE_VERIFY_FULL_V2 = EnvBool(True)
+    # Experimental TP4/EP4 Q32/KV4 full verify; also requires FULL_V2 above.
+    SGLANG_MUSE_TP4_VERIFY_FULL_V2 = EnvBool(False)
     SGLANG_MUSE_VERIFY_FULL_GQA = EnvBool(True)
     # Triton extend: DFlash draft block (8 x 8 heads, 1 KV head, HD128) split-KV.
     SGLANG_MUSE_DFLASH_SPLITKV = EnvBool(True)
@@ -1905,13 +1909,22 @@ class Envs:
     # and joint router/pooler projections.
     SGLANG_MUSE_FUSED_QKV_CACHE = EnvBool(True)
     SGLANG_MUSE_QK_ROPE_CACHE = EnvBool(True)
+    # Opt-in Q32/KV4 variants; TP8 retains its existing Q16/KV2 dispatch.
+    SGLANG_MUSE_TP4_FUSED_QKV_CACHE = EnvBool(False)
+    SGLANG_MUSE_TP4_QK_ROPE_CACHE = EnvBool(False)
     SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY = EnvBool(True)
     SGLANG_MUSE_COMPACT_A4_VERIFY = EnvBool(True)
+    # Experimental TP4/EP4, E64 verify: M8..64 by 8, plus M80/96/112/128.
+    # The original compact-A4 switch must also be enabled. Requires restart.
+    SGLANG_MUSE_TP4_COMPACT_A4_VERIFY = EnvBool(False)
     SGLANG_MUSE_A4W4_MOE = EnvBool(True)
+    SGLANG_MUSE_MOE_SINGLE_LAYOUT = EnvBool(False)
     SGLANG_MUSE_PREFILL_SP = EnvBool(True)
     SGLANG_MUSE_PREFILL_ULYSSES = EnvBool(True)
     SGLANG_MUSE_DENSE_TUNED = EnvBool(True)
     SGLANG_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
+    # Opt-in TP4/EP4 target-verify router/pooler at the larger decode graph buckets.
+    SGLANG_MUSE_TP4_VERIFY_ROUTER_POOLER = EnvBool(False)
     SGLANG_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
