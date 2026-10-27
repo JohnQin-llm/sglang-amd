@@ -1919,6 +1919,9 @@ class Envs:
     SGLANG_MUSE_TP4_COMPACT_A4_VERIFY = EnvBool(False)
     SGLANG_MUSE_A4W4_MOE = EnvBool(True)
     SGLANG_MUSE_MOE_SINGLE_LAYOUT = EnvBool(False)
+    # Round the BF16 routed experts a Quark MXFP4 export leaves unquantized to
+    # MXFP4 at load. Changes the model's numerics.
+    SGLANG_MUSE_MXFP4_BF16_EXPERTS = EnvBool(False)
     SGLANG_MUSE_PREFILL_SP = EnvBool(True)
     SGLANG_MUSE_PREFILL_ULYSSES = EnvBool(True)
     SGLANG_MUSE_DENSE_TUNED = EnvBool(True)
