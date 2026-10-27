@@ -1929,6 +1929,11 @@ class Envs:
     # Opt-in TP4/EP4 target-verify router/pooler at the larger decode graph buckets.
     SGLANG_MUSE_TP4_VERIFY_ROUTER_POOLER = EnvBool(False)
     SGLANG_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
+    # Load each MoE layer's experts in the EP4 placement of
+    # rocm_muse_spark/ep4_expert_placement.json (fitted on recorded verify routes).
+    SGLANG_MUSE_EP4_PLACEMENT = EnvBool(False)
+    # Padded target-verify graph rows get expert id -1 in the joint router/pooler.
+    SGLANG_MUSE_TP4_VERIFY_PAD_MASK = EnvBool(False)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )

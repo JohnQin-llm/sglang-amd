@@ -119,6 +119,8 @@ def _joint_epilogue(
     MULT: tl.constexpr,
     SCALE: tl.constexpr,
     EPS: tl.constexpr,
+    NUM_REAL,
+    HAS_NUM_REAL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     s = tl.arange(0, SK)
@@ -140,6 +142,9 @@ def _joint_epilogue(
             biased = tl.where(n == idx, -float("inf"), biased)
             ids = tl.where(slots == j, idx, ids)
             selected = tl.where(slots == j, score, selected)
+        if HAS_NUM_REAL:
+            # Graph padding rows: expert id -1 matches no rank's experts.
+            ids = tl.where(pid < tl.load(NUM_REAL), ids, -1)
         tl.store(IDS + pid * 8 + slots, ids)
         tl.store(SCORES + pid * 8 + slots, selected * (SCALE / (denominator + 1e-15)))
     else:
@@ -309,8 +314,12 @@ _JOINT_HIPBLASLT_SOLUTIONS = {
 JOINT_ROWS = (*_JOINT_SPLITK_TILES, *_JOINT_HIPBLASLT_SOLUTIONS)
 
 
-def joint_router_pooler_topk(x, packed, bias, norm, multiplier, scale, eps):
-    """Same outputs as ``router_pooler_topk`` from the packed joint weight, for verify widths of 8..128 rows."""
+def joint_router_pooler_topk(
+    x, packed, bias, norm, multiplier, scale, eps, num_real=None
+):
+    """Same outputs as ``router_pooler_topk`` from the packed joint weight, for verify widths of 8..128 rows.
+
+    ``num_real`` (device int32 scalar) gives the rows from it on expert id -1."""
     m, k = x.shape
     assert m in JOINT_ROWS and k == 8192 and packed.shape == (4608, 8192)
     if m in _JOINT_HIPBLASLT_SOLUTIONS:
@@ -357,6 +366,8 @@ def joint_router_pooler_topk(x, packed, bias, norm, multiplier, scale, eps):
         multiplier,
         scale,
         eps,
+        num_real,
+        num_real is not None,
         num_warps=4,
     )
     return scores, ids, expert_input

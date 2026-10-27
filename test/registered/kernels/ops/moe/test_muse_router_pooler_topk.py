@@ -1,5 +1,6 @@
 """Muse Spark joint router/pooler (joint_router_pooler_topk) at every verify width
-against an FP32 reference of the unfused routing front."""
+against an FP32 reference of the unfused routing front, under an EP4 expert
+placement, and with padded verify rows masked."""
 
 import unittest
 
@@ -50,7 +51,7 @@ def inputs(rows: int, seed: int) -> torch.Tensor:
     return torch.randn(rows, HIDDEN, generator=g).bfloat16().cuda()
 
 
-def joint(moe: _MoE, x: torch.Tensor):
+def joint(moe: _MoE, x: torch.Tensor, num_real=None):
     from sglang.kernels.ops.moe.router_pooler_topk import joint_router_pooler_topk
 
     return joint_router_pooler_topk(
@@ -61,6 +62,7 @@ def joint(moe: _MoE, x: torch.Tensor):
         MULTIPLIER,
         ROUTE_SCALE,
         NORM_EPS,
+        num_real=num_real,
     )
 
 
@@ -144,6 +146,52 @@ class TestMuseJointRouterPooler(CustomTestCase):
                 graph.replay()
                 for a, b in zip(captured, joint(self.moe, fresh)):
                     self.assertTrue(torch.equal(a, b))
+
+    def test_placed_router_routes_to_relabelled_experts(self):
+        """With the router columns and expert bias in an EP4 placement's slot order,
+        every row picks the slots of the experts it picked in checkpoint order, with
+        bitwise scores and expert input."""
+        from sglang.srt.rocm_muse_spark.ep4_placement import layer_placements
+        from sglang.srt.rocm_muse_spark.router_pooler import (
+            prepare_joint_router_pooler,
+        )
+
+        placement = layer_placements(4, EXPERTS)[31]
+        expert, slot = placement.expert.cuda(), placement.slot.cuda()
+        placed = _MoE(
+            router=self.moe.router.weight[:, expert].contiguous(),
+            pooler=self.moe.pre_expert_proj.weight.clone(),
+            expert_bias=self.moe.expert_bias[expert].contiguous(),
+            norm_weight=self.moe.norm_weight,
+        )
+        prepare_joint_router_pooler(placed)
+        for rows in (8, 40, 48, 96, 128):
+            with self.subTest(rows=rows):
+                x = inputs(rows, seed=3)
+                scores, ids, expert_input = joint(self.moe, x)
+                placed_scores, placed_ids, placed_input = joint(placed, x)
+                self.assertTrue(torch.equal(placed_ids.long(), slot[ids.long()]))
+                self.assertTrue(torch.equal(placed_scores, scores))
+                self.assertTrue(torch.equal(placed_input, expert_input))
+
+    def test_padded_rows_route_to_no_expert(self):
+        """Rows from the device real-row count on get expert id -1 and the real rows
+        are unchanged; a captured graph reads the count at replay."""
+        for rows in (16, 40, 80, 96, 128):
+            with self.subTest(rows=rows):
+                x = inputs(rows, seed=4)
+                scores, ids, expert_input = joint(self.moe, x)
+                num_real = torch.tensor(rows, dtype=torch.int32, device="cuda")
+                graph, (m_scores, m_ids, m_input) = capture(
+                    lambda: joint(self.moe, x, num_real=num_real)
+                )
+                for real in (rows, rows - 8, 1):
+                    num_real.fill_(real)
+                    graph.replay()
+                    self.assertTrue(torch.equal(m_ids[:real], ids[:real]))
+                    self.assertTrue(bool((m_ids[real:] == -1).all()))
+                    self.assertTrue(torch.equal(m_scores, scores))
+                    self.assertTrue(torch.equal(m_input, expert_input))
 
 
 if __name__ == "__main__":

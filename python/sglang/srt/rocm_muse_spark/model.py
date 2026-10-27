@@ -63,7 +63,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.rocm_muse_spark import mxfp4_moe, router_pooler, single_layout
+from sglang.srt.rocm_muse_spark import (
+    ep4_placement,
+    mxfp4_moe,
+    router_pooler,
+    single_layout,
+)
 from sglang.srt.rocm_muse_spark.attention_kv_write import (
     FUSED_QKV_CACHE,
     QK_ROPE_CACHE,
@@ -339,7 +344,19 @@ _FUSED_UNPOOL_BOUNDARY = envs.SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY.get()
 # The Quark MXFP4 export keeps BF16 routed experts in layers 0 and 61: 1.57 ms of a
 # 36 ms TP4 verify step at batch 10. Rounding them to MXFP4 changes numerics.
 _MXFP4_BF16_EXPERTS = envs.SGLANG_MUSE_MXFP4_BF16_EXPERTS.get()
+# Target-verify graphs pad batch 9 / 11 / 13 / 15 to 80 / 96 / 112 / 128 rows, and every rank streams
+# the experts the 8 padded rows route to: 442-583 us of expert stage per verify step at 80 and 96 rows.
+_TP4_VERIFY_PAD_MASK = envs.SGLANG_MUSE_TP4_VERIFY_PAD_MASK.get()
+_MOE_LAYER_NAME = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.")
 _dense_tuned_logged: set = set()
+
+
+def _layer_placement(
+    placements: dict[int, ep4_placement.LayerPlacement], name: str
+) -> ep4_placement.LayerPlacement | None:
+    """The EP4 placement of the MoE layer that checkpoint tensor ``name`` belongs to."""
+    match = _MOE_LAYER_NAME.search(name) if placements else None
+    return placements.get(int(match.group(1))) if match else None
 
 
 def _log_dense_tuned(kind: str, key) -> None:
@@ -954,12 +971,14 @@ class MuseSpark1xMoE(nn.Module):
         skip_post_expert_proj: bool = False,
         target_verify: bool = False,
         sp: SPShape | None = None,
+        num_real: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """MoE on ``hidden_states``; under sequence parallelism (``sp``) they are this
         rank's token shard and so is the result. ``skip_post_expert_proj`` returns the
-        reduced expert output before the unpooler (fused into the next boundary)."""
+        reduced expert output before the unpooler (fused into the next boundary).
+        ``num_real``: device count of real rows; the rows after it are graph padding."""
         topk_scores, topk_ids, expert_input = self.route(
-            hidden_states, target_verify=target_verify and sp is None
+            hidden_states, target_verify=target_verify and sp is None, num_real=num_real
         )
         rows = topk_ids.shape[0] if sp is None else sp.padded
         use_a4w4 = self.uses_a4w4(rows, target_verify)
@@ -988,15 +1007,25 @@ class MuseSpark1xMoE(nn.Module):
             return output
         return self.unpool(output)
 
-    def route(self, hidden_states: torch.Tensor, *, target_verify: bool = False):
-        """Router top-k and the expert input (pooler + pre-expert norm) of these rows."""
+    def route(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        target_verify: bool = False,
+        num_real: torch.Tensor | None = None,
+    ):
+        """Router top-k and the expert input (pooler + pre-expert norm) of these rows.
+
+        The joint router/pooler gives rows from ``num_real`` on expert id -1."""
         # The joint router/pooler serves 80..128 rows 5.2-7.9 us faster than the TP4 high-M route.
         if (
             router_pooler.SHARED_ROUTER_POOLER
             and _USE_ROUTER_GEMV
             and router_pooler.can_share_router_pooler(self, hidden_states)
         ):
-            return router_pooler.route_with_shared_pooler(self, hidden_states)
+            return router_pooler.route_with_shared_pooler(
+                self, hidden_states, num_real=num_real
+            )
         if (
             _TP4_VERIFY_ROUTER_POOLER
             and target_verify
@@ -1261,8 +1290,13 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 num_warps=16,
             )
             return stream, next_attn_input
+        num_real = (
+            forward_batch.num_token_non_padded
+            if _TP4_VERIFY_PAD_MASK and target_verify and sp is None
+            else None
+        )
         ffn_output = (
-            self.mlp(ffn_input, target_verify=target_verify, sp=sp)
+            self.mlp(ffn_input, target_verify=target_verify, sp=sp, num_real=num_real)
             if self.is_moe_layer
             else self.mlp(ffn_input)
         )
@@ -1520,6 +1554,22 @@ class MuseSparkTextForCausalLM(single_layout.SingleLayoutStateDictGuard, nn.Modu
             quant_config
         )
         self._nvfp4_pending: dict[tuple[str, str], dict[str, torch.Tensor]] = {}
+        self.expert_placements = (
+            ep4_placement.layer_placements(
+                get_parallel().moe_ep_size, config.num_local_experts
+            )
+            if envs.SGLANG_MUSE_EP4_PLACEMENT.get()
+            else {}
+        )
+        if self.expert_placements:
+            if self.requant_nvfp4_experts:
+                raise ValueError(
+                    "SGLANG_MUSE_EP4_PLACEMENT does not cover NVFP4 requantization"
+                )
+            logger.info(
+                "EP4 expert placement: %d MoE layers re-placed",
+                len(self.expert_placements),
+            )
         self.model = MuseSparkModel(config, quant_config, add_prefix("model", prefix))
         self.lm_head = ParallelLMHead(
             config.vocab_size,
@@ -1721,7 +1771,14 @@ class MuseSparkTextForCausalLM(single_layout.SingleLayoutStateDictGuard, nn.Modu
         if loaded_weight.shape[0] == self.config.num_local_experts:
             local = loaded_weight.shape[0] // parallel.moe_ep_size
             start = parallel.moe_ep_rank * local
-            loaded_weight = loaded_weight.narrow(0, start, local)
+            placement = _layer_placement(self.expert_placements, name)
+            if placement is None:
+                loaded_weight = loaded_weight.narrow(0, start, local)
+            else:  # the logical experts in this rank's physical slots
+                experts = placement.expert[start : start + local]
+                loaded_weight = loaded_weight.index_select(
+                    0, experts.to(loaded_weight.device)
+                )
         if param.shape != loaded_weight.shape:
             raise RuntimeError(
                 f"Expert weight shape mismatch for {name}: "
@@ -1768,6 +1825,9 @@ class MuseSparkTextForCausalLM(single_layout.SingleLayoutStateDictGuard, nn.Modu
         if suffix == "input_scale":
             return True
         expert_id = int(expert_raw)
+        placement = _layer_placement(self.expert_placements, prefix)
+        if placement is not None:
+            expert_id = int(placement.slot[expert_id])
         parallel = get_parallel()
         local_count = self.config.num_local_experts // parallel.moe_ep_size
         start = parallel.moe_ep_rank * local_count
@@ -1950,6 +2010,12 @@ class MuseSparkTextForCausalLM(single_layout.SingleLayoutStateDictGuard, nn.Modu
                 )
             if "router.weight" in name and param.shape != loaded_weight.shape:
                 loaded_weight = loaded_weight.t().contiguous()
+            if name.endswith((".mlp.router.weight", ".mlp.expert_bias")):
+                placement = _layer_placement(self.expert_placements, name)
+                if placement is not None:  # [..., experts]: column p is slot p's expert
+                    loaded_weight = loaded_weight.index_select(
+                        -1, placement.expert.to(loaded_weight.device)
+                    ).contiguous()
             if ".experts.w" in name:
                 self._copy_expert_stack(param, loaded_weight, name)
             else:
