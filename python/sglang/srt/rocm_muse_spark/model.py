@@ -336,6 +336,9 @@ _DENSE_TILED = envs.SGLANG_MUSE_DENSE_TILED.get()
 _DRAFT_TRITON_A16W16_GEMMS = ((24, 7168, 8192), (24, 8192, 3584))
 # Unpooler GEMM fused with the next FFN boundary's norms at decode / verify widths.
 _FUSED_UNPOOL_BOUNDARY = envs.SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY.get()
+# The Quark MXFP4 export keeps BF16 routed experts in layers 0 and 61: 1.57 ms of a
+# 36 ms TP4 verify step at batch 10. Rounding them to MXFP4 changes numerics.
+_MXFP4_BF16_EXPERTS = envs.SGLANG_MUSE_MXFP4_BF16_EXPERTS.get()
 _dense_tuned_logged: set = set()
 
 
@@ -898,7 +901,9 @@ class MuseSpark1xMoE(nn.Module):
             residual_id=2 * layer_idx + 2,
         )
         self.nvfp4_checkpoint = nvfp4_checkpoint
-        self.mxfp4_checkpoint = _uses_quark_mxfp4_experts(quant_config, prefix)
+        self.mxfp4_checkpoint = _uses_quark_mxfp4_experts(quant_config, prefix) or (
+            _MXFP4_BF16_EXPERTS and _is_quark_mxfp4(quant_config)
+        )
         if nvfp4_checkpoint:
             # Packed NVFP4: the FlashInfer TRT-LLM kernel runs the experts and we
             # finalize in torch so the post-expert norm lands before the top-k sum.
@@ -1723,6 +1728,28 @@ class MuseSparkTextForCausalLM(single_layout.SingleLayoutStateDictGuard, nn.Modu
             )
         param.data.copy_(loaded_weight)
 
+    @staticmethod
+    @torch.no_grad()
+    def _round_expert_to_mxfp4(
+        name: str,
+        loaded_weight: torch.Tensor,
+        weight: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> None:
+        """BF16 [rows, cols] -> packed E2M1 [rows, cols / 2] into ``weight`` and E8M0
+        scales [rows, cols / 32] into ``scale``, in the Quark layout. aiter's rounding
+        reproduces Quark's own MXFP4 experts byte for byte."""
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+        q_weight, q_scale = dynamic_mxfp4_quant(loaded_weight.to(weight.device))
+        if q_weight.shape != weight.shape or q_scale.shape != scale.shape:
+            raise RuntimeError(
+                f"MXFP4 rounding of {name}: {tuple(q_weight.shape)}/{tuple(q_scale.shape)} vs "
+                f"{tuple(weight.shape)}/{tuple(scale.shape)}"
+            )
+        weight.copy_(q_weight)
+        scale.copy_(q_scale)
+
     def _load_single_expert(
         self,
         params: dict[str, torch.Tensor],
@@ -1765,6 +1792,13 @@ class MuseSparkTextForCausalLM(single_layout.SingleLayoutStateDictGuard, nn.Modu
             half = target.shape[0] // 2
             offset = 0 if projection == "gate_proj" else half
             target = target.narrow(0, offset, half)
+        if loaded_weight.is_floating_point() and target.dtype == torch.uint8:
+            # A BF16 expert of a layer the export left unquantized, served as MXFP4.
+            scale = params[f"{param_name}_scale"].data[local_id]
+            if is_w13:
+                scale = scale.narrow(0, offset, half)
+            self._round_expert_to_mxfp4(name, loaded_weight, target, scale)
+            return True
         if target.shape != loaded_weight.shape:
             raise RuntimeError(
                 f"Expert weight shape mismatch for {name}: "
