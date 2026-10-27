@@ -3,8 +3,8 @@
 At decode / verify widths (up to 64 rows) the router logits, the sigmoid top-8 routing, the pooler projection
 and the pre-expert RMSNorm share one epilogue (``kernels/ops/moe/router_pooler_topk``) instead of separate
 router GEMM, routing, pooler GEMM and norm launches (``SGLANG_MUSE_SHARED_ROUTER_POOLER``). Verify batches of
-8 / 16 / 24 rows run the router and the pooler as one GEMM over a packed weight prepared after loading
-(``SGLANG_MUSE_JOINT_ROUTER_POOLER``).
+every multiple of 8 up to 128 rows run the router and the pooler as one GEMM over a packed weight prepared after
+loading (``SGLANG_MUSE_JOINT_ROUTER_POOLER``).
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import logging
 import torch
 
 from sglang.kernels.ops.moe.router_pooler_topk import (
+    JOINT_ROWS,
     joint_router_pooler_topk,
     pack_joint_router_pooler_weight,
     router_pooler_topk,
@@ -24,7 +25,6 @@ logger = logging.getLogger(__name__)
 
 SHARED_ROUTER_POOLER = envs.SGLANG_MUSE_SHARED_ROUTER_POOLER.get()
 JOINT_ROUTER_POOLER = envs.SGLANG_MUSE_JOINT_ROUTER_POOLER.get()
-_JOINT_ROWS = tuple(range(8, 65, 8))
 _logged: set = set()
 
 
@@ -33,7 +33,7 @@ def can_share_router_pooler(moe, x: torch.Tensor) -> bool:
     op = moe._routing_op()
     rows = x.shape[0]
     return (
-        (0 < rows <= 64 or (JOINT_ROUTER_POOLER and rows in _JOINT_ROWS))
+        (0 < rows <= 64 or (JOINT_ROUTER_POOLER and rows in JOINT_ROWS))
         and x.shape[1] == 8192
         and x.is_contiguous()
         and x.dtype == torch.bfloat16
@@ -61,7 +61,7 @@ def route_with_shared_pooler(moe, x: torch.Tensor):
     """(top-8 scores, expert ids, normalized expert input) for ``x``; requires ``can_share_router_pooler``."""
     m = x.shape[0]
     norm_weight = moe.pre_expert_norm._get_effective_weight()
-    if JOINT_ROUTER_POOLER and m in _JOINT_ROWS:
+    if JOINT_ROUTER_POOLER and m in JOINT_ROWS:
         packed = moe.router_pooler_packed_weight
         assert moe.pre_expert_proj.weight.data_ptr() == packed.data_ptr()
         key = ("joint", moe.layer_idx, m)
@@ -104,6 +104,16 @@ def route_with_shared_pooler(moe, x: torch.Tensor):
     )
 
 
+def _create_hipblaslt_handle() -> None:
+    """Create aiter's hipBLASLt handle for the joint GEMM's hipBLASLt widths before graph capture, once per
+    process: aiter's tuned GEMM checks the same flag."""
+    from aiter import hipb_create_extension, tuned_gemm
+
+    if not tuned_gemm.extensions_created:
+        hipb_create_extension()
+        tuned_gemm.extensions_created = True
+
+
 @torch.no_grad()
 def prepare_joint_router_pooler(moe) -> None:
     """Pack ``[pooler; router high; router low]`` once after loading; the pooler weight aliases the prefix."""
@@ -112,6 +122,7 @@ def prepare_joint_router_pooler(moe) -> None:
     assert router.shape == (8192, 256) and router.dtype == torch.float32
     assert pooler.shape == (4096, 8192) and pooler.dtype == torch.bfloat16
     packed = getattr(moe, "router_pooler_packed_weight", None)
+    _create_hipblaslt_handle()
     if packed is None:
         # Runs in post_load_weights, before warmup or graph capture. The pooler prefix holds exactly the
         # original BF16 values and stays available to the plain nn.Linear path at larger M.
