@@ -456,6 +456,16 @@ _MUSE_SPARK_GFX950_KERNELS = [
         "dflash_block_splitkv",
         "DFlash 8-row block extend over an FP8 prefix cache, split-KV, head_dim 128",
     ),
+    (
+        "verify_tp4",
+        "verify_full_tp4",
+        "8-token full-attention verify, 32 Q / 4 KV heads, split-KV, FP8 KV page 16",
+    ),
+    (
+        "verify_tp4",
+        "verify_swa_tp4",
+        "8-token verify on a 2047-token window, 32 Q / 4 KV heads, split-KV",
+    ),
 ]
 for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
     register_kernel(

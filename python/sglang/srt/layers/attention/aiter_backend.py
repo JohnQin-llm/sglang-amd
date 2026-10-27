@@ -104,6 +104,11 @@ from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
 )
+from sglang.kernels.ops.attention.verify_tp4 import (
+    can_verify_tp4,
+    verify_full_tp4,
+    verify_swa_tp4,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
@@ -349,7 +354,10 @@ def _muse_verify_attention(
     Sliding layers (2047-token window): split-KV up to 8 requests, GQA-folded
     tiles beyond. Full layers: the two-KV-head kernel (16 Q / 2 KV heads per
     rank, bitwise equal to the GQA-folded and 3D paths), else GQA-folded
-    split-KV from 8 requests. ``kernels`` holds the enabled kernel names.
+    split-KV from 8 requests. With 32 Q / 4 KV heads per rank (TP4), both
+    layer types take verify_tp4 at every batch size when the TP4 switches are
+    on and its layout guard accepts the call. ``kernels`` holds the enabled
+    kernel names.
     """
     num_tokens, num_query_heads, head_size = q.shape
     _, block_size, num_kv_heads, _ = k.shape
@@ -369,6 +377,18 @@ def _muse_verify_attention(
     ):
         return False
     if sliding_window == 2047 and window_size[1] == 0:
+        if (
+            "swa_splitkv" in kernels
+            and "swa_splitkv_tp4" in kernels
+            and can_verify_tp4(
+                q, k, v, out, seqused_k, block_table, k_descale, v_descale
+            )
+        ):
+            verify_swa_tp4(
+                q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
+                window=sliding_window,
+            )  # fmt: skip
+            return True
         # The existing kernels parameterize KV heads and all cache strides.
         # Keep Q16 unchanged; Q32 is an independent opt-in, never a replacement
         # for the global SWA split-KV opt-out. Inner Q/output dimensions are
@@ -431,13 +451,18 @@ def _muse_verify_attention(
         return True
     # The TP4 opt-in is independent of the incumbent TP8 branch above.
     # Both switches are required, and unsupported layouts keep their fallback.
-    if (
-        "full_v2" in kernels
-        and "full_v2_tp4" in kernels
-        and window_size == (-1, -1)
-        and can_gqa_verify_splitkv_4kv(
-            q, k, v, out, seqused_k, block_table, k_descale, v_descale
+    tp4_full = (
+        "full_v2" in kernels and "full_v2_tp4" in kernels and window_size == (-1, -1)
+    )
+    if tp4_full and can_verify_tp4(
+        q, k, v, out, seqused_k, block_table, k_descale, v_descale
+    ):
+        verify_full_tp4(
+            q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale
         )
+        return True
+    if tp4_full and can_gqa_verify_splitkv_4kv(
+        q, k, v, out, seqused_k, block_table, k_descale, v_descale
     ):
         gqa_verify_splitkv_4kv(
             q,
