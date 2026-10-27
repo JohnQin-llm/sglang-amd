@@ -85,6 +85,7 @@ class TestMuseSparkMxfp4Bf16Experts(CustomTestCase):
         }
         loader = SimpleNamespace(
             config=SimpleNamespace(num_local_experts=2),
+            expert_placements={},
             _round_expert_to_mxfp4=self.model_cls._round_expert_to_mxfp4,
         )
         parallel = SimpleNamespace(moe_ep_size=1, moe_ep_rank=0)

@@ -57,8 +57,10 @@ def can_share_router_pooler(moe, x: torch.Tensor) -> bool:
     )
 
 
-def route_with_shared_pooler(moe, x: torch.Tensor):
-    """(top-8 scores, expert ids, normalized expert input) for ``x``; requires ``can_share_router_pooler``."""
+def route_with_shared_pooler(moe, x: torch.Tensor, num_real=None):
+    """(top-8 scores, expert ids, normalized expert input) for ``x``; requires ``can_share_router_pooler``.
+
+    On the joint path, rows from ``num_real`` (device count of real rows) on get expert id -1."""
     m = x.shape[0]
     norm_weight = moe.pre_expert_norm._get_effective_weight()
     if JOINT_ROUTER_POOLER and m in JOINT_ROWS:
@@ -78,6 +80,7 @@ def route_with_shared_pooler(moe, x: torch.Tensor):
             float(moe.router_multiplier),
             float(moe.route_scale),
             float(moe.pre_expert_norm.eps),
+            num_real=num_real,
         )
     key = "shared" if m <= 16 else "shared_completed"
     if key not in _logged:
