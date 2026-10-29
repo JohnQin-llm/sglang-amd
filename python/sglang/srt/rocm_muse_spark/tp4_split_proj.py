@@ -31,6 +31,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.rocm_muse_spark.jit_build import stage_source
+
 logger = logging.getLogger(__name__)
 
 ENABLED = os.environ.get("SGLANG_MUSE_TP4_SPLIT_POOL_UNPOOL", "0") == "1"
@@ -121,17 +123,17 @@ def _extension():
     if _ext is None:
         from torch.utils.cpp_extension import load
 
-        digest = hashlib.sha256(_SOURCE.read_bytes()).hexdigest()
+        source = _SOURCE.read_bytes()
+        digest = hashlib.sha256(source).hexdigest()
         if digest != _SOURCE_SHA256:
             raise ImportError(f"{_SOURCE} has sha256 {digest}, expected {_SOURCE_SHA256}")
-        build = Path(os.environ.get("MUSE_SPLIT_PROJ_BUILD", _SOURCE.parents[1] / "build")) / digest[:16]
-        build.mkdir(parents=True, exist_ok=True)
+        build, staged = stage_source(_SOURCE, source, digest, "MUSE_SPLIT_PROJ_BUILD", "muse_split_gather")
         arch = os.environ.get("PYTORCH_ROCM_ARCH")
         os.environ["PYTORCH_ROCM_ARCH"] = "gfx950"  # the kernels are written for MI355X only
         try:
             _ext = load(
                 name=f"muse_split_gather_{digest[:16]}",
-                sources=[str(_SOURCE)],
+                sources=[str(staged)],
                 extra_cflags=["-O3", "-std=c++20"],
                 extra_cuda_cflags=["-O3", "-std=c++20", "-ffp-contract=off", "--offload-arch=gfx950"],
                 build_directory=str(build),

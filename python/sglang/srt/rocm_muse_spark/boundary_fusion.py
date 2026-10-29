@@ -25,6 +25,8 @@ from pathlib import Path
 
 import torch
 
+from sglang.srt.rocm_muse_spark.jit_build import stage_source
+
 logger = logging.getLogger(__name__)
 
 _SOURCE = Path(__file__).resolve().parent / "csrc" / "muse_ar_fusion.cu"
@@ -53,14 +55,13 @@ def _extension():
         import aiter
 
         include = Path(aiter.__file__).resolve().parents[1] / "csrc" / "include"
-        build = Path(os.environ.get("MUSE_AR_FUSION_BUILD", _SOURCE.parents[1] / "build")) / digest[:16]
-        build.mkdir(parents=True, exist_ok=True)
+        build, staged = stage_source(_SOURCE, source, digest, "MUSE_AR_FUSION_BUILD", "muse_ar_fusion")
         arch = os.environ.get("PYTORCH_ROCM_ARCH")
         os.environ["PYTORCH_ROCM_ARCH"] = "gfx950"  # the kernels are written for MI355X only
         try:
             _ext = load(
                 name=f"muse_ar_fusion_{digest[:16]}",
-                sources=[str(_SOURCE)],
+                sources=[str(staged)],
                 extra_include_paths=[str(include)],
                 extra_cflags=["-O3", "-std=c++20"],
                 extra_cuda_cflags=[
