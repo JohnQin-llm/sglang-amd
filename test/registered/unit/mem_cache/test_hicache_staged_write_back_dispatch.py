@@ -8,6 +8,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.managers import cache_controller as cache_controller_module
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache import l2_transfer as transfer_module
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
@@ -185,8 +186,8 @@ class _FakeDeviceModule:
     Event = _FakeEvent
 
     @staticmethod
-    def Stream():
-        return object()
+    def Stream(priority=0):
+        return mock.Mock(priority=priority)
 
     @staticmethod
     @contextmanager
@@ -1348,6 +1349,49 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
 
         controller.move_indices.assert_called_once()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
+
+    def _fenced_write_controller(self):
+        class FakeHostPool(MHATokenToKVPoolHost):
+            layout = "page_first"
+            can_use_write_back_jit = True
+            size_per_token = 2
+
+            def backup_from_device_all_layer(self, *args):
+                pass
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.write_queue = [CacheOperation(_indices(0, 4), _indices(4, 8), 1)]
+        controller.io_backend = "kernel"
+        controller.mem_pool_host = FakeHostPool.__new__(FakeHostPool)
+        controller.mem_pool_device = None
+        controller.mem_pool_device_allocator = mock.Mock()
+        controller.device = "cuda"
+        controller.ack_write_queue = []
+        controller.write_fence_stream = object()
+        return controller
+
+    def test_rocm_write_through_waits_for_forward_stream(self):
+        for is_hip, waits in ((True, True), (False, False)):
+            controller = self._fenced_write_controller()
+            with mock.patch.object(cache_controller_module, "_is_hip", is_hip):
+                self._start_writing(controller)
+            stream = controller.l2_transfer_engine.device_to_host_stream
+            if waits:
+                stream.wait_stream.assert_called_once_with(
+                    controller.write_fence_stream
+                )
+            else:
+                stream.wait_stream.assert_not_called()
+
+    def test_rocm_copy_streams_have_high_priority(self):
+        for is_hip, priority in ((True, -1), (False, 0)):
+            with (
+                mock.patch.object(transfer_module, "device_module", _FakeDeviceModule),
+                mock.patch.object(transfer_module, "is_hip", return_value=is_hip),
+            ):
+                engine = L2TransferEngine("kernel")
+            self.assertEqual(engine.device_to_host_stream.priority, priority)
+            self.assertEqual(engine.host_to_device_stream.priority, priority)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_hip
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
@@ -54,8 +54,15 @@ class L2TransferEngine:
 
     def __init__(self, io_backend: str):
         self.io_backend = io_backend
-        self.device_to_host_stream = device_module.Stream()
-        self.host_to_device_stream = device_module.Stream()
+        # HIP runs all normal-priority streams on GPU_MAX_HW_QUEUES (default 4)
+        # hardware queues, and streams that share a queue run in submission
+        # order. A backup on the forward stream's queue holds every later forward
+        # until its last page copy (35-89 ms after a prefill on MI355X), and a
+        # load-back there makes the prefill wait for every layer instead of its
+        # first one. High-priority streams get queues of their own.
+        stream_options = {"priority": -1} if is_hip() else {}
+        self.device_to_host_stream = device_module.Stream(**stream_options)
+        self.host_to_device_stream = device_module.Stream(**stream_options)
 
     @staticmethod
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:

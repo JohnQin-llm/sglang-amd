@@ -44,11 +44,12 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_hip
 
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+_is_hip = is_hip()
 
 
 def storage_model_name(
@@ -840,8 +841,11 @@ class HiCacheController:
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
-        if wait_for_forward and self.write_fence_stream is not None:
-            # An evicted SWA page can belong to an unfinished checkpoint.
+        # An evicted SWA page can belong to an unfinished checkpoint. On ROCm the
+        # copy stream has a hardware queue of its own (L2TransferEngine), so
+        # every write waits for the forward work queued so far, as it did when
+        # the two streams shared a queue.
+        if (wait_for_forward or _is_hip) and self.write_fence_stream is not None:
             self.l2_transfer_engine.device_to_host_stream.wait_stream(
                 self.write_fence_stream
             )

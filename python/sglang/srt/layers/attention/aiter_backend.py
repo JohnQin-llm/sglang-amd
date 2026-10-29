@@ -5612,8 +5612,9 @@ class AiterIndicesUpdaterPrefill:
                 self.req_to_token.shape[1],
             )
 
-            token_num = kv_indptr[-1]
-            kv_indices[token_num:] = kv_indices[0]
+            # kv_indptr[-1] is paged_kernel_lens_sum. Slicing at the device value
+            # would block the CPU until the forward stream drains.
+            kv_indices[paged_kernel_lens_sum:] = kv_indices[0]
 
             extend_lens = seq_lens - prefix_lens
 
