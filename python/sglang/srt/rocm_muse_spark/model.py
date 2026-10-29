@@ -69,6 +69,7 @@ from sglang.srt.rocm_muse_spark import (
     mxfp4_moe,
     router_pooler,
     single_layout,
+    split_pool_unpool,
 )
 from sglang.srt.rocm_muse_spark.attention_kv_write import (
     FUSED_QKV_CACHE,
@@ -1028,6 +1029,9 @@ class MuseSpark1xMoE(nn.Module):
         """Router top-k and the expert input (pooler + pre-expert norm) of these rows.
 
         The joint router/pooler gives rows from ``num_real`` on expert id -1."""
+        if target_verify and split_pool_unpool.front_applies(self, hidden_states):
+            # TP4 verify graphs at the split widths: this rank's quarter of the pooler.
+            return split_pool_unpool.route(self, hidden_states, num_real=num_real)
         # The joint router/pooler serves 80..128 rows 5.2-7.9 us faster than the TP4 high-M route.
         if (
             router_pooler.SHARED_ROUTER_POOLER
@@ -1320,6 +1324,26 @@ class MuseSpark1xDecoderLayer(nn.Module):
             if _TP4_VERIFY_PAD_MASK and target_verify and sp is None
             else None
         )
+        if (
+            sp is None
+            and target_verify
+            and self.is_moe_layer
+            and split_pool_unpool.tail_applies(
+                self.mlp, ffn_input, stream, ffn_boundary, pre_norm_dtype
+            )
+        ):
+            # TP4 verify graphs at the split widths: this rank's quarter of the unpool,
+            # the FFN boundary on whole rows.
+            expert_output = self.mlp(
+                ffn_input,
+                skip_post_expert_proj=True,
+                target_verify=target_verify,
+                num_real=num_real,
+            )
+            next_attn_input, stream = split_pool_unpool.unpool_boundary(
+                self.mlp, expert_output, stream, ffn_boundary, pre_norm_dtype
+            )
+            return stream, next_attn_input
         ffn_output = (
             self.mlp(ffn_input, target_verify=target_verify, sp=sp, num_real=num_real)
             if self.is_moe_layer
@@ -2118,6 +2142,7 @@ class MuseSparkTextForCausalLM(single_layout.SingleLayoutStateDictGuard, nn.Modu
             if ensure is not None:
                 ensure(torch.bfloat16)
         fused_collectives.install(get_parallel().tp_group)
+        split_pool_unpool.install(get_parallel().tp_group)
 
 
 __all__ = [

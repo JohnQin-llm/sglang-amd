@@ -1940,6 +1940,10 @@ class Envs:
     # all-reduce, and the attention all-reduce fused with the attention boundary.
     SGLANG_MUSE_TP4_FUSED_FINALIZE_AR = EnvBool(False)
     SGLANG_MUSE_TP4_FUSED_AR_BOUNDARY = EnvBool(False)
+    # TP4 target-verify graphs at 48, 56, 64, 80 and 96 rows: the MoE pooler and
+    # unpool split four ways across the ranks, the slices exchanged in the consuming
+    # kernels.
+    SGLANG_MUSE_TP4_SPLIT_POOL_UNPOOL = EnvBool(False)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )
