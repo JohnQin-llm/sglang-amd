@@ -125,7 +125,8 @@ def _partials_kernel(
     for tile in range(tile_begin, tile_end):
         pos = tile * BLOCK_N + cols
         kv_valid = pos < prefix_len
-        slot = tl.load(kv_indices + kv_start + pos, mask=kv_valid, other=0)
+        # 64-bit: an int32 slot times the slot stride passes 2^31 above 8M slots.
+        slot = tl.load(kv_indices + kv_start + pos, mask=kv_valid, other=0).to(tl.int64)
         k = tl.load(
             K_Cache
             + slot[None, :] * stride_kc_slot

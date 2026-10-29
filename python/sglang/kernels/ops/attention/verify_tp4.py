@@ -70,7 +70,7 @@ def _masked_tile(
     # Keys past the end re-read the last key, so no table entry past the end is read.
     clamped = tl.minimum(position, kv_len - 1)
     kv = (
-        tl.load(table_row + clamped // PAGE) * kv_stride_0
+        tl.load(table_row + clamped // PAGE).to(tl.int64) * kv_stride_0
         + (clamped % PAGE) * kv_stride_1
         + kv_head * 64
     )
@@ -160,7 +160,8 @@ def _split_kv_partials(
                 mask=tile + 1 < inner_end,
                 other=0,
             )
-            kv = pages * kv_stride_0 + in_page
+            # 64-bit: a page number times the page stride passes 2^31 above 8M tokens.
+            kv = pages.to(tl.int64) * kv_stride_0 + in_page
             k = tl.load(K + kv[None, :] + d[:, None])
             v = tl.load(V + kv[:, None] + d[None, :])
             p = tl.exp2(tl.dot(q, k.to(tl.bfloat16)) * scale).to(tl.bfloat16)
@@ -174,7 +175,7 @@ def _split_kv_partials(
             acc = tl.zeros((64, 64), tl.float32)
             for tile in range(inner_begin, inner_end):
                 pages = tl.load(table_row + (first + tile * BN + keys) // PAGE)
-                kv = pages * kv_stride_0 + in_page
+                kv = pages.to(tl.int64) * kv_stride_0 + in_page
                 k = tl.load(K + kv[None, :] + d[:, None])
                 s = tl.dot(q, k.to(tl.bfloat16)) * scale
                 v = tl.load(V + kv[:, None] + d[None, :])
@@ -269,7 +270,6 @@ def can_verify_tp4(q, k, v, out, seqused_k, block_table, k_descale, v_descale) -
         and k.stride() == v.stride()
         and k.stride(3) == 1
         and k.stride(2) == HEAD_DIM
-        and k.shape[0] * k.stride(0) < 2**31  # 32-bit element offsets
         and seqused_k.numel() > 0
         and q.shape[0] == seqused_k.numel() * TOKENS
         and block_table.shape[0] == seqused_k.numel()
