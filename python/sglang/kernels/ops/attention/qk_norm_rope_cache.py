@@ -4,7 +4,8 @@
   Q; the first Q head of each GQA group also normalizes and rotates its K and stores K/V into the FP8 cache
   (optionally through the full -> SWA slot mapping).
 * ``qkv_proj_qk_norm_rope_cache``: the same epilogue fed straight from the BF16 split-K partials of the fused
-  QKV + output-gate projection (``bf16_splitk_gemm``), which also emits V and the gate.
+  QKV + output-gate projection (``bf16_splitk_gemm``), which also emits V and the gate. With ``tile_epilogue``
+  (TP4, up to 48 rows) the last split-K program of each output tile runs the epilogue in the same launch.
 
 The BF16 round trips of the unfused sequence (norm output, query scaling, RoPE products, projection store)
 are explicit, so the results match the separate norm / RoPE / cache-write kernels.
@@ -14,7 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.gemm.bf16_splitk_gemm import _dense_partial
+from sglang.kernels.ops.gemm.bf16_splitk_gemm import _dense_partial, _tile_partial
 
 
 @triton.jit
@@ -167,6 +168,171 @@ def _qkv_epilogue(
                 offset = slot * HK * D + kh * D + d
                 tl.store(KC + offset, k.to(tl.float32) / tl.load(KS))
                 tl.store(VC + offset, v.to(tl.float32) / tl.load(VS))
+
+
+@triton.jit
+def _tile_split_sum(tile, stride, mask, SK: tl.constexpr):
+    """The SK split-K partials of a tile (``stride`` apart), summed in the order
+    _project_slice's tl.sum adds them on gfx950: split s with s + SK / 2, then
+    with s + SK / 4, and so on."""
+    p0 = tl.load(tile, mask=mask, other=0.0)
+    p1 = tl.load(tile + stride, mask=mask, other=0.0)
+    p2 = tl.load(tile + 2 * stride, mask=mask, other=0.0)
+    p3 = tl.load(tile + 3 * stride, mask=mask, other=0.0)
+    if SK == 4:
+        return (p0 + p2) + (p1 + p3)
+    tl.static_assert(SK == 8)
+    p4 = tl.load(tile + 4 * stride, mask=mask, other=0.0)
+    p5 = tl.load(tile + 5 * stride, mask=mask, other=0.0)
+    p6 = tl.load(tile + 6 * stride, mask=mask, other=0.0)
+    p7 = tl.load(tile + 7 * stride, mask=mask, other=0.0)
+    return ((p0 + p4) + (p2 + p6)) + ((p1 + p5) + (p3 + p7))
+
+
+@triton.jit
+def _tile_head_rsqrt(f, eps, BM: tl.constexpr, D: tl.constexpr):
+    """rsqrt(mean(f^2) + eps) of each row of f [BM, 64], summed as _norm_rope's
+    tl.sum adds it on gfx950: per thread fma(c0, c0, c2 c2) + fma(c1, c1, c3 c3)
+    over four adjacent columns, then 16 lanes xor 8, 4, 2, 1."""
+    even, odd = tl.split(tl.reshape(f, (BM, D // 4, 2, 2)))
+    c0, c2 = tl.split(even)
+    c1, c3 = tl.split(odd)
+    t = tl.fma(c0, c0, c2 * c2) + tl.fma(c1, c1, c3 * c3)
+    t = tl.sum(tl.reshape(t, (BM, 2, 8)), axis=1)
+    t = tl.sum(tl.reshape(t, (BM, 2, 4)), axis=1)
+    t = tl.sum(tl.reshape(t, (BM, 2, 2)), axis=1)
+    return tl.rsqrt(tl.sum(t, axis=1) / D + eps)
+
+
+@triton.jit
+def _tile_norm_rope(
+    f,
+    COS,
+    pos,
+    eps,
+    scale,
+    is_query,
+    BM: tl.constexpr,
+    D: tl.constexpr,
+    ROPE: tl.constexpr,
+    COS_STRIDE: tl.constexpr,
+):
+    """_norm_rope on the rows of f [BM, 64], each token at its own position."""
+    d = tl.arange(0, D)
+    value = (
+        (f * _tile_head_rsqrt(f, eps, BM, D)[:, None]).to(tl.bfloat16).to(tl.float32)
+    )
+    if is_query:
+        value = (value * scale).to(tl.bfloat16).to(tl.float32)
+    if ROPE:
+        row = pos[:, None] * COS_STRIDE
+        cosine = tl.load(COS + row + d[None, :] // 2).to(tl.bfloat16).to(tl.float32)
+        sine = (
+            tl.load(COS + row + D // 2 + d[None, :] // 2).to(tl.bfloat16).to(tl.float32)
+        )
+        other = tl.reshape(tl.flip(tl.reshape(value, (BM, D // 2, 2)), 2), (BM, D))
+        rotated = tl.where((d % 2 == 0)[None, :], -other, other)
+        first = (value * cosine).to(tl.bfloat16).to(tl.float32)
+        second = (rotated * sine).to(tl.bfloat16).to(tl.float32)
+        value = first + second
+    return value.to(tl.bfloat16)
+
+
+@triton.jit
+def _tile_cache_store(
+    CACHE, SCALE, slot, kv_head, value, HK: tl.constexpr, D: tl.constexpr
+):
+    """Rows of ``value`` [BM, 64] into the FP8 cache of KV head ``kv_head``; slot -1 is skipped."""
+    d = tl.arange(0, D)
+    tl.store(
+        CACHE + slot[:, None] * HK * D + kv_head * D + d[None, :],
+        value.to(tl.float32) / tl.load(SCALE),
+        mask=(slot >= 0)[:, None],
+    )
+
+
+@triton.jit
+def _qkv_tile_epilogue(
+    X,
+    W,
+    P,
+    TICKETS,
+    POS,
+    COS,
+    LOC,
+    MAP,
+    KC,
+    VC,
+    QO,
+    KO,
+    VO,
+    GO,
+    KS,
+    VS,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BK: tl.constexpr,
+    SK: tl.constexpr,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    EPS: tl.constexpr,
+    SCALE: tl.constexpr,
+    ROPE: tl.constexpr,
+    HAS_MAP: tl.constexpr,
+    COS_STRIDE: tl.constexpr,
+):
+    """_dense_partial + _qkv_epilogue in one launch, bitwise equal to them. Each
+    program stores one split-K partial of a BM x 64 tile, which is one Q, K, V or
+    gate head of BM tokens; the tile's last program to finish sums the partials and
+    runs the epilogue for that head.
+
+    The partials are written through to memory and drained by the barrier before a
+    relaxed ticket, and the last program's acquire invalidates its cached copies
+    before it reads them. A first version with a release ticket (an L2 writeback in
+    every program) and volatile reads took 35 instead of 18 us at 8 rows.
+    """
+    D: tl.constexpr = 64
+    pn, pm, pk = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    token = pm * BM + tl.arange(0, BM)
+    live = token < M
+    d = tl.arange(0, D)
+    col = pn * D + d
+    acc = _tile_partial(X, W, pn, pm, pk, M, K, BM, D, BK, SK, ".cg")
+    tile = P + token[:, None] * N + col[None, :]
+    tl.store(tile + pk * M * N, acc, mask=live[:, None], cache_modifier=".wt")
+    tl.debug_barrier()
+    ticket = TICKETS + pm * (N // D) + pn
+    if tl.atomic_add(ticket, 1, sem="relaxed", scope="gpu") == SK - 1:
+        tl.atomic_xchg(ticket, 0, sem="acquire", scope="gpu")  # for the next launch
+        value = _tile_split_sum(tile, M * N, live[:, None], SK).to(tl.bfloat16)
+        if pn < HQ + HK:  # Q or K: norm, query scale, RoPE
+            pos = tl.load(POS + token, mask=live, other=0)
+            is_query = pn < HQ
+            value = value.to(tl.float32)
+            value = _tile_norm_rope(
+                value, COS, pos, EPS, SCALE, is_query, BM, D, ROPE, COS_STRIDE
+            )
+        if pn < HQ:
+            out = QO + token[:, None] * HQ * D + pn * D + d[None, :]
+            tl.store(out, value, mask=live[:, None])
+        elif pn < HQ + 2 * HK:
+            kv_head = (pn - HQ) % HK
+            slot = tl.load(LOC + token, mask=live, other=-1).to(tl.int64)
+            if HAS_MAP:
+                mapped = tl.load(MAP + tl.maximum(slot, 0), mask=slot >= 0, other=-1)
+                slot = tl.where(slot >= 0, mapped.to(tl.int64), -1)
+            row = token[:, None] * HK * D + kv_head * D + d[None, :]
+            if pn < HQ + HK:
+                tl.store(KO + row, value, mask=live[:, None])
+                _tile_cache_store(KC, KS, slot, kv_head, value, HK, D)
+            else:
+                tl.store(VO + row, value, mask=live[:, None])
+                _tile_cache_store(VC, VS, slot, kv_head, value, HK, D)
+        else:
+            out = GO + token[:, None] * HQ * D + (pn - HQ - 2 * HK) * D + d[None, :]
+            tl.store(out, value, mask=live[:, None])
 
 
 @triton.jit
@@ -363,6 +529,22 @@ def projection_tile(m: int, num_q_heads: int):
     return None
 
 
+# TP4 rows the single-launch epilogue serves; at 56 rows it saves nothing.
+TILE_EPILOGUE_MAX_ROWS = 48
+# One ticket per output tile of a tile-epilogue launch (72 column tiles of the TP4
+# projection, at most three row blocks), per device. Every launch leaves them at
+# zero. The first call compiles the kernel, so it runs outside graph capture.
+_TILE_TICKETS = 72 * 3
+_tile_tickets: dict = {}
+
+
+def _tile_epilogue_launch(m: int):
+    """The projection tile at ``m`` rows, on 8 warps where block M is 32: the last
+    program's 32 x 64 epilogue then takes 0.9 us less."""
+    split_k, block_n, block_m, warps = projection_tile(m, 32)
+    return split_k, block_n, block_m, 8 if block_m == 32 else warps
+
+
 def qkv_proj_qk_norm_rope_cache(
     x,
     weight,
@@ -379,23 +561,76 @@ def qkv_proj_qk_norm_rope_cache(
     *,
     num_q_heads=16,
     num_kv_heads=2,
+    tile_epilogue=False,
 ):
     """Fused QKV + gate projection of ``x`` [M, 8192] (M <= max of ``PROJECTION_TILES``) with the QK-norm /
     RoPE / FP8-cache epilogue.
 
     Supports Muse TP8 (Q16/KV2) and TP4 (Q32/KV4). Returns BF16 Q, K, V
     and gate with the corresponding local head counts and head dimension 64.
+    ``tile_epilogue`` (TP4, M <= ``TILE_EPILOGUE_MAX_ROWS``) runs the epilogue in
+    the projection launch, with the same results.
     """
     m, k = x.shape
     hq, hk = num_q_heads, num_kv_heads
     assert (hq, hk) in ((16, 2), (32, 4))
     n = 2 * (hq + hk) * 64
-    split_k, block_n, block_m, warps = projection_tile(m, hq)
     assert k == 8192 and weight.shape == (n, 8192)
     assert x.dtype == weight.dtype == torch.bfloat16
     assert x.is_contiguous() and weight.is_contiguous()
     assert cache_k.dtype == cache_v.dtype == torch.float8_e4m3fn
     assert cache_k.is_contiguous() and cache_v.is_contiguous()
+    qo = torch.empty((m, hq * 64), device=x.device, dtype=torch.bfloat16)
+    ko = torch.empty((m, hk * 64), device=x.device, dtype=torch.bfloat16)
+    vo = torch.empty_like(ko)
+    go = torch.empty_like(qo)
+    if tile_epilogue:
+        assert hq == 32 and m <= TILE_EPILOGUE_MAX_ROWS
+        split_k, block_n, block_m, warps = _tile_epilogue_launch(m)
+        assert block_n == 64
+        grid = (n // 64, triton.cdiv(m, block_m), split_k)
+        assert grid[0] * grid[1] <= _TILE_TICKETS
+        tickets = _tile_tickets.get(x.device)
+        if tickets is None:
+            tickets = torch.zeros(_TILE_TICKETS, device=x.device, dtype=torch.int32)
+            _tile_tickets[x.device] = tickets
+        partials = torch.empty((split_k, m, n), device=x.device, dtype=torch.float32)
+        _qkv_tile_epilogue[grid](
+            x,
+            weight,
+            partials,
+            tickets,
+            positions,
+            cos_sin,
+            locations,
+            mapping,
+            cache_k,
+            cache_v,
+            qo,
+            ko,
+            vo,
+            go,
+            k_scale,
+            v_scale,
+            m,
+            n,
+            k,
+            block_m,
+            128,
+            split_k,
+            hq,
+            hk,
+            float(eps),
+            float(q_scale),
+            cos_sin is not None,
+            mapping is not None,
+            cos_sin.stride(0) if cos_sin is not None else 64,
+            num_warps=warps,
+            num_stages=2,
+            matrix_instr_nonkdim=16,
+        )
+        return qo, ko, vo, go
+    split_k, block_n, block_m, warps = projection_tile(m, hq)
     partials = torch.empty((split_k, m, n), device=x.device, dtype=torch.float32)
     _dense_partial[(n // block_n, triton.cdiv(m, block_m), split_k)](
         x,
@@ -413,10 +648,6 @@ def qkv_proj_qk_norm_rope_cache(
         num_stages=2,
         matrix_instr_nonkdim=16,
     )
-    qo = torch.empty((m, hq * 64), device=x.device, dtype=torch.bfloat16)
-    ko = torch.empty((m, hk * 64), device=x.device, dtype=torch.bfloat16)
-    vo = torch.empty_like(ko)
-    go = torch.empty_like(qo)
     _qkv_epilogue[(m, hq)](
         partials,
         positions,

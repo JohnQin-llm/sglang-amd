@@ -21,6 +21,7 @@ from typing import NamedTuple
 import torch
 
 from sglang.kernels.ops.attention.qk_norm_rope_cache import (
+    TILE_EPILOGUE_MAX_ROWS,
     projection_tile,
     qk_norm_rope_cache,
     qkv_proj_qk_norm_rope_cache,
@@ -36,6 +37,7 @@ QK_ROPE_CACHE = envs.SGLANG_MUSE_QK_ROPE_CACHE.get()
 FUSED_QKV_CACHE = envs.SGLANG_MUSE_FUSED_QKV_CACHE.get()
 TP4_QK_ROPE_CACHE = envs.SGLANG_MUSE_TP4_QK_ROPE_CACHE.get()
 TP4_FUSED_QKV_CACHE = envs.SGLANG_MUSE_TP4_FUSED_QKV_CACHE.get()
+TP4_QKV_TILE_EPILOGUE = envs.SGLANG_MUSE_TP4_QKV_TILE_EPILOGUE.get()
 _logged: set = set()
 
 
@@ -170,6 +172,9 @@ def qkv_proj_norm_rope_kv_write(
         target.v_scale,
         num_q_heads=attention.num_heads,
         num_kv_heads=attention.num_kv_heads,
+        tile_epilogue=TP4_QKV_TILE_EPILOGUE
+        and attention.num_heads == 32
+        and x.shape[0] <= TILE_EPILOGUE_MAX_ROWS,
     )
 
 

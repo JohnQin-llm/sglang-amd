@@ -1896,6 +1896,8 @@ class Envs:
     SGLANG_MUSE_VERIFY_FULL_V2 = EnvBool(True)
     # Experimental TP4/EP4 Q32/KV4 full verify; also requires FULL_V2 above.
     SGLANG_MUSE_TP4_VERIFY_FULL_V2 = EnvBool(False)
+    # The TP4 verify split merge also applies the attention output norm and gate.
+    SGLANG_MUSE_TP4_VERIFY_OUTPUT_GATE = EnvBool(False)
     SGLANG_MUSE_VERIFY_FULL_GQA = EnvBool(True)
     # Triton extend: DFlash draft block (8 x 8 heads, 1 KV head, HD128) split-KV.
     SGLANG_MUSE_DFLASH_SPLITKV = EnvBool(True)
@@ -1912,6 +1914,9 @@ class Envs:
     # Opt-in Q32/KV4 variants; TP8 retains its existing Q16/KV2 dispatch.
     SGLANG_MUSE_TP4_FUSED_QKV_CACHE = EnvBool(False)
     SGLANG_MUSE_TP4_QK_ROPE_CACHE = EnvBool(False)
+    # TP4 fused QKV projection up to 48 rows: the last split-K program of each
+    # output tile runs the QK-norm / RoPE / FP8 cache epilogue.
+    SGLANG_MUSE_TP4_QKV_TILE_EPILOGUE = EnvBool(False)
     SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY = EnvBool(True)
     SGLANG_MUSE_COMPACT_A4_VERIFY = EnvBool(True)
     # Experimental TP4/EP4, E64 verify: M8..64 by 8, plus M80/96/112/128.

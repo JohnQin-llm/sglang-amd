@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.attention.verify_tp4 import OutputNormGate
 from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import LAYOUT as TILED_GEMM_LAYOUT
 from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
     prepare_tiled_weight,
@@ -44,6 +45,7 @@ from sglang.srt.configs.muse_spark import (
 )
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -62,6 +64,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.rocm_muse_spark import (
     ep4_placement,
@@ -333,6 +336,7 @@ _tgemm = None
 # split-K GEMM (configs in kernels/ops/gemm/configs).
 _DENSE_TUNED = envs.SGLANG_MUSE_DENSE_TUNED.get()
 _TP4_VERIFY_ROUTER_POOLER = envs.SGLANG_MUSE_TP4_VERIFY_ROUTER_POOLER.get()
+_TP4_VERIFY_OUTPUT_GATE = envs.SGLANG_MUSE_TP4_VERIFY_OUTPUT_GATE.get()
 # Tiled 17..64-row GEMMs: the pooler here, unquantized linear layers through
 # register_gfx950_unquantized_gemm_shapes (the O projection, the DFlash draft MLP).
 _DENSE_TILED = envs.SGLANG_MUSE_DENSE_TILED.get()
@@ -626,10 +630,36 @@ class MuseSpark1xAttention(nn.Module):
             )
             kv_written = fused_qk is not None
             q, k = fused_qk if kv_written else self.qk_norm_rope(positions, q, k)
-        output = self.attn(q, k, v, forward_batch, save_kv_cache=not kv_written)
-        output = self._fused_o_norm_gate.forward(output, o_gate)
+        output_gate = self._verify_output_gate(o_gate, forward_batch)
+        if output_gate is None:
+            output = self.attn(q, k, v, forward_batch, save_kv_cache=not kv_written)
+        else:
+            output = self.attn(
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=not kv_written,
+                output_gate=output_gate,
+            )
+        if output_gate is None or not output_gate.applied:
+            output = self._fused_o_norm_gate.forward(output, o_gate)
         output, _ = self.o_proj(output, skip_all_reduce=not reduce)
         return output
+
+    def _verify_output_gate(self, o_gate, forward_batch: ForwardBatch):
+        """The output norm and gate for the aiter backend's TP4 verify merge to
+        apply, or None to keep the separate kernel."""
+        if not (
+            _TP4_VERIFY_OUTPUT_GATE
+            and o_gate is not None
+            and self._o_norm_module is not None
+            and not self._o_norm_module.has_weight
+            and forward_batch.forward_mode.is_target_verify()
+            and isinstance(get_attn_backend(), AiterAttnBackend)
+        ):
+            return None
+        return OutputNormGate(o_gate, self._o_norm_module.eps)
 
 
 class MuseSpark1xMLP(nn.Module):

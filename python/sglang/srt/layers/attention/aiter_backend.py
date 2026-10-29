@@ -347,6 +347,7 @@ def _muse_verify_attention(
     v_descale,
     sinks,
     kernels,
+    output_gate=None,
 ) -> bool:
     """Muse Spark target verify (8 tokens x GQA 8, head_dim 64, FP8 KV in 16-token
     pages) on the verify kernels; False leaves the call to unified_attention.
@@ -357,7 +358,8 @@ def _muse_verify_attention(
     split-KV from 8 requests. With 32 Q / 4 KV heads per rank (TP4), both
     layer types take verify_tp4 at every batch size when the TP4 switches are
     on and its layout guard accepts the call. ``kernels`` holds the enabled
-    kernel names.
+    kernel names. ``output_gate`` (``verify_tp4.OutputNormGate``) is applied by
+    the verify_tp4 kernels when they can; they mark it applied.
     """
     num_tokens, num_query_heads, head_size = q.shape
     _, block_size, num_kv_heads, _ = k.shape
@@ -386,7 +388,7 @@ def _muse_verify_attention(
         ):
             verify_swa_tp4(
                 q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
-                window=sliding_window,
+                window=sliding_window, output_gate=output_gate,
             )  # fmt: skip
             return True
         # The existing kernels parameterize KV heads and all cache strides.
@@ -458,7 +460,16 @@ def _muse_verify_attention(
         q, k, v, out, seqused_k, block_table, k_descale, v_descale
     ):
         verify_full_tp4(
-            q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale
+            q,
+            k,
+            v,
+            out,
+            seqused_k,
+            block_table,
+            softmax_scale,
+            k_descale,
+            v_descale,
+            output_gate=output_gate,
         )
         return True
     if tp4_full and can_gqa_verify_splitkv_4kv(
@@ -4261,6 +4272,7 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        output_gate=None,
     ):
         self.logits_soft_cap = layer.logit_cap
 
@@ -4803,6 +4815,7 @@ class AiterAttnBackend(AttentionBackend):
                             v_descale,
                             sinks,
                             self.muse_verify_kernels,
+                            output_gate,
                         )
                     ):
                         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)

@@ -12,6 +12,37 @@ import triton.language as tl
 
 
 @triton.jit
+def _tile_partial(
+    X,
+    W,
+    pn,
+    pm,
+    pk,
+    M: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    SK: tl.constexpr,
+    CACHE: tl.constexpr,
+):
+    """FP32 partial of output tile (pm, pn) over K slice pk."""
+    m = pm * BM + tl.arange(0, BM)
+    n = pn * BN + tl.arange(0, BN)
+    k = pk * (K // SK) + tl.arange(0, BK)
+    ap = X + m[:, None] * K + k[None, :]
+    bp = W + n[None, :] * K + k[:, None]
+    acc = tl.zeros((BM, BN), tl.float32)
+    for _ in range(K // SK // BK):
+        a = tl.load(ap, m[:, None] < M, other=0)
+        b = tl.load(bp, cache_modifier=CACHE)
+        acc = tl.dot(a, b, acc)
+        ap += BK
+        bp += BK
+    return acc
+
+
+@triton.jit
 def _dense_partial(
     X,
     W,
@@ -26,18 +57,9 @@ def _dense_partial(
     CACHE: tl.constexpr,
 ):
     pn, pm, pk = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    acc = _tile_partial(X, W, pn, pm, pk, M, K, BM, BN, BK, SK, CACHE)
     m = pm * BM + tl.arange(0, BM)
     n = pn * BN + tl.arange(0, BN)
-    k = pk * (K // SK) + tl.arange(0, BK)
-    ap = X + m[:, None] * K + k[None, :]
-    bp = W + n[None, :] * K + k[:, None]
-    acc = tl.zeros((BM, BN), tl.float32)
-    for _ in range(K // SK // BK):
-        a = tl.load(ap, m[:, None] < M, other=0)
-        b = tl.load(bp, cache_modifier=CACHE)
-        acc = tl.dot(a, b, acc)
-        ap += BK
-        bp += BK
     tl.store(P + pk * M * N + m[:, None] * N + n[None, :], acc, m[:, None] < M)
 
 

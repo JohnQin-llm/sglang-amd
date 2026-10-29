@@ -18,7 +18,12 @@ tile, and batch 16 from 214 to 192 us. The result is exact while the row sums st
 inside [1e-30, 1e30]; a program whose sums leave that range recomputes its
 interior tiles with an online maximum. Tiles on a mask edge (the causal end, the
 end of the KV, the left edge of a window) always use the online maximum.
+
+Given the attention's output gate (``OutputNormGate``), the merge also applies the
+output norm and sigmoid gate, so the model skips its separate norm-gate kernel.
 """
+
+from dataclasses import dataclass
 
 import torch
 import triton
@@ -28,6 +33,17 @@ TOKENS = 8  # verify tokens per request
 HEAD_DIM = 64
 PAGE = 16  # KV cache page size in tokens
 TILE = 64  # keys per tile, a multiple of PAGE
+
+
+@dataclass
+class OutputNormGate:
+    """The attention output's weightless per-head RMS norm and sigmoid gate, for the
+    split merge to apply. ``gate`` is [tokens, heads x 64] BF16 with unit inner
+    stride; the verify call sets ``applied`` when its merge applied both."""
+
+    gate: torch.Tensor
+    eps: float
+    applied: bool = False
 
 
 @triton.jit
@@ -200,13 +216,33 @@ def _split_kv_partials(
 
 
 @triton.jit
+def _head_sum_of_squares(x, num_tokens):
+    """sum(x * x) of one 64-wide head row in the order FusedRMSNormGate's Triton
+    kernel adds it on gfx950, so the gated merge is bitwise equal to it: each lane
+    adds its two columns' squares, then lanes xor 16, 8, 4, 2, 1. The always-true
+    runtime mask keeps the two products unfused, as that kernel's row mask does."""
+    squares = tl.where(tl.program_id(0) < num_tokens, x * x, 0.0)
+    even, odd = tl.split(tl.reshape(squares, (32, 2)))
+    t = even + odd
+    t = tl.sum(tl.reshape(t, (2, 16)), axis=0)
+    t = tl.sum(tl.reshape(t, (2, 8)), axis=0)
+    t = tl.sum(tl.reshape(t, (2, 4)), axis=0)
+    t = tl.sum(tl.reshape(t, (2, 2)), axis=0)
+    return tl.sum(t, axis=0)
+
+
+@triton.jit
 def _merge_splits(
     PARTIAL,
     LSE,
     OUT,
     V_SCALE,
+    GATE,
     o_stride_0,
     o_stride_1,
+    gate_stride,
+    eps,
+    num_tokens,
     HEADS: tl.constexpr,
     SPLITS: tl.constexpr,
     SPLITS_POW2: tl.constexpr,
@@ -226,6 +262,13 @@ def _merge_splits(
     out = out / tl.sum(weight, axis=0)
     if V_SCALE is not None:
         out *= tl.load(V_SCALE)
+    if GATE is not None:
+        # The output norm and gate on the BF16 merged row, as the model's
+        # FusedRMSNormGate computes them.
+        out = out.to(tl.bfloat16).to(tl.float32)
+        rstd = 1.0 / tl.sqrt(_head_sum_of_squares(out, num_tokens) / 64 + eps)
+        gate = tl.load(GATE + token * gate_stride + head * 64 + d).to(tl.float32)
+        out = out * rstd * tl.sigmoid(gate)
     tl.store(OUT + token * o_stride_0 + head * o_stride_1 + d, out)
 
 
@@ -293,6 +336,17 @@ def can_verify_tp4(q, k, v, out, seqused_k, block_table, k_descale, v_descale) -
     )
 
 
+def _can_apply_output_gate(out, output_gate) -> bool:
+    gate = output_gate.gate
+    return (
+        gate.ndim == 2
+        and gate.dtype == torch.bfloat16
+        and gate.device == out.device
+        and gate.shape == (out.shape[0], out.shape[1] * HEAD_DIM)
+        and gate.stride(1) == 1
+    )
+
+
 def _launch(
     q,
     k,
@@ -307,6 +361,7 @@ def _launch(
     window,
     splits,
     num_warps,
+    output_gate,
 ):
     heads, kv_heads = q.shape[1], k.shape[2]
     partial = torch.empty(
@@ -325,17 +380,33 @@ def _launch(
         work, heads, PAGE, splits, float(softmax_scale), window, TILE,
         num_warps=num_warps, num_stages=2, matrix_instr_nonkdim=16,
     )  # fmt: skip
+    gate, gate_stride, eps = None, 0, 0.0
+    if output_gate is not None and _can_apply_output_gate(out, output_gate):
+        gate, eps = output_gate.gate, output_gate.eps
+        gate_stride = gate.stride(0)
+        output_gate.applied = True
     _merge_splits[(q.shape[0], heads)](
-        partial, lse, out, v_descale, out.stride(0), out.stride(1),
-        heads, splits, triton.next_power_of_2(splits), num_warps=1,
+        partial, lse, out, v_descale, gate, out.stride(0), out.stride(1), gate_stride,
+        float(eps), q.shape[0], heads, splits, triton.next_power_of_2(splits), num_warps=1,
     )  # fmt: skip
     return out
 
 
 def verify_full_tp4(
-    q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale
+    q,
+    k,
+    v,
+    out,
+    seqused_k,
+    block_table,
+    softmax_scale,
+    k_descale,
+    v_descale,
+    *,
+    output_gate=None,
 ):
-    """Full-attention verify into ``out``; the caller checks ``can_verify_tp4``."""
+    """Full-attention verify into ``out``; the caller checks ``can_verify_tp4``.
+    ``output_gate`` (``OutputNormGate``) is applied when its layout allows."""
     return _launch(
         q,
         k,
@@ -349,6 +420,7 @@ def verify_full_tp4(
         window=0,
         splits=_full_splits(seqused_k.numel()),
         num_warps=1,
+        output_gate=output_gate,
     )
 
 
@@ -364,9 +436,11 @@ def verify_swa_tp4(
     v_descale,
     *,
     window=2047,
+    output_gate=None,
 ):
     """Sliding-window verify into ``out``; ``window`` counts the keys a query sees,
-    its own position included. The caller checks ``can_verify_tp4``."""
+    its own position included. The caller checks ``can_verify_tp4``.
+    ``output_gate`` (``OutputNormGate``) is applied when its layout allows."""
     # Four warps split the 64 rows of the short window programs (batch 8: 13.5 us,
     # 21.2 us with one warp).
     return _launch(
@@ -382,4 +456,5 @@ def verify_swa_tp4(
         window=window,
         splits=_window_splits(seqused_k.numel()),
         num_warps=4,
+        output_gate=output_gate,
     )

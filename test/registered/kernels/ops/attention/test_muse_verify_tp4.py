@@ -1,5 +1,6 @@
 """TP4 Muse Spark target-verify attention (verify_full_tp4 / verify_swa_tp4)
-against an FP32 reference over the same FP8 KV cache."""
+against an FP32 reference over the same FP8 KV cache, and the merge with the
+attention output norm and gate against the model's separate kernel."""
 
 import math
 import random
@@ -19,6 +20,9 @@ SCALE = HEAD_DIM**-0.5
 # Page index written past each request's last page; reading it would fault.
 OUT_OF_RANGE_PAGE = 10**7
 LAYERS = {"full": 0, "swa": WINDOW}
+EPS = 1e-5  # Muse Spark rms_norm_eps
+# Verify graph widths: batch 1..8, then even batches to 16.
+BATCHES = (1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16)
 
 
 def make_inputs(lens, seed, q_mult=1.0, k_mult=1.0, total_pages=None, aligned=False):
@@ -81,17 +85,38 @@ class TestMuseVerifyTp4(CustomTestCase):
 
         cls.ops = verify_tp4
 
-    def launch(self, layer, q, k, v, out, lens, table, k_descale, v_descale):
+    def launch(
+        self, layer, q, k, v, out, lens, table, k_descale, v_descale, output_gate=None
+    ):
         self.assertTrue(
             self.ops.can_verify_tp4(q, k, v, out, lens, table, k_descale, v_descale)
         )
         if layer == "full":
             self.ops.verify_full_tp4(
-                q, k, v, out, lens, table, SCALE, k_descale, v_descale
+                q,
+                k,
+                v,
+                out,
+                lens,
+                table,
+                SCALE,
+                k_descale,
+                v_descale,
+                output_gate=output_gate,
             )
         else:
             self.ops.verify_swa_tp4(
-                q, k, v, out, lens, table, SCALE, k_descale, v_descale, window=WINDOW
+                q,
+                k,
+                v,
+                out,
+                lens,
+                table,
+                SCALE,
+                k_descale,
+                v_descale,
+                window=WINDOW,
+                output_gate=output_gate,
             )
 
     def run_layer(self, layer, q, k, v, lens, table, k_scale=1.0, v_scale=1.0):
@@ -190,6 +215,104 @@ class TestMuseVerifyTp4(CustomTestCase):
                     reference(q, k, v, s, t, window, 1.0, 1.0),
                     f"{layer} replay {name}",
                 )
+
+    def separate_norm_gate(self, out, gate):
+        """The model's output norm and gate kernel on the merged output."""
+        from sglang.srt.rocm_muse_spark.fused_norm_gate import FusedRMSNormGate
+        from sglang.srt.rocm_muse_spark.layers import MuseSpark1xRMSNorm
+
+        norm = MuseSpark1xRMSNorm(HEAD_DIM, eps=EPS, has_weight=False)
+        op = FusedRMSNormGate(norm, True, HEAD_DIM)
+        return op.forward_triton(out.view(out.shape[0], -1), gate)
+
+    @staticmethod
+    def projection_gate(tokens, seed):
+        """The output gate as the QKV projection leaves it: its last 2048 columns."""
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        qkv = torch.randn(
+            tokens, 4608, generator=g, device="cuda", dtype=torch.bfloat16
+        )
+        return qkv[:, -Q_HEADS * HEAD_DIM :]
+
+    def test_output_gate_matches_separate_kernel(self):
+        """At every verify graph width, merge + norm + gate in one kernel is bitwise
+        equal to the merge followed by the model's norm-gate kernel. Batch 1 with a
+        short context leaves most splits empty."""
+        rng = random.Random(1)
+        pool = [9, 100, 2047, 2056, 5000, 70000, 131072]
+        for layer in LAYERS:
+            for bs in BATCHES:
+                lens = [rng.choice(pool) for _ in range(bs)]
+                if bs == 1:
+                    lens = [100]
+                q, k, v, s, t = make_inputs(lens, seed=10 + bs)
+                gate = self.projection_gate(q.shape[0], seed=bs)
+                with self.subTest(layer=layer, lens=lens):
+                    expected = self.separate_norm_gate(
+                        self.run_layer(layer, q, k, v, s, t, 0.5, 0.25), gate
+                    )
+                    out = torch.full_like(q, float("nan"))
+                    output_gate = self.ops.OutputNormGate(gate, EPS)
+                    scales = [torch.tensor([x], device="cuda") for x in (0.5, 0.25)]
+                    self.launch(layer, q, k, v, out, s, t, *scales, output_gate)
+                    self.assertTrue(output_gate.applied)
+                    self.assertTrue(torch.equal(out.view(q.shape[0], -1), expected))
+
+    def test_output_gate_layout_guard(self):
+        """A gate the merge cannot read is left to the model: the merge output is
+        unchanged and the gate is not marked applied."""
+        q, k, v, s, t = make_inputs([3000, 64], seed=5)
+        gate = self.projection_gate(q.shape[0], seed=5)
+        rejected = {
+            "column-major": gate.t().contiguous().t(),
+            "FP32": gate.float(),
+            "head-grouped": gate.reshape(q.shape[0], 4, -1),
+        }
+        for layer in LAYERS:
+            plain = self.run_layer(layer, q, k, v, s, t)
+            for name, bad in rejected.items():
+                with self.subTest(layer=layer, gate=name):
+                    out = torch.full_like(q, float("nan"))
+                    output_gate = self.ops.OutputNormGate(bad, EPS)
+                    one = torch.ones(1, device="cuda")
+                    self.launch(layer, q, k, v, out, s, t, one, one, output_gate)
+                    self.assertFalse(output_gate.applied)
+                    self.assertTrue(torch.equal(out, plain))
+
+    def test_output_gate_graph_replay(self):
+        """A captured gated call reads the gate and attention inputs at replay time."""
+        lens_a, lens_b = [5000, 64, 131, 70000], [69999, 9, 4100, 2055]
+        total = sum(math.ceil(n / PAGE) for n in lens_a + lens_b) + 64
+        for layer in LAYERS:
+            a = make_inputs(lens_a, 303, total_pages=total)
+            b = make_inputs(lens_b, 404, total_pages=total)
+            gates = {"A": self.projection_gate(32, 1), "B": self.projection_gate(32, 2)}
+            q, k, v, s = (x.clone() for x in a[:4])
+            width = max(a[4].shape[1], b[4].shape[1])
+            t = torch.zeros(len(lens_a), width, dtype=torch.int32, device="cuda")
+            t[:, : a[4].shape[1]] = a[4]
+            gate = gates["A"].clone()
+            out = torch.empty_like(q)
+            one = torch.ones(1, device="cuda")
+            output_gate = self.ops.OutputNormGate(gate, EPS)
+            self.launch(layer, q, k, v, out, s, t, one, one, output_gate)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self.launch(layer, q, k, v, out, s, t, one, one, output_gate)
+            for name, src in (("A", a), ("B", b), ("A", a)):
+                for dst, x in zip((q, k, v, s), src[:4]):
+                    dst.copy_(x)
+                t.zero_()
+                t[:, : src[4].shape[1]] = src[4]
+                gate.copy_(gates[name])
+                out.fill_(float("nan"))
+                graph.replay()
+                expected = self.separate_norm_gate(
+                    self.run_layer(layer, *src), gates[name]
+                )
+                with self.subTest(layer=layer, replay=name):
+                    self.assertTrue(torch.equal(out.view(32, -1), expected))
 
     def test_guard_rejects_other_layouts(self):
         """Layouts the kernels do not handle stay on the existing verify paths."""
