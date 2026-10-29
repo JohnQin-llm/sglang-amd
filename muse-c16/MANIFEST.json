@@ -4,33 +4,65 @@
   "commit": "93406f598d109f1991c34ac9e938dad51c05c34b",
   "source": "official Muse1020 source: the sglang tree of image muse-spark-open-agentx-c0ee5d27 (SGLANG_IMAGE_REVISION c0ee5d27fd9dfb9da6b9c91ec070bff794449a19)"
  },
- "checked_commit": "fb481a33a0149062ca399d1d383f0d301d5283a1",
+ "checked_commit": "913fdd62a21ad58bf2b93c85b6e63284681a23b4",
  "runtime": {
   "stack": "kernelforge/c16-claude/stacks/hour-f7183a59.json (manifest_sha256 f7183a59)",
   "overrides": "kernelforge/c16-claude/kv-int64/overrides.json (sha256 8223b4fc); parents kv-capacity, f1-native, k2-lowm, small-kernels, draft-fuse, bundle-v8p, bundle-v7s, bundle-v7, bundle-v6",
   "aiter": "image aiter at AITER_COMMIT 4ad99832823dde2315b361cbd3b54b1c5c12acd5 with the node's local edits; launch_server.sh applies the overlay and checks the pinned files below by sha256"
  },
  "check": {
-  "status": "partial: override-map arm only",
-  "run": "g01 2026-10-29 06:44-06:51 UTC: override-map arm of the C16 equivalence A/B, startup and about 3 min of C16 load before the node was reclaimed",
+  "status": "complete",
+  "run": "pit2-p03-g23 20261029-1228-v11-stack-ab-g23: one 600 s C16 per arm",
   "method": "sys.modules origins and opened files of every server process (audit hook), from probe.py dumps",
   "maps_arm": {
    "processes": 10,
-   "sglang_modules": 1820,
-   "aiter_modules": 231
+   "sglang_modules": 1822,
+   "aiter_modules": 236
   },
   "results": [
    "63 sglang modules loaded from override paths: each byte-equal to its branch file, except the 2 JIT loaders, which build in a local cache instead of next to their source",
-   "1757 of 1757 sglang modules loaded from the image: byte-equal to base 93406f5 and unchanged by the branch",
+   "1759 of 1759 sglang modules loaded from the image: byte-equal to base 93406f5 and unchanged by the branch",
    "data files (JIT sources, tuned GEMM rows, aiter overlay): byte-equal to the branch copies",
    "NFS writes by the override-map run: 0. It read the hipify outputs next to the NFS sources (2 .hip files); the branch builds them in the local JIT cache instead",
-   "launch_server.sh c16 (preflight on g01 GPU 4, 06:27 UTC) gives the override-map run's server argv exactly; every SGLANG_/MUSE_/AITER_ variable it sets has the override-map run's value, except that AITER_CONFIG_GEMM_BF16 names the TP4 QKV tuned GEMM rows at their branch path (same bytes). The override-map run's other variables are its harness (stack, overrides, probe, build directories) or set at runtime by sglang (muse_spark_hook, serving_hook, engine) and aiter"
+   "server argv: the branch run's launch_server.sh c16 arguments give the same flag/value map as the override-map run (the branch repeats two flags with equal values)"
   ],
-  "pending": [
-   "server run from the branch (muse-c16/launch_server.sh c16) with the probe",
-   "server P90 and per-batch decode step against the override-map run"
+  "pending": [],
+  "branch_only_modules": [
+   "python/sglang/srt/rocm_muse_spark/jit_build.py"
   ],
-  "problems": []
+  "branch_arm": {
+   "processes": 10,
+   "sglang_modules": 1823
+  },
+  "problems": [
+   "server argv differs: []"
+  ],
+  "ab": {
+   "recipe": "C16, B200 TP4 C16 recipe (SPF, chunk 8192, max prefill 8192, interval 48), 600 s per arm, node quiet",
+   "p90_tok_s_user": {
+    "override_map": 143.88,
+    "branch": 141.84
+   },
+   "decode_step_ms_by_batch": {
+    "override_map": {
+     "b1": 10.4,
+     "b2": 13.0,
+     "b3": 15.5,
+     "b4": 17.3,
+     "b5": 19.4,
+     "b6": 21.9
+    },
+    "branch": {
+     "b1": 10.4,
+     "b2": 12.6,
+     "b3": 14.9,
+     "b4": 17.3,
+     "b5": 19.9,
+     "b6": 23.0
+    }
+   },
+   "verdict": "equal within 600 s noise (P90 -1.4%, step b1-b5 within 0.5 ms)"
+  }
  },
  "snapshot": [
   {
@@ -599,6 +631,8 @@
   "python/sglang/__init__.py": "0c6bd1b5bc75da013d49d26f7799ca36d682779293405dce1adc193b97a0e6bd",
   "python/sglang/api/v1/api_types.py": "6b9091b68eb549d85322b5560b62127b3e332d5acc6eba2a482240b8a9d0fbe3",
   "python/sglang/kernels/__init__.py": "8699543ca891f901b829d318d14314ce516a03a5814e27db02ecf09b49250faa",
+  "python/sglang/kernels/cake_kernels/__init__.py": "6f0af9f962464cf6c6b7ed8497b958e4c5248e1f1a7beb0e8970f5b15812c958",
+  "python/sglang/kernels/cake_kernels/sampling.py": "ef88d0d731eaba3af1698b1ab2e43f23b18982a68a5c994396d1bb23888ed9f1",
   "python/sglang/kernels/fused_op.py": "652ceeea3bbbdc2b864c3fa3cf914148d486392a90384506043d5c2ccf60eb3e",
   "python/sglang/kernels/jit/__init__.py": "7d3a182933356ee4a73edae72cde73251f9b4ba13b7a1b1731b6bc8acae20f5c",
   "python/sglang/kernels/jit/utils/__init__.py": "115c0388c11eb179750afa9c17843cf657c35b1478b0a967476d562f66d79b91",
