@@ -292,8 +292,8 @@ def _qkv_tile_epilogue(
 
     The partials are written through to memory and drained by the barrier before a
     relaxed ticket, and the last program's acquire invalidates its cached copies
-    before it reads them. A first version with a release ticket (an L2 writeback in
-    every program) and volatile reads took 35 instead of 18 us at 8 rows.
+    before it reads them. A release ticket instead (an L2 writeback in every
+    program) takes 38 instead of 18 us at 8 rows.
     """
     D: tl.constexpr = 64
     pn, pm, pk = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -531,7 +531,7 @@ def projection_tile(m: int, num_q_heads: int):
     return None
 
 
-# TP4 rows the single-launch epilogue serves; at 56 rows it saves nothing.
+# TP4 rows the single-launch epilogue serves; at 56 rows it is 0.5-1.1 us slower.
 TILE_EPILOGUE_MAX_ROWS = 48
 # One ticket per output tile of a tile-epilogue launch (72 column tiles of the TP4
 # projection, at most three row blocks), per device. Every launch leaves them at
@@ -542,7 +542,7 @@ _tile_tickets: dict = {}
 
 def _tile_epilogue_launch(m: int):
     """The projection tile at ``m`` rows, on 8 warps where block M is 32: the last
-    program's 32 x 64 epilogue then takes 0.9 us less."""
+    program's 32 x 64 epilogue then takes 0.6-0.9 us less."""
     split_k, block_n, block_m, warps = projection_tile(m, 32)
     return split_k, block_n, block_m, 8 if block_m == 32 else warps
 
