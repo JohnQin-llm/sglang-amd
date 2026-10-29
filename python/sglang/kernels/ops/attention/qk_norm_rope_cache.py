@@ -180,13 +180,15 @@ def _tile_split_sum(tile, stride, mask, SK: tl.constexpr):
     p2 = tl.load(tile + 2 * stride, mask=mask, other=0.0)
     p3 = tl.load(tile + 3 * stride, mask=mask, other=0.0)
     if SK == 4:
-        return (p0 + p2) + (p1 + p3)
-    tl.static_assert(SK == 8)
-    p4 = tl.load(tile + 4 * stride, mask=mask, other=0.0)
-    p5 = tl.load(tile + 5 * stride, mask=mask, other=0.0)
-    p6 = tl.load(tile + 6 * stride, mask=mask, other=0.0)
-    p7 = tl.load(tile + 7 * stride, mask=mask, other=0.0)
-    return ((p0 + p4) + (p2 + p6)) + ((p1 + p5) + (p3 + p7))
+        total = (p0 + p2) + (p1 + p3)
+    else:
+        tl.static_assert(SK == 8)
+        p4 = tl.load(tile + 4 * stride, mask=mask, other=0.0)
+        p5 = tl.load(tile + 5 * stride, mask=mask, other=0.0)
+        p6 = tl.load(tile + 6 * stride, mask=mask, other=0.0)
+        p7 = tl.load(tile + 7 * stride, mask=mask, other=0.0)
+        total = ((p0 + p4) + (p2 + p6)) + ((p1 + p5) + (p3 + p7))
+    return total
 
 
 @triton.jit
