@@ -579,6 +579,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
         self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
+        self._commit_unscaled_fp8_fused = envs.SGLANG_MUSE_DFLASH_DRAFT_FUSE.get()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -2043,14 +2044,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         ) -> None:
             attn = self.draft_model.layers[layer_idx].self_attn.attn
             if ctx_cache_loc_2d is not None and commit_lens is not None:
+                k_scale, v_scale = attn.k_scale, attn.v_scale
+                if (
+                    self._commit_unscaled_fp8_fused
+                    and k_scale is None
+                    and v_scale is None
+                    and token_to_kv_pool.dtype == torch.float8_e4m3fn
+                ):
+                    # Scale 1 takes the pool's fused FP8 commit: the bytes of its
+                    # saturate-and-cast fallback in one launch instead of five.
+                    k_scale = v_scale = 1.0
                 token_to_kv_pool.set_kv_buffer_prefix_valid(
                     attn,
                     ctx_cache_loc_2d,
                     commit_lens,
                     cache_k,
                     cache_v,
-                    attn.k_scale,
-                    attn.v_scale,
+                    k_scale,
+                    v_scale,
                 )
             else:
                 token_to_kv_pool.set_kv_buffer(
@@ -2371,11 +2382,16 @@ class DFlashWorkerV2(BaseSpecWorker):
 
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
+            # Upload from pinned memory: a pageable copy waits for the target
+            # prefill just queued on this stream (~0.4 s at 16K tokens), so the
+            # scheduler could build the next batch only after the GPU went idle.
             device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+            ctx_lens = torch.tensor(
+                batch.extend_lens, dtype=torch.int32, pin_memory=True
+            ).to(device, non_blocking=True)
             draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
+                batch.prefix_lens, dtype=torch.int32, pin_memory=True
+            ).to(device, non_blocking=True)
 
             if batch.out_cache_loc is None:
                 raise RuntimeError(

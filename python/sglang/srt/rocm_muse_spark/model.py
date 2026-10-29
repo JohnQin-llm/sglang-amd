@@ -63,7 +63,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.rocm_muse_spark import mxfp4_moe, router_pooler
+from sglang.srt.rocm_muse_spark import (
+    boundary_fusion,
+    ep4_placement,
+    mxfp4_moe,
+    router_pooler,
+    single_layout,
+    tp4_split_proj,
+)
+from sglang.kernels.ops.attention.verify_tp4 import OutputNormGate
 from sglang.srt.rocm_muse_spark.attention_kv_write import (
     FUSED_QKV_CACHE,
     QK_ROPE_CACHE,
@@ -161,6 +169,7 @@ def _run_fused_moe(
     post_expert_norm: nn.Module | None,
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
+    single_layout: bool = False,
 ) -> torch.Tensor:
     if _moe_backend() == "flydsl":
         from sglang.srt.rocm_muse_spark.muse_moe_flydsl import (
@@ -174,6 +183,12 @@ def _run_fused_moe(
     weight, gain, has_norm = _post_expert_norm_args(post_expert_norm)
     eps = float(post_expert_norm.eps) if post_expert_norm is not None else 0.0
     kwargs = {}
+    if single_layout:
+        if _moe_backend() != "flydsl":
+            raise RuntimeError(
+                "Shuffled Muse weights require the single-layout FlyDSL consumer"
+            )
+        kwargs["single_layout"] = True
     if w13_scale is not None or w2_scale is not None:
         kwargs["w13_scale"] = w13_scale
         kwargs["w2_scale"] = w2_scale
@@ -305,6 +320,15 @@ _USE_FUSED_QK_NORM = (
 _USE_ROUTER_GEMV = (
     os.environ.get("MUSE_ROUTER_GEMV", "1") == "1" and torch.version.hip is not None
 )
+# The Quark MXFP4 export leaves the routed experts of the first and last layer in BF16, which run the
+# BF16 expert kernels at 4x the weight bytes. SGLANG_MUSE_MXFP4_BF16_EXPERTS=1 rounds them to MXFP4 at
+# load so every MoE layer takes the MXFP4 path. This changes the model's numerics.
+_MXFP4_BF16_EXPERTS = os.environ.get("SGLANG_MUSE_MXFP4_BF16_EXPERTS", "0") == "1"
+# Target-verify graphs pad odd batches above 8 (e.g. 9 requests run the 80-row graph). The padded rows hold
+# stale inputs and route to real experts, which every rank then streams. SGLANG_MUSE_TP4_VERIFY_PAD_MASK=1
+# gives the padded rows expert id -1 (no rank's expert) in the verify route (the joint router/pooler, or the
+# high-M route where the joint path does not serve the width), from the graph's real-row count.
+_TP4_VERIFY_PAD_MASK = os.environ.get("SGLANG_MUSE_TP4_VERIFY_PAD_MASK", "0") == "1"
 
 # Replicated pre_expert_proj/post_expert_proj GEMMs at decode-sized M stay on nn.Linear (hipBLASLt). aiter's tuned
 # GEMM is opt-in via MUSE_AITER_DENSE=1: with the pinned aiter its table resolves these shapes to kernels that are
@@ -320,6 +344,9 @@ _tgemm = None
 # tuned BF16 GEMM (searched hipBLASLt solutions); the FP32 router runs a tuned
 # split-K GEMM (configs in kernels/ops/gemm/configs).
 _DENSE_TUNED = envs.SGLANG_MUSE_DENSE_TUNED.get()
+_TP4_VERIFY_ROUTER_POOLER = envs.SGLANG_MUSE_TP4_VERIFY_ROUTER_POOLER.get()
+# TP4 target verify: the attention output norm + gate in the verify merge (aiter backend, verify_tp4).
+_TP4_VERIFY_OUTPUT_GATE = envs.SGLANG_MUSE_TP4_VERIFY_OUTPUT_GATE.get()
 # Tiled 17..64-row GEMMs: the pooler here, unquantized linear layers through
 # register_gfx950_unquantized_gemm_shapes (the O projection, the DFlash draft MLP).
 _DENSE_TILED = envs.SGLANG_MUSE_DENSE_TILED.get()
@@ -573,6 +600,17 @@ class MuseSpark1xAttention(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
+        output = self.forward_core(positions, hidden_states, forward_batch)
+        output, _ = self.o_proj(output, skip_all_reduce=not reduce)
+        return output
+
+    def forward_core(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Attention through the output norm and gate: this rank's o_proj input."""
         # Decode / verify: the fused QK-norm / RoPE kernels also store K/V into
         # the FP8 cache, so the attention layer must not store them again.
         projected = (
@@ -598,10 +636,26 @@ class MuseSpark1xAttention(nn.Module):
             )
             kv_written = fused_qk is not None
             q, k = fused_qk if kv_written else self.qk_norm_rope(positions, q, k)
-        output = self.attn(q, k, v, forward_batch, save_kv_cache=not kv_written)
-        output = self._fused_o_norm_gate.forward(output, o_gate)
-        output, _ = self.o_proj(output, skip_all_reduce=not reduce)
-        return output
+        if self._verify_merge_applies_output_gate(o_gate, forward_batch):
+            # The aiter backend's TP4 verify merge can apply the output norm and gate itself.
+            output_gate = OutputNormGate(o_gate, self.norm_eps)
+            output = self.attn(
+                q, k, v, forward_batch, save_kv_cache=not kv_written, output_gate=output_gate
+            )
+            if output_gate.applied:
+                return output
+        else:
+            output = self.attn(q, k, v, forward_batch, save_kv_cache=not kv_written)
+        return self._fused_o_norm_gate.forward(output, o_gate)
+
+    def _verify_merge_applies_output_gate(self, o_gate, forward_batch) -> bool:
+        return (
+            _TP4_VERIFY_OUTPUT_GATE
+            and o_gate is not None
+            and self.use_o_norm
+            and self._fused_o_norm_gate._effective_weight is None
+            and forward_batch.forward_mode.is_target_verify()
+        )
 
 
 class MuseSpark1xMLP(nn.Module):
@@ -737,7 +791,7 @@ class MuseSpark1xNativeExperts(nn.Module):
         return output
 
 
-class MuseSpark1xMxfp4Experts(nn.Module):
+class MuseSpark1xMxfp4Experts(single_layout.SingleLayoutStateDictGuard, nn.Module):
     """AMD Quark MXFP4 experts with packed E2M1 weights and E8M0 scales."""
 
     def __init__(
@@ -747,6 +801,7 @@ class MuseSpark1xMxfp4Experts(nn.Module):
         intermediate_size: int,
     ):
         super().__init__()
+        single_layout.initialize(self, envs.SGLANG_MUSE_MOE_SINGLE_LAYOUT.get())
         self.num_local_experts = num_local_experts
         self.expert_hidden_size = expert_hidden_size
         self.intermediate_size = intermediate_size
@@ -795,6 +850,7 @@ class MuseSpark1xMxfp4Experts(nn.Module):
         local_expert_start: int,
         post_expert_norm: nn.Module | None,
     ) -> torch.Tensor:
+        shared = mxfp4_moe.single_layout_enabled(self)
         if hidden_states.shape[0] == 0:
             return hidden_states
         if not _want_fused_moe():
@@ -811,6 +867,7 @@ class MuseSpark1xMxfp4Experts(nn.Module):
             post_expert_norm,
             w13_scale=self.w13_weight_scale,
             w2_scale=self.w2_weight_scale,
+            single_layout=shared,
         )
 
     _forward_capturable = forward
@@ -887,7 +944,13 @@ class MuseSpark1xMoE(nn.Module):
             residual_id=2 * layer_idx + 2,
         )
         self.nvfp4_checkpoint = nvfp4_checkpoint
-        self.mxfp4_checkpoint = _uses_quark_mxfp4_experts(quant_config, prefix)
+        self.mxfp4_checkpoint = _uses_quark_mxfp4_experts(quant_config, prefix) or (
+            _MXFP4_BF16_EXPERTS and _is_quark_mxfp4(quant_config)
+        )
+        # BF16 checkpoint experts that the loader rounds to MXFP4 (layers 0 and 61 of the Quark export).
+        self.mxfp4_rounded = self.mxfp4_checkpoint and not _uses_quark_mxfp4_experts(
+            quant_config, prefix
+        )
         if nvfp4_checkpoint:
             # Packed NVFP4: the FlashInfer TRT-LLM kernel runs the experts and we
             # finalize in torch so the post-expert norm lands before the top-k sum.
@@ -938,11 +1001,17 @@ class MuseSpark1xMoE(nn.Module):
         skip_post_expert_proj: bool = False,
         target_verify: bool = False,
         sp: SPShape | None = None,
+        num_real: torch.Tensor | None = None,
+        fused_collectives: bool = True,
     ) -> torch.Tensor:
         """MoE on ``hidden_states``; under sequence parallelism (``sp``) they are this
         rank's token shard and so is the result. ``skip_post_expert_proj`` returns the
-        reduced expert output before the unpooler (fused into the next boundary)."""
-        topk_scores, topk_ids, expert_input = self.route(hidden_states)
+        reduced expert output before the unpooler (fused into the next boundary).
+        ``num_real``: device count of real rows; the rows after it are graph padding.
+        ``fused_collectives=False`` keeps the separate finalize and all-reduce (a forward with K2 launches)."""
+        topk_scores, topk_ids, expert_input = self.route(
+            hidden_states, target_verify=target_verify and sp is None, num_real=num_real
+        )
         rows = topk_ids.shape[0] if sp is None else sp.padded
         use_a4w4 = self.uses_a4w4(rows, target_verify)
         quantized = None
@@ -959,25 +1028,62 @@ class MuseSpark1xMoE(nn.Module):
                 expert_input = sp_gather(expert_input, rows)
             topk_ids = sp_gather(topk_ids, rows)
             topk_scores = sp_gather(topk_scores, rows)
-        output = self.run_experts(
-            expert_input, topk_scores, topk_ids, target_verify, use_a4w4, quantized
+        reduced = (
+            boundary_fusion.finalize_all_reduce(
+                self, expert_input, topk_scores, topk_ids
+            )
+            if fused_collectives
+            and sp is None
+            and not use_a4w4
+            and self.uses_compact_a4(expert_input, target_verify)
+            else None
         )
-        if sp is not None:
-            output = sp_reduce_scatter(output, sp.padded)
-        elif self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output)
+        if reduced is not None:
+            output = reduced
+        else:
+            output = self.run_experts(
+                expert_input, topk_scores, topk_ids, target_verify, use_a4w4, quantized
+            )
+            if sp is not None:
+                output = sp_reduce_scatter(output, sp.padded)
+            elif self.tp_size > 1:
+                output = tensor_model_parallel_all_reduce(output)
         if skip_post_expert_proj:
             return output
         return self.unpool(output)
 
-    def route(self, hidden_states: torch.Tensor):
-        """Router top-k and the expert input (pooler + pre-expert norm) of these rows."""
+    def route(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        target_verify: bool = False,
+        num_real: torch.Tensor | None = None,
+    ):
+        """Router top-k and the expert input (pooler + pre-expert norm) of these rows.
+
+        With ``num_real`` the verify route (joint or high-M) gives rows from ``num_real`` on expert id -1."""
+        if target_verify and tp4_split_proj.front_applies(self, hidden_states):
+            # TP4 verify graphs at 48..128 rows: this rank's quarter of the pooler, slices exchanged in the epilogue.
+            return tp4_split_proj.route(self, hidden_states, num_real=num_real)
+        if (
+            _TP4_VERIFY_ROUTER_POOLER
+            and target_verify
+            and _DENSE_TUNED
+            and _USE_ROUTER_GEMV
+            and router_pooler.SHARED_ROUTER_POOLER
+            and router_pooler.can_route_tp4_high_m(self, hidden_states)
+        ):
+            return router_pooler.route_with_tp4_high_m(
+                self, hidden_states, pooler_fn=_dense_linear, num_real=num_real
+            )
         if (
             router_pooler.SHARED_ROUTER_POOLER
             and _USE_ROUTER_GEMV
             and router_pooler.can_share_router_pooler(self, hidden_states)
         ):
-            return router_pooler.route_with_shared_pooler(self, hidden_states)
+            return router_pooler.route_with_shared_pooler(
+                self, hidden_states, num_real=num_real
+            )
         if (
             _USE_ROUTER_GEMV
             and self.router_in_fp32
@@ -1009,12 +1115,34 @@ class MuseSpark1xMoE(nn.Module):
         return topk_scores, topk_ids, expert_input
 
     def uses_a4w4(self, rows: int, target_verify: bool) -> bool:
+        if self.mxfp4_checkpoint:
+            mxfp4_moe.single_layout_enabled(self.experts)
         return (
             mxfp4_moe.A4W4_ENABLED
             and not target_verify
             and self.mxfp4_checkpoint
             and rows >= mxfp4_moe.A4W4_MIN_ROWS
             and getattr(self.experts, "a4w4_weights", None) is not None
+        )
+
+    def uses_compact_a4(self, expert_input, target_verify: bool) -> bool:
+        rows = expert_input.shape[0]
+        return (
+            mxfp4_moe.COMPACT_A4_ENABLED
+            and target_verify
+            and self.mxfp4_checkpoint
+            and (
+                (self.tp_size == self.ep_size == 8 and self.num_local_experts == 32)
+                or (
+                    mxfp4_moe.TP4_COMPACT_A4_ENABLED
+                    and self.tp_size == self.ep_size == 4
+                    and self.num_local_experts == 64
+                    and rows in mxfp4_moe.COMPACT_A4_TP4_ROWS
+                )
+            )
+            and self.top_k == 8
+            and rows % 8 == 0
+            and 0 < rows <= mxfp4_moe.COMPACT_A4_MAX_ROWS
         )
 
     def run_experts(
@@ -1041,16 +1169,7 @@ class MuseSpark1xMoE(nn.Module):
                 gain,
                 quantized=quantized,
             )
-        if (
-            mxfp4_moe.COMPACT_A4_ENABLED
-            and target_verify
-            and self.mxfp4_checkpoint
-            and self.tp_size == self.ep_size == 8
-            and self.num_local_experts == 32
-            and self.top_k == 8
-            and expert_input.shape[0] % 8 == 0
-            and 0 < expert_input.shape[0] <= mxfp4_moe.COMPACT_A4_MAX_ROWS
-        ):
+        if self.uses_compact_a4(expert_input, target_verify):
             norm_weight, gain, has_norm = _post_expert_norm_args(self.post_expert_norm)
             assert has_norm and norm_weight is not None
             if not self._compact_a4_reported:
@@ -1170,12 +1289,27 @@ class MuseSpark1xDecoderLayer(nn.Module):
         ffn_boundary: FusedPostNormResidualPreNorm | None = None,
         pre_norm_dtype: torch.dtype | None = None,
         sp: SPShape | None = None,
+        tp4_k2=None,
     ):
         """Under sequence parallelism (``sp``) ``stream`` / ``attn_input`` are this rank's
         token shard; attention and the experts still see every token."""
         attn_input = (
             self.self_attn_input_norm(stream) if attn_input is None else attn_input
         )
+        if tp4_k2 is not None and self.layer_idx in tp4_k2.layers:
+            # o_proj through the unpool as one persistent launch (tp4_k2_runner); the attention core
+            # before it stays native, the FFN boundary after it too unless the launch applies it.
+            core = self.self_attn.forward_core(positions, attn_input, forward_batch)
+            if tp4_k2.fuses_ffn_boundary:
+                return tp4_k2.forward_through_ffn_boundary(self, core, stream)
+            stream, ffn_output = tp4_k2.forward(self, core, stream)
+            next_attn_input, stream, _ = ffn_boundary.forward(
+                stream,
+                ffn_output,
+                branch_dtype=torch.bfloat16,
+                pre_norm_dtype=pre_norm_dtype,
+            )
+            return stream, next_attn_input
         if sp is not None and hasattr(self.self_attn, "ulysses_qkv_weight"):
             attn_output = ulysses_attention(
                 self.self_attn, attn_input, positions, forward_batch, sp
@@ -1188,11 +1322,20 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 reduce=False,
             )
             attn_output = sp_reduce_scatter(partial, sp.padded)
+        elif tp4_k2 is None and boundary_fusion.fuses_attention_boundary(
+            self._fused_attn_boundary, attn_input, stream
+        ):
+            attn_output = None
+            partial = self.self_attn(positions, attn_input, forward_batch, reduce=False)
+            ffn_input, stream = boundary_fusion.all_reduce_attention_boundary(
+                self._fused_attn_boundary, partial, stream
+            )
         else:
             attn_output = self.self_attn(positions, attn_input, forward_batch)
-        ffn_input, stream, _ = self._fused_attn_boundary.forward(
-            stream, attn_output, branch_dtype=torch.bfloat16
-        )
+        if attn_output is not None:
+            ffn_input, stream, _ = self._fused_attn_boundary.forward(
+                stream, attn_output, branch_dtype=torch.bfloat16
+            )
         target_verify = forward_batch.forward_mode.is_target_verify()
         if (
             sp is None
@@ -1202,7 +1345,10 @@ class MuseSpark1xDecoderLayer(nn.Module):
             # The MoE keeps its per-expert norm / combine and TP reduction; only the
             # unpooler moves into the next boundary's norm-residual kernel.
             expert_output = self.mlp(
-                ffn_input, skip_post_expert_proj=True, target_verify=target_verify
+                ffn_input,
+                skip_post_expert_proj=True,
+                target_verify=target_verify,
+                fused_collectives=tp4_k2 is None,
             )
             ffn_boundary._ensure_cached_weights(torch.bfloat16)
             next_attn_input, stream = unpool_gemm_norm_residual(
@@ -1222,8 +1368,41 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 num_warps=16,
             )
             return stream, next_attn_input
+        num_real = (
+            forward_batch.num_token_non_padded
+            if _TP4_VERIFY_PAD_MASK and target_verify and sp is None
+            else None
+        )
+        if (
+            tp4_split_proj.ENABLED
+            and sp is None
+            and target_verify
+            and self.is_moe_layer
+            and tp4_split_proj.tail_applies(
+                self.mlp, ffn_input, stream, ffn_boundary, pre_norm_dtype
+            )
+        ):
+            # TP4 verify graphs at 48..128 rows: this rank's quarter of the unpool, the branch slices exchanged
+            # in the FFN-boundary kernel.
+            expert_output = self.mlp(
+                ffn_input,
+                skip_post_expert_proj=True,
+                target_verify=target_verify,
+                num_real=num_real,
+                fused_collectives=tp4_k2 is None,
+            )
+            next_attn_input, stream = tp4_split_proj.unpool_boundary(
+                self.mlp, expert_output, stream, ffn_boundary, pre_norm_dtype
+            )
+            return stream, next_attn_input
         ffn_output = (
-            self.mlp(ffn_input, target_verify=target_verify, sp=sp)
+            self.mlp(
+                ffn_input,
+                target_verify=target_verify,
+                sp=sp,
+                num_real=num_real,
+                fused_collectives=tp4_k2 is None,
+            )
             if self.is_moe_layer
             else self.mlp(ffn_input)
         )
@@ -1247,7 +1426,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
     def _can_fuse_unpool_boundary(
         self, x: torch.Tensor, boundary: FusedPostNormResidualPreNorm | None
     ) -> bool:
-        """Unpooler + FFN boundary fusion: TP8/EP8 MoE layers at up to 16 rows."""
+        """Unpooler + FFN boundary fusion: TP8/EP8 and TP4/EP4 MoE layers at up to 16 rows."""
         if not self.is_moe_layer or boundary is None:
             return False
         moe = self.mlp
@@ -1255,9 +1434,10 @@ class MuseSpark1xDecoderLayer(nn.Module):
         return (
             proj is not None
             and proj.bias is None
-            and moe.tp_size == 8
-            and moe.ep_size == 8
-            and 0 < x.shape[0] <= 16
+            and (
+                (moe.tp_size == moe.ep_size == 8 and 0 < x.shape[0] <= 16)
+                or (moe.tp_size == moe.ep_size == 4 and 0 < x.shape[0] <= 16)
+            )
             and x.dtype == torch.bfloat16
             and x.shape[1] == 8192
             and x.is_contiguous()
@@ -1368,6 +1548,16 @@ class MuseSpark1xModel(nn.Module):
             sp = sp_shape(forward_batch, stream.shape[0])
             if sp is not None:
                 stream = sp_shard(stream, sp)
+            # TP4 K2 at its verify widths; every other step keeps the native layers. A step with K2 launches
+            # also keeps the separate collectives on its native layers (0 and 61): the fused finalize/all-reduce
+            # and all-reduce/boundary kernels run only in the verify graphs above K2's widths.
+            tp4_k2 = getattr(self, "_tp4_k2", None)
+            if tp4_k2 is not None and (
+                sp is not None or not tp4_k2.eligible(forward_batch, stream.shape[0])
+            ):
+                tp4_k2 = None
+            if tp4_k2 is not None:
+                tp4_k2.step_begin()
             final_pre_norm_dtype = torch.bfloat16
             attn_input = self.layers[0].self_attn_input_norm(stream)
             last = len(self.layers) - 1
@@ -1380,9 +1570,12 @@ class MuseSpark1xModel(nn.Module):
                     ffn_boundary=self._ffn_boundaries[i],
                     pre_norm_dtype=final_pre_norm_dtype if i == last else None,
                     sp=sp,
+                    tp4_k2=tp4_k2,
                 )
                 if i in self.layers_to_capture:
                     aux_hidden_states.append(stream.to(torch.bfloat16))
+            if tp4_k2 is not None:
+                tp4_k2.step_end()
             # == self.norm(norm_input).to(bf16) from the last boundary
             hidden_states = attn_input
             if sp is not None:
@@ -1433,7 +1626,7 @@ class MuseSparkModel(nn.Module):
         return self.language_model(*args, **kwargs)
 
 
-class MuseSparkTextForCausalLM(nn.Module):
+class MuseSparkTextForCausalLM(single_layout.SingleLayoutStateDictGuard, nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
@@ -1446,6 +1639,7 @@ class MuseSparkTextForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        single_layout.initialize(self, envs.SGLANG_MUSE_MOE_SINGLE_LAYOUT.get())
         # Unquantized linear shapes tuned on MI355X at TP8, registered before any
         # weights load: tiled small-M GEMMs for the attention O projection and the
         # DFlash draft's MLP (the draft loads after the target, in this process),
@@ -1680,13 +1874,35 @@ class MuseSparkTextForCausalLM(nn.Module):
         if loaded_weight.shape[0] == self.config.num_local_experts:
             local = loaded_weight.shape[0] // parallel.moe_ep_size
             start = parallel.moe_ep_rank * local
-            loaded_weight = loaded_weight.narrow(0, start, local)
+            slots = self._ep_slots_for(name)
+            if slots is None:
+                loaded_weight = loaded_weight.narrow(0, start, local)
+            else:  # the logical experts in this rank's physical slots
+                loaded_weight = loaded_weight.index_select(0, slots[1][start : start + local])
         if param.shape != loaded_weight.shape:
             raise RuntimeError(
                 f"Expert weight shape mismatch for {name}: "
                 f"parameter={tuple(param.shape)}, checkpoint={tuple(loaded_weight.shape)}"
             )
         param.data.copy_(loaded_weight)
+
+    @staticmethod
+    @torch.no_grad()
+    def _round_expert_to_mxfp4(
+        name: str, loaded_weight: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor
+    ) -> None:
+        """BF16 [rows, cols] -> packed E2M1 [rows, cols / 2] and E8M0 scales [rows, cols / 32] in
+        the Quark layout, rounded the way Quark's exporter rounds (aiter ``even`` scaling)."""
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+
+        q_weight, q_scale = dynamic_mxfp4_quant(loaded_weight.to(weight.device))
+        if q_weight.shape != weight.shape or q_scale.shape != scale.shape:
+            raise RuntimeError(
+                f"MXFP4 rounding of {name}: {tuple(q_weight.shape)}/{tuple(q_scale.shape)} vs "
+                f"{tuple(weight.shape)}/{tuple(scale.shape)}"
+            )
+        weight.copy_(q_weight)
+        scale.copy_(q_scale)
 
     def _load_single_expert(
         self,
@@ -1705,6 +1921,9 @@ class MuseSparkTextForCausalLM(nn.Module):
         if suffix == "input_scale":
             return True
         expert_id = int(expert_raw)
+        slots = self._ep_slots_for(prefix)
+        if slots is not None:
+            expert_id = int(slots[0][expert_id])
         parallel = get_parallel()
         local_count = self.config.num_local_experts // parallel.moe_ep_size
         start = parallel.moe_ep_rank * local_count
@@ -1730,6 +1949,13 @@ class MuseSparkTextForCausalLM(nn.Module):
             half = target.shape[0] // 2
             offset = 0 if projection == "gate_proj" else half
             target = target.narrow(0, offset, half)
+        if loaded_weight.is_floating_point() and target.dtype == torch.uint8:
+            # A BF16 expert of a layer the export left unquantized, served as MXFP4.
+            scale = params[f"{param_name}_scale"].data[local_id]
+            if is_w13:
+                scale = scale.narrow(0, offset, half)
+            self._round_expert_to_mxfp4(name, loaded_weight, target, scale)
+            return True
         if target.shape != loaded_weight.shape:
             raise RuntimeError(
                 f"Expert weight shape mismatch for {name}: "
@@ -1738,7 +1964,87 @@ class MuseSparkTextForCausalLM(nn.Module):
         target.copy_(loaded_weight)
         return True
 
+    def _single_layout_modules(self):
+        modules = [
+            m for m in self.model.modules() if isinstance(m, MuseSpark1xMxfp4Experts)
+        ]
+        requested = envs.SGLANG_MUSE_MOE_SINGLE_LAYOUT.get()
+        if not requested and not self._single_layout_mode:
+            return []
+        # Preflight EVERY layer before any buffer is transformed. An unsupported
+        # later layer must not leave earlier layers with a different layout.
+        mxfp4_moe.single_layout_enabled(self, ready=False)
+        if not modules or not self.mxfp4_checkpoint:
+            raise ValueError("Single-layout requires Muse MXFP4 expert layers")
+        parallel = get_parallel()
+        for module in modules:
+            mxfp4_moe.single_layout_enabled(module, ready=False)
+            device = module.w13_weight.device
+            arch = (
+                torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+                if device.type == "cuda" and _is_rocm()
+                else "unsupported"
+            )
+            single_layout.validate_scope(
+                module,
+                tp=parallel.tp_size,
+                ep=parallel.moe_ep_size,
+                moe_tp=parallel.moe_tp_size,
+                arch=arch,
+            )
+        for module in self.model.modules():
+            if isinstance(module, MuseSpark1xMoE) and module.mxfp4_checkpoint:
+                if module.top_k != 8:
+                    raise ValueError("Muse single-layout requires topk=8")
+        return modules
+
+    @torch.no_grad()
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        modules = self._single_layout_modules()
+        if not modules:
+            return self._load_weights_native(weights)
+        if getattr(self, "_single_layout_load_active", False):
+            raise RuntimeError(
+                "Concurrent/reentrant Muse single-layout reload is unsupported"
+            )
+        self._single_layout_load_active = True
+        try:
+            for module in modules:
+                single_layout.begin_load(module)
+            return self._load_weights_native(weights)
+        except BaseException:
+            # A partial checkpoint or interrupted asynchronous transform cannot
+            # safely be served or repaired by a partial retry. Restart required.
+            self._single_layout_state = "failed"
+            for module in modules:
+                module._single_layout_state = "failed"
+                module.a4w4_weights = None
+            raise
+        finally:
+            self._single_layout_load_active = False
+
+    _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.")
+
+    def _ep_slots_for(self, name: str):
+        """This layer's (physical slot of each logical expert, logical expert of each slot), or None (linear)."""
+        slots = getattr(self, "_ep_slots", None)
+        if not slots:
+            return None
+        match = self._LAYER_RE.search(name)
+        return slots.get(int(match.group(1))) if match else None
+
+    def _load_weights_native(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        self._ep_slots = ep4_placement.layer_slots(
+            get_parallel().moe_ep_size, self.config.num_local_experts
+        )
+        if self._ep_slots:
+            if self.requant_nvfp4_experts:
+                raise ValueError("SGLANG_MUSE_EP4_PLACEMENT does not cover NVFP4 requantization")
+            logger.info(
+                "EP4 expert placement %s: %d layers re-placed",
+                ep4_placement.selected(),
+                len(self._ep_slots),
+            )
         params = dict(self.named_parameters())
         params.update(
             {name: value for name, value in self.named_buffers() if name not in params}
@@ -1821,6 +2127,10 @@ class MuseSparkTextForCausalLM(nn.Module):
                 )
             if "router.weight" in name and param.shape != loaded_weight.shape:
                 loaded_weight = loaded_weight.t().contiguous()
+            if name.endswith((".mlp.router.weight", ".mlp.expert_bias")):
+                slots = self._ep_slots_for(name)
+                if slots is not None:  # [..., experts]: column p is the logical expert in slot p
+                    loaded_weight = loaded_weight.index_select(-1, slots[1]).contiguous()
             if ".experts.w" in name:
                 self._copy_expert_stack(param, loaded_weight, name)
             else:
@@ -1837,6 +2147,12 @@ class MuseSparkTextForCausalLM(nn.Module):
 
     @torch.no_grad()
     def post_load_weights(self) -> None:
+        shared_modules = self._single_layout_modules()
+        for module in shared_modules:
+            if module._single_layout_state == "loading":
+                if not getattr(self, "_single_layout_load_active", False):
+                    raise RuntimeError("Interrupted Muse single-layout load")
+                single_layout.finish_load(module)
         moe_layers = [
             layer.mlp
             for layer in self.model.layers
@@ -1849,6 +2165,22 @@ class MuseSparkTextForCausalLM(nn.Module):
             for module in self.model.modules():
                 if isinstance(module, MuseSpark1xMxfp4Experts):
                     mxfp4_moe.prepare_a4w4_weights(module)
+        if shared_modules:
+            storage_bytes = 0
+            for module in shared_modules:
+                for name, alias in zip(single_layout.NAMES, module.a4w4_weights):
+                    weight = getattr(module, name)
+                    if alias.data_ptr() != weight.data_ptr():
+                        raise RuntimeError(
+                            "Muse single-layout A4 weights must alias parameters"
+                        )
+                    storage_bytes += weight.numel() * weight.element_size()
+            logger.info(
+                "Muse MXFP4 single layout ready: %d layers, %.3f GiB expert "
+                "storage per rank; A4W4 prefill aliases parameters",
+                len(shared_modules),
+                storage_bytes / (1024**3),
+            )
         if _DENSE_TILED:
             for moe in moe_layers:
                 for proj in (moe.pre_expert_proj, moe.post_expert_proj):
@@ -1875,6 +2207,77 @@ class MuseSparkTextForCausalLM(nn.Module):
             ensure = getattr(op, "_ensure_cached_weights", None)
             if ensure is not None:
                 ensure(torch.bfloat16)
+        boundary_fusion.install(
+            get_parallel().tp_group, torch.device("cuda", torch.cuda.current_device())
+        )
+        tp4_split_proj.install(get_parallel().tp_group)
+        # The TP4 K2 binds the tensors prepared above, so it is built (or re-checked) last.
+        decoder = self.model.language_model
+        runner = getattr(decoder, "_tp4_k2", None)
+        if runner is not None:
+            runner.refresh()
+        elif os.environ.get("SGLANG_MUSE_TP4_K2", "0") == "1":
+            self._enable_tp4_k2(decoder)
+
+    def _enable_tp4_k2(self, decoder: MuseSpark1xModel) -> None:
+        """Build the TP4 K2 runner on every TP rank, or keep the native path where it does not apply."""
+        parallel = get_parallel()
+        device = decoder.embed_tokens.weight.device
+        layers = [
+            layer
+            for layer in decoder.layers
+            if isinstance(layer.mlp, MuseSpark1xMoE)
+            and isinstance(layer.mlp.experts, MuseSpark1xMxfp4Experts)
+            # Qualified on the checkpoint's MXFP4 layers only, not on BF16 experts rounded at load.
+            and not layer.mlp.mxfp4_rounded
+        ]
+        compatible = (
+            self.mxfp4_checkpoint
+            and envs.SGLANG_MUSE_MOE_SINGLE_LAYOUT.get()
+            and router_pooler.JOINT_ROUTER_POOLER
+            and decoder._ffn_boundaries is not None
+            and bool(layers)
+            and parallel.tp_size == 4
+            and parallel.attn_tp_size == 4
+            and parallel.moe_ep_size == 4
+            and parallel.moe_tp_size == 1
+            and device.type == "cuda"
+            and _is_rocm()
+            and torch.cuda.get_device_properties(device).gcnArchName.startswith("gfx950")
+        )
+        # Every rank agrees before any persistent-kernel state is imported or allocated.
+        from sglang.srt.rocm_muse_spark.tp4mono.runtime.peer import tp_agree
+
+        if not tp_agree(compatible, parallel.tp_group.cpu_group):
+            logger.warning(
+                "Muse TP4 K2 does not apply to this model/topology; keeping the native path"
+            )
+            return
+        from sglang.srt.rocm_muse_spark.tp4_k2_runner import (
+            Tp4K2Runner,
+            Tp4K2Unsupported,
+        )
+
+        ffn_boundaries = None
+        if envs.SGLANG_MUSE_TP4_K2_FFN_BOUNDARY.get():
+            ffn_boundaries = {
+                layer.layer_idx: decoder._ffn_boundaries[layer.layer_idx]
+                for layer in layers
+            }
+        try:
+            runner = Tp4K2Runner(layers, parallel, ffn_boundaries=ffn_boundaries)
+        except Tp4K2Unsupported as error:
+            logger.warning("Muse TP4 K2 declined; keeping the native path: %s", error)
+            return
+        object.__setattr__(decoder, "_tp4_k2", runner)
+        logger.info(
+            "Muse TP4 K2 enabled: target verify rows %s, %d layers (%d..%d), FFN boundary in the launch: %s",
+            runner.widths,
+            len(runner.layers),
+            min(runner.layers),
+            max(runner.layers),
+            runner.fuses_ffn_boundary,
+        )
 
 
 __all__ = [

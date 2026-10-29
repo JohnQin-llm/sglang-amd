@@ -179,7 +179,14 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
                 self.model.language_model.embed_tokens,
                 self.model.language_model.embed_norm,
             )
-        if self.language_only:
+        # A text-only server (``--json-model-override-args '{"language_model_only": true}'``):
+        # model_config then reports no multimodal support, so the server warms up and
+        # serves text only and rejects media input in the chat front end; the towers are
+        # not built and their checkpoint tensors are not read (about 1.1 GiB per TP4 rank).
+        self.text_only = bool(getattr(config, "language_model_only", False)) and not self.encoder_only
+        if self.language_only or self.text_only:
+            if self.text_only:
+                logger.info("language_model_only: vision and audio towers not built")
             return
         self.use_data_parallel_encoder = get_mm().mm_enable_dp_encoder
         self.model.vision_tower = NaViT(
@@ -221,7 +228,15 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
         if config.audio_config.out_hidden_size != config.text_config.hidden_size:
             raise ValueError("audio out_hidden_size must match text hidden_size")
 
+    def _require_towers(self) -> None:
+        if getattr(self, "text_only", False):
+            raise RuntimeError(
+                "this server runs with language_model_only (no vision/audio towers); "
+                "image, video and audio input is not served"
+            )
+
     def preprocess_mm_for_encoder(self, mm_data, modality, config):
+        self._require_towers()
         from sglang.srt.multimodal.processors.muse_spark_omni import (
             build_encoder_inputs,
             make_preprocess_config,
@@ -295,6 +310,7 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
         return output
 
     def get_image_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
+        self._require_towers()
         images = []
         for item in items:
             value = torch.as_tensor(item.feature)
@@ -333,6 +349,7 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
         return self._encode_vision(images)
 
     def get_video_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
+        self._require_towers()
         videos = []
         for item in items:
             value = torch.as_tensor(item.feature)
@@ -372,6 +389,7 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
         return self._encode_vision(videos)
 
     def get_audio_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
+        self._require_towers()
         if self.model.audio_tower is None:
             raise RuntimeError(
                 "this checkpoint does not configure the waveform encoder"
@@ -435,7 +453,7 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
                     if not self.encoder_only:
                         yield name, weight
                     continue
-                if self.language_only and name.startswith(
+                if (self.language_only or self.text_only) and name.startswith(
                     (
                         "model.vision_tower.",
                         "model.vision_adapter.",

@@ -840,8 +840,13 @@ class HiCacheController:
         host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
-        if wait_for_forward and self.write_fence_stream is not None:
-            # An evicted SWA page can belong to an unfinished checkpoint.
+        # Every write (wait_for_forward or not) starts behind the forward work
+        # queued so far: an evicted SWA page can belong to an unfinished
+        # checkpoint, and write-through then reads KV no earlier than when the
+        # copy stream shared the forward stream's hardware queue. Forwards issued
+        # later do not wait for the copies: device pages under a write-through
+        # copy stay locked until its ack.
+        if self.write_fence_stream is not None:
             self.l2_transfer_engine.device_to_host_stream.wait_stream(
                 self.write_fence_stream
             )

@@ -11,10 +11,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.speculative import dflash_draft_fused
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -28,10 +34,13 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     should_apply_lm_head_quant_method,
 )
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -46,7 +55,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import is_npu, set_weight_attrs
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -54,6 +63,25 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
+
+
+def _draft_fuse_enabled() -> bool:
+    """The fused draft layers (dflash_draft_fused) on gfx950; read when the draft model is built."""
+    return (
+        is_hip() and is_gfx95_supported() and envs.SGLANG_MUSE_DFLASH_DRAFT_FUSE.get()
+    )
+
+
+class _DraftLinearMethod(UnquantizedLinearMethod):
+    """The served BF16 linear, on the library GEMM tuned per draft width where one beats its dispatch."""
+
+    def apply(self, layer, x, bias=None):
+        if bias is None and x.dim() == 2:
+            out = dflash_draft_fused.library_gemm(x, layer.weight)
+            if out is not None:
+                return out
+        return super().apply(layer, x, bias)
+
 
 try:
     from flashinfer import top_k as _flashinfer_top_k
@@ -327,6 +355,11 @@ class DFlashAttention(nn.Module):
             attn_type=self.attn_type,
             quant_config=quant_config,
         )
+        if (
+            _draft_fuse_enabled()
+            and type(self.qkv_proj.quant_method) is UnquantizedLinearMethod
+        ):
+            self.qkv_proj.quant_method = _DraftLinearMethod()
 
     def _build_qkv_proj(self, bias: bool, quant_config, prefix: str) -> nn.Module:
         return QKVParallelLinear(
@@ -404,6 +437,75 @@ class DFlashAttention(nn.Module):
     ) -> torch.Tensor:
         return attn_output
 
+    def fused_cache_target(self, forward_batch: ForwardBatch):
+        """(k_cache, v_cache, slots) where the backend would store this layer's K/V, if the fused
+        QK-norm/RoPE kernel can store it there instead; else None."""
+        pool = get_token_to_kv_pool()
+        if not (
+            type(pool) is MHATokenToKVPool
+            and not pool.is_quantized_kv_cache
+            and not pool.use_hnd
+            and pool.kv_cache_layout != "vectorized_5d"
+            and self.attn.k_scale is None
+            and self.attn.v_scale is None
+            # The pool's own write door: physical marks matter only where it requires them.
+            and (
+                forward_batch.out_cache_loc_is_physical
+                or not pool.requires_physical_write_loc
+            )
+        ):
+            return None
+        k_cache, v_cache = pool.get_kv_buffer(self.attn.layer_id)
+        shape = (self.num_kv_heads, self.head_dim)
+        if not (
+            k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn
+            and k_cache.dim() == v_cache.dim() == 3
+            and k_cache.shape[1:] == v_cache.shape[1:] == shape
+            and k_cache.is_contiguous()
+            and v_cache.is_contiguous()
+        ):
+            return None
+        return k_cache, v_cache, forward_batch.out_cache_loc
+
+    def forward_fused(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        cache_target,
+    ) -> torch.Tensor:
+        """forward() with QK-norm/RoPE summing the QKV projection's split-K partials and storing K/V."""
+        weight = self.qkv_proj.weight
+        launch = dflash_draft_fused.partial_launch(hidden_states.shape[0], weight)
+        if launch is None:
+            partials = None
+            qkv, _ = self.qkv_proj(hidden_states)
+        else:
+            partials = dflash_draft_fused.projection_partials(
+                hidden_states, weight, launch
+            )
+            qkv = hidden_states.new_empty((hidden_states.shape[0], weight.shape[0]))
+        k_cache, v_cache, slots = cache_target
+        dflash_draft_fused.qk_norm_rope_kv_write(
+            qkv,
+            qkv_partials=partials,
+            positions=positions,
+            q_weight=self.q_norm.weight,
+            k_weight=self.k_norm.weight,
+            cos_sin_cache=self.rotary_emb.cos_sin_cache,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            loc=slots,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+        )
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=False)
+        output, _ = self.o_proj(attn_output)
+        return output
+
     def kv_proj_only(
         self, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -474,10 +576,26 @@ class DFlashMLP(nn.Module):
                 f"Unsupported DFlash activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        if _draft_fuse_enabled():
+            for proj in (self.gate_up_proj, self.down_proj):
+                if type(proj.quant_method) is UnquantizedLinearMethod:
+                    proj.quant_method = _DraftLinearMethod()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+    def forward_fused(self, x: torch.Tensor) -> torch.Tensor:
+        """forward() with SiLU-and-mul summing the gate/up projection's split-K partials."""
+        weight = self.gate_up_proj.weight
+        launch = dflash_draft_fused.partial_launch(x.shape[0], weight)
+        if launch is None:
+            return self.forward(x)
+        x = dflash_draft_fused.silu_mul(
+            dflash_draft_fused.projection_partials(x, weight, launch)
+        )
         x, _ = self.down_proj(x)
         return x
 
@@ -556,6 +674,40 @@ class DFlashGroupedConv(nn.Module):
     def finish(self, hidden_states: torch.Tensor, coefficients) -> torch.Tensor:
         return self._convolve(hidden_states, coefficients, side=1)
 
+    def projection_partials(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The kernel projection's split-K partials, read by both sides' fused convolutions."""
+        weight = self.kernel_projection.weight
+        launch = dflash_draft_fused.partial_launch(hidden_states.shape[0], weight)
+        return dflash_draft_fused.projection_partials(hidden_states, weight, launch)
+
+    def prepare_fused(self, hidden_states: torch.Tensor, partials) -> torch.Tensor:
+        return dflash_draft_fused.conv_in(
+            hidden_states,
+            coef_partials=partials,
+            base=self.base_kernel[0],
+            block_tokens=self.block_size,
+            group_size=self.group_size,
+        )
+
+    def finish_add_rmsnorm(
+        self,
+        hidden_states: torch.Tensor,
+        partials,
+        residual: torch.Tensor,
+        norm: RMSNorm,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """norm(finish(hidden_states) + residual) and the new residual, in one kernel."""
+        return dflash_draft_fused.conv_out_add_rmsnorm(
+            hidden_states,
+            coef_partials=partials,
+            base=self.base_kernel[1],
+            residual=residual,
+            weight=norm.weight,
+            eps=norm.variance_epsilon,
+            block_tokens=self.block_size,
+            group_size=self.group_size,
+        )
+
 
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
@@ -632,6 +784,32 @@ class DFlashDecoderLayer(nn.Module):
             hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         return hidden_states, residual
 
+    def forward_fused(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        cache_target,
+        next_norm: RMSNorm,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """forward() from this layer's normed input to the next one's (``next_norm`` applied)."""
+        partials = self.attention_conv.projection_partials(hidden_states)
+        attn_out = self.self_attn.forward_fused(
+            positions,
+            self.attention_conv.prepare_fused(hidden_states, partials),
+            forward_batch,
+            cache_target,
+        )
+        hidden_states, residual = self.attention_conv.finish_add_rmsnorm(
+            attn_out, partials, residual, self.post_attention_layernorm
+        )
+        partials = self.mlp_conv.projection_partials(hidden_states)
+        mlp_out = self.mlp.forward_fused(
+            self.mlp_conv.prepare_fused(hidden_states, partials)
+        )
+        return self.mlp_conv.finish_add_rmsnorm(mlp_out, partials, residual, next_norm)
+
 
 class DFlashDraftModel(nn.Module):
     """SGLang DFlash draft model with an optional Nemotron embedding.
@@ -659,6 +837,8 @@ class DFlashDraftModel(nn.Module):
             draft_hf_config=config
         )
         self.block_size = draft_config.resolve_block_size(default=16)
+        self.draft_fuse = _draft_fuse_enabled()
+        self._fused_rows_logged: set = set()
         self.candidate_selector: Optional[nn.Module] = None
         self.lilicorr: Optional[nn.Module] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
@@ -797,10 +977,30 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = self.fc(target_hidden)
-        if self.quantizable:
-            projected = projected[0]
+        if self._shard_fc_projection(target_hidden):
+            # Each rank projects its slice of the output columns and the ranks gather
+            # them, instead of every rank reading the whole replicated weight.
+            tp_size = get_tensor_model_parallel_world_size()
+            cols = self.fc.out_features // tp_size
+            start = get_tensor_model_parallel_rank() * cols
+            projected = tensor_model_parallel_all_gather(
+                F.linear(target_hidden, self.fc.weight[start : start + cols]), dim=-1
+            )
+        else:
+            projected = self.fc(target_hidden)
+            if self.quantizable:
+                projected = projected[0]
         return self.hidden_norm(projected)
+
+    def _shard_fc_projection(self, target_hidden: torch.Tensor) -> bool:
+        # Decode-sized appends only: their target hidden rows are the same on every rank.
+        return (
+            self.draft_fuse
+            and not self.quantizable
+            and 0 < target_hidden.shape[0] <= 128
+            and get_tensor_model_parallel_world_size() > 1
+            and self.fc.out_features % get_tensor_model_parallel_world_size() == 0
+        )
 
     @torch.no_grad()
     def forward(
@@ -825,6 +1025,15 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
+        cache_targets = self._fused_cache_targets(input_embeds, forward_batch)
+        if cache_targets is not None:
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                hidden_states=self._forward_fused(
+                    positions, input_embeds, forward_batch, cache_targets
+                ),
+            )
+
         for layer in self.layers:
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
@@ -840,6 +1049,55 @@ class DFlashDraftModel(nn.Module):
             next_token_logits=None,
             hidden_states=hidden_states,
         )
+
+    def _fused_cache_targets(self, input_embeds, forward_batch: ForwardBatch):
+        """Each layer's FP8 cache target when the fused draft layers serve this forward, else None."""
+        if not (
+            self.draft_fuse
+            and forward_batch.forward_mode.is_target_verify()
+            and input_embeds.dim() == 2
+            and input_embeds.dtype == torch.bfloat16
+            and input_embeds.is_contiguous()
+            and 0 < input_embeds.shape[0] <= 128
+            and input_embeds.shape[0] % self.block_size == 0
+            and self.block_size & (self.block_size - 1) == 0
+        ):
+            return None
+        targets = []
+        for layer in self.layers:
+            attn = layer.self_attn
+            if not (
+                layer.attention_conv is not None
+                and layer.mlp_conv is not None
+                and layer.attention_conv.taps == layer.mlp_conv.taps == 2
+                and attn.use_table_qk_norm_rope
+                and attn.v_scale is None
+                and attn.attention_sink_bias is None
+                and type(attn) is DFlashAttention
+            ):
+                return None
+            target = attn.fused_cache_target(forward_batch)
+            if target is None:
+                return None
+            targets.append(target)
+        return targets
+
+    def _forward_fused(self, positions, input_embeds, forward_batch, cache_targets):
+        if input_embeds.shape[0] not in self._fused_rows_logged:
+            self._fused_rows_logged.add(input_embeds.shape[0])
+            logger.info("DFlash draft: fused layers, rows=%d", input_embeds.shape[0])
+        residual = input_embeds
+        hidden_states = self.layers[0].input_layernorm(input_embeds)
+        for i, (layer, target) in enumerate(zip(self.layers, cache_targets)):
+            next_norm = (
+                self.layers[i + 1].input_layernorm
+                if i + 1 < len(self.layers)
+                else self.norm
+            )
+            hidden_states, residual = layer.forward_fused(
+                positions, hidden_states, residual, forward_batch, target, next_norm
+            )
+        return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

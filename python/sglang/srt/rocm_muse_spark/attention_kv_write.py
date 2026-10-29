@@ -4,8 +4,8 @@
 attention layer with ``save_kv_cache=False``, the usual SGLang pattern for producers that fuse the cache store
 (bailing_moe, gemma4):
 
-* ``qkv_proj_norm_rope_kv_write`` (``SGLANG_MUSE_FUSED_QKV_CACHE``): up to 32 rows, the QKV + output-gate
-  projection's split-K partials feed the QK-norm / RoPE / cache-store epilogue directly.
+* ``qkv_proj_norm_rope_kv_write`` (``SGLANG_MUSE_FUSED_QKV_CACHE``): at the widths of ``PROJECTION_TILES``,
+  the QKV + output-gate projection's split-K partials feed the QK-norm / RoPE / cache-store epilogue directly.
 * ``qk_norm_rope_kv_write`` (``SGLANG_MUSE_QK_ROPE_CACHE``): up to 64 rows, from the projected Q/K/V.
 
 Both write exactly where and what the backend's own store would (FP8 with the layer's per-tensor scales, through
@@ -21,6 +21,8 @@ from typing import NamedTuple
 import torch
 
 from sglang.kernels.ops.attention.qk_norm_rope_cache import (
+    TILE_EPILOGUE_MAX_ROWS,
+    projection_tile,
     qk_norm_rope_cache,
     qkv_proj_qk_norm_rope_cache,
 )
@@ -33,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 QK_ROPE_CACHE = envs.SGLANG_MUSE_QK_ROPE_CACHE.get()
 FUSED_QKV_CACHE = envs.SGLANG_MUSE_FUSED_QKV_CACHE.get()
+TP4_QK_ROPE_CACHE = envs.SGLANG_MUSE_TP4_QK_ROPE_CACHE.get()
+TP4_FUSED_QKV_CACHE = envs.SGLANG_MUSE_TP4_FUSED_QKV_CACHE.get()
+# TP4: the epilogue in the projection launch (the last split-K program of each tile runs it).
+TP4_QKV_TILE_EPILOGUE = envs.SGLANG_MUSE_TP4_QKV_TILE_EPILOGUE.get()
 _logged: set = set()
 
 
@@ -46,11 +52,14 @@ class _KVWriteTarget(NamedTuple):
     cos_sin: torch.Tensor | None
 
 
-def _attention_shape_ok(attention, forward_batch: ForwardBatch) -> bool:
+def _attention_shape_ok(
+    attention, forward_batch: ForwardBatch, *, projection: bool = False
+) -> bool:
+    heads = (attention.num_heads, attention.num_kv_heads)
+    tp4_enabled = TP4_FUSED_QKV_CACHE if projection else TP4_QK_ROPE_CACHE
     return (
         attention.head_dim == 64
-        and attention.num_heads == 16
-        and attention.num_kv_heads == 2
+        and (heads == (16, 2) or (heads == (32, 4) and tp4_enabled))
         and attention.use_qk_norm
         and not attention.use_attn_temperature_tuning
         and (
@@ -130,17 +139,19 @@ def qkv_proj_norm_rope_kv_write(
     projection = attention.qkv_proj
     if not (
         x.ndim == 2
-        and 0 < x.shape[0] <= 32
+        and attention.num_heads in (16, 32)
+        and projection_tile(x.shape[0], attention.num_heads) is not None
         and x.shape[1] == 8192
         and x.dtype == torch.bfloat16
         and x.is_contiguous()
-        and projection.weight.shape == (2304, 8192)
+        and projection.weight.shape
+        == (2 * (attention.num_heads + attention.num_kv_heads) * 64, 8192)
         and projection.weight.dtype == torch.bfloat16
         and projection.weight.is_contiguous()
         and projection.bias is None
         and not projection.gather_output
         and attention.use_o_gate
-        and _attention_shape_ok(attention, forward_batch)
+        and _attention_shape_ok(attention, forward_batch, projection=True)
     ):
         return None
     target = _kv_write_target(attention, forward_batch)
@@ -160,6 +171,11 @@ def qkv_proj_norm_rope_kv_write(
         attention.scale_query_by,
         target.k_scale,
         target.v_scale,
+        num_q_heads=attention.num_heads,
+        num_kv_heads=attention.num_kv_heads,
+        tile_epilogue=TP4_QKV_TILE_EPILOGUE
+        and attention.num_heads == 32
+        and x.shape[0] <= TILE_EPILOGUE_MAX_ROWS,
     )
 
 
@@ -172,8 +188,10 @@ def qk_norm_rope_kv_write(
     forward_batch: ForwardBatch,
 ):
     """(q, k) normalized and rotated with K/V already in the cache, or None when the kernel does not apply."""
+    # Include C16 target verification with eight draft tokens per request.
+    max_tokens = 128 if attention.num_heads == 32 else 64
     if not (
-        0 < q.shape[0] <= 64
+        0 < q.shape[0] <= max_tokens
         and q.dtype == k.dtype == v.dtype == torch.bfloat16
         and q.stride(1) == k.stride(1) == v.stride(1) == 1
         and _attention_shape_ok(attention, forward_batch)

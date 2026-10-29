@@ -176,6 +176,10 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd_unified,
         )
         from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
+        from sglang.kernels.ops.attention.dflash_draft_splitkv import (
+            dflash_draft_splitkv_fwd,
+            dflash_draft_splitkv_supported,
+        )
         from sglang.kernels.ops.attention.verify_splitkv import verify_splitkv_fwd
 
         super().__init__()
@@ -205,6 +209,8 @@ class TritonAttnBackend(AttentionBackend):
         self.verify_splitkv_fwd = torch.compiler.disable(verify_splitkv_fwd)
         # Grouped-head split-KV verify kernel for MLA or one shared local KV head.
         self.verify_shared_kv_fwd = torch.compiler.disable(verify_shared_kv_fwd)
+        self.dflash_draft_splitkv_fwd = torch.compiler.disable(dflash_draft_splitkv_fwd)
+        self.dflash_draft_splitkv_supported = dflash_draft_splitkv_supported
 
         # Parse args
         self.skip_prefill = skip_prefill
@@ -404,6 +410,14 @@ class TritonAttnBackend(AttentionBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
+        # DFlash draft blocks attend non-causally to a sliding window of the
+        # draft cache; see _forward_dflash_draft_block.
+        self.use_dflash_draft_splitkv = (
+            model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dflash()
+            and is_gfx95_supported()
+            and envs.SGLANG_MUSE_DFLASH_SPLITKV.get()
+        )
 
         # Auto-detect BLOCK_M that extend_attention kernel will use for this model.
         # This is used by the scheduler's tile-budget admission logic to match
@@ -1763,6 +1777,26 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        if self.use_dflash_draft_splitkv and self._forward_dflash_draft_block(
+            q,
+            k,
+            v,
+            o,
+            layer,
+            forward_batch,
+            causal,
+            sliding_window_size,
+            kv_indptr,
+            kv_indices,
+            k_descale,
+            v_descale,
+            logits_soft_cap,
+            sinks,
+            score_mod,
+            aux_tensors,
+        ):
+            return o
+
         # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
         # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
         # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
@@ -1838,6 +1872,81 @@ class TritonAttnBackend(AttentionBackend):
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         )
         return o
+
+    def _forward_dflash_draft_block(
+        self,
+        q,
+        k,
+        v,
+        o,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        causal: bool,
+        sliding_window_size: int,
+        kv_indptr,
+        kv_indices,
+        k_descale: float,
+        v_descale: float,
+        logit_cap: float,
+        sinks,
+        score_mod,
+        aux_tensors,
+    ) -> bool:
+        """Run a DFlash draft block on the split-KV kernel; return False to keep extend_attention_fwd.
+
+        The draft block (target-verify mode on the draft runner) is a few query
+        tokens per request attending non-causally to the request's sliding
+        window. extend_attention_fwd walks the whole window in one program per
+        (request, head), which leaves most of the GPU idle at small batch. A
+        single local KV head (TP8) keeps the dflash_block_splitkv path inside
+        extend_attention_fwd.
+        """
+        metadata = self.forward_metadata
+        if not (
+            forward_batch.forward_mode.is_target_verify()
+            and layer.attn_type == AttentionType.ENCODER_ONLY
+            and not causal
+            and sliding_window_size > 0
+            and layer.tp_k_head_num > 1
+            and sinks is None
+            and score_mod is None
+            and aux_tensors is None
+            and metadata.custom_mask is None
+            and layer.xai_temperature_len <= 0
+            and self.dllm_attention is None
+        ):
+            return False
+        q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        if not self.dflash_draft_splitkv_supported(
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            metadata.max_extend_len,
+            sliding_window_size,
+        ):
+            return False
+        self.dflash_draft_splitkv_fwd(
+            q,
+            k,
+            v,
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            k_cache,
+            v_cache,
+            metadata.qo_indptr,
+            kv_indptr,
+            kv_indices,
+            metadata.max_extend_len,
+            layer.scaling,
+            k_descale,
+            v_descale,
+            sliding_window_size=sliding_window_size,
+            logit_cap=logit_cap,
+        )
+        return True
 
     def _forward_extend_kernel(self, layer, *args, **kwargs):
         if self.dllm_attention is not None:

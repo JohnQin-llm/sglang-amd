@@ -54,8 +54,16 @@ class L2TransferEngine:
 
     def __init__(self, io_backend: str):
         self.io_backend = io_backend
-        self.device_to_host_stream = device_module.Stream()
-        self.host_to_device_stream = device_module.Stream()
+        # HIP runs all normal-priority streams on GPU_MAX_HW_QUEUES (default 4)
+        # hardware queues, and streams that share a queue run in submission
+        # order. When the write-through stream shares the forward stream's
+        # queue, every forward issued after a backup waits for its last page
+        # copy (22-86 ms after a prefill on MI355X); when the load-back stream
+        # does, the prefill waits for all layers to load instead of layer by
+        # layer. High-priority streams use their own queues. Consumers still
+        # wait for each loaded layer on its event (LayerDoneCounter).
+        self.device_to_host_stream = device_module.Stream(priority=-1)
+        self.host_to_device_stream = device_module.Stream(priority=-1)
 
     @staticmethod
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:

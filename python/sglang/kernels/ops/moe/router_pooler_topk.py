@@ -7,8 +7,8 @@ split-K), sigmoid scores, bias-corrected top-8 selection with normalized weights
 * ``router_pooler_topk``: three ordered launches, router partials, pooler partials (both split-K) and one
   epilogue kernel whose programs either route a row or normalize a row. Above 16 rows the pooler output comes
   completed from hipBLASLt (or the tiled small-M GEMM when its copy is given) and only the epilogue is shared.
-* ``joint_router_pooler_topk``: one split-K GEMM over a packed ``[pooler; router_hi; router_lo]`` BF16 weight
-  (the FP32 router as high + low BF16 parts) and the same epilogue; 8 / 16 / 24-row verify batches.
+* ``joint_router_pooler_topk``: one GEMM over a packed ``[pooler; router_hi; router_lo]`` BF16 weight (the FP32
+  router as high + low BF16 parts) into FP32 partials, and the same epilogue; verify widths of 8..128 rows.
 
 Router ids follow the unfused routing sequence; the pooler and router projections differ from it only in
 FP32 summation order (and, for the joint form, the two-part BF16 router weights).
@@ -18,7 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.gemm.bf16_splitk_gemm import bf16_splitk_gemm_partials
+from sglang.kernels.ops.gemm.bf16_splitk_gemm import _dense_partial, bf16_splitk_gemm_partials
 from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
     tiled_gemm,
     tiled_gemm_applies,
@@ -39,6 +39,8 @@ def _reduce_route(
     SCALE: tl.constexpr,
     EPS: tl.constexpr,
     TREE: tl.constexpr,
+    NREAL,
+    HAS_NREAL: tl.constexpr,
 ):
     m = tl.program_id(0)
     n = tl.arange(0, N)
@@ -65,6 +67,9 @@ def _reduce_route(
         selected_ids = tl.where(ks == k, idx, selected_ids)
         selected_scores = tl.where(ks == k, score, selected_scores)
     inv = SCALE / (denom + EPS)
+    if HAS_NREAL:
+        # Rows from the real-row count on are graph padding: expert id -1 matches no rank's experts.
+        selected_ids = tl.where(m < tl.load(NREAL), selected_ids, -1)
     tl.store(SCORES + m * 8 + ks, selected_scores * inv)
     tl.store(IDS + m * 8 + ks, selected_ids)
 
@@ -86,10 +91,12 @@ def _route_preproject_epilogue(
     SCALE: tl.constexpr,
     REPS: tl.constexpr,
     NORM_EPS: tl.constexpr,
+    NREAL=None,
+    HAS_NREAL: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     if pid < M:
-        _reduce_route(RP, BIAS, SCORES, IDS, M, 256, RS, MULT, SCALE, 1e-15, False)
+        _reduce_route(RP, BIAS, SCORES, IDS, M, 256, RS, MULT, SCALE, 1e-15, False, NREAL, HAS_NREAL)
     else:
         row = (pid - M) // REPS
         replica = (pid - M) % REPS
@@ -116,6 +123,8 @@ def _joint_epilogue(
     MULT: tl.constexpr,
     SCALE: tl.constexpr,
     EPS: tl.constexpr,
+    NREAL,
+    HAS_NREAL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     s = tl.arange(0, SK)
@@ -137,6 +146,9 @@ def _joint_epilogue(
             biased = tl.where(n == idx, -float("inf"), biased)
             ids = tl.where(slots == j, idx, ids)
             selected = tl.where(slots == j, score, selected)
+        if HAS_NREAL:
+            # Rows from the real-row count on are graph padding: expert id -1 matches no rank's experts.
+            ids = tl.where(pid < tl.load(NREAL), ids, -1)
         tl.store(IDS + pid * 8 + slots, ids)
         tl.store(SCORES + pid * 8 + slots, selected * (SCALE / (denominator + 1e-15)))
     else:
@@ -293,20 +305,55 @@ def pack_joint_router_pooler_weight(router, pooler):
     return torch.cat([pooler, high, low], dim=0).contiguous()
 
 
-def joint_router_pooler_topk(x, packed, bias, norm, multiplier, scale, eps):
-    """Same outputs as ``router_pooler_topk`` from the packed joint weight, for 8 / 16 / 24 rows."""
-    m, k = x.shape
-    assert m in (8, 16, 24) and k == 8192 and packed.shape == (4608, 8192)
-    if m == 24:
-        from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+# Joint GEMM per verify width (every multiple of 8 rows up to 128), measured end to end with the epilogue on
+# MI355X with cold weights against the production route at each width (aiter-tune/joint_sweep.py): split-K with
+# one row tile covering the rows up to 40 rows (the bundle-v3 tiles), hipBLASLt BF16 x BF16 -> FP32 above, which
+# is 0.7-1.7 us faster at 48..64 rows and 6-8 us faster than the TP4 high-M route at 80..128. The hipBLASLt
+# solution ids are this image's (hipb_findallsols on the [M, 8192] x [8192, 4608] problem at each width).
+_JOINT_DISPATCH = {
+    **{m: ("splitk", 16, 4) for m in (8, 16)},
+    **{m: ("splitk", 32, 4) for m in (24, 32)},
+    40: ("splitk", 64, 4),
+    **{m: ("hipblaslt", 442670) for m in (48, 56, 64)},
+    **{m: ("hipblaslt", 442661) for m in (72, 80, 88)},
+    **{m: ("hipblaslt", 442158) for m in (96, 104, 112, 120, 128)},
+}
+JOINT_ROWS = tuple(_JOINT_DISPATCH)
 
-        partial = gemm_a16w16(x, packed, dtype=torch.float32, skip_reduce=True)
-        sk = partial.shape[0] if partial.ndim == 3 else 1
+
+def joint_router_pooler_topk(x, packed, bias, norm, multiplier, scale, eps, num_real=None):
+    """Same outputs as ``router_pooler_topk`` from the packed joint weight, for verify widths of 8..128 rows.
+
+    ``num_real`` (device int32, the graph's real-row count) turns the expert ids of the padded rows
+    after it into -1; real rows are unchanged."""
+    m, k = x.shape
+    assert m in _JOINT_DISPATCH and k == 8192 and packed.shape == (4608, 8192)
+    kind, *params = _JOINT_DISPATCH[m]
+    if kind == "hipblaslt":
+        from aiter import hipb_mm
+
+        # One FP32 partial [M, 4608]; the hipBLASLt handle is created at weight preparation, before capture.
+        partial = hipb_mm(x, packed.t(), params[0], bias=None, out_dtype=torch.float32)
+        sk = 1
     else:
         sk = 8
+        block_m, warps = params
         partial = torch.empty((sk, m, 4608), device=x.device, dtype=torch.float32)
-        bf16_splitk_gemm_partials(
-            x, packed, partial, block_n=64, block_k=128, split_k=sk
+        _dense_partial[(4608 // 64, triton.cdiv(m, block_m), sk)](
+            x,
+            packed,
+            partial,
+            m,
+            4608,
+            8192,
+            block_m,
+            64,
+            128,
+            sk,
+            ".cg",
+            num_warps=warps,
+            num_stages=2,
+            matrix_instr_nonkdim=16,
         )
     assert partial.dtype == torch.float32 and sk & (sk - 1) == 0
     scores = torch.empty((m, 8), device=x.device, dtype=torch.float32)
@@ -324,6 +371,88 @@ def joint_router_pooler_topk(x, packed, bias, norm, multiplier, scale, eps):
         multiplier,
         scale,
         eps,
+        num_real,
+        num_real is not None,
         num_warps=4,
+    )
+    return scores, ids, expert_input
+
+
+# These are padded verify row counts, not an interval. Small-M and EP8 callers
+# continue to use the original entry points above.
+TP4_HIGH_M_ROWS = (80, 96, 112, 128)
+TP4_HIGH_M_ROUTER_CONFIG = {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 32,
+    "SPLIT_K": 32,
+    "num_warps": 4,
+    "num_stages": 2,
+}
+
+
+def router_pooler_topk_high_m(
+    x, router_weight, bias, norm_weight, multiplier, scale, eps, *, pooler, num_real=None
+):
+    """Fuse the *tuned* high-M router reduction with routing and pooler norm.
+
+    ``pooler(x)`` must be the caller's original dense projection, returning its
+    completed BF16 output. No new tiled-weight copy, GEMV schedule, or pooler
+    arithmetic is introduced. The host's TP4 target-verify guard must pass first.
+    The original SK32 sequential router sum and BF16-before-RMS boundary remain.
+    ``num_real`` (device int32, the graph's real-row count) turns the expert ids of the padded rows
+    after it into -1; real rows are unchanged.
+    """
+    from sglang.kernels.ops.gemm.router_gemm_fp32 import (
+        _router_partial,
+        get_router_gemm_fp32_configs,
+    )
+
+    m, k = x.shape
+    assert m in TP4_HIGH_M_ROWS and k == 8192
+    assert (get_router_gemm_fp32_configs(256, k) or {}).get(
+        m
+    ) == TP4_HIGH_M_ROUTER_CONFIG
+    rp = torch.empty((32, m, 256), device=x.device, dtype=torch.float32)
+    # Match router_gemm_tuned, including its distinct contiguous kernel entry.
+    _router_partial[(2, 32, triton.cdiv(m, 16))](
+        x,
+        router_weight,
+        rp,
+        m,
+        256,
+        k,
+        16,
+        128,
+        32,
+        32,
+        num_warps=4,
+        num_stages=2,
+    )
+    dp = pooler(x)
+    assert dp.shape == (m, 4096) and dp.dtype == torch.bfloat16
+    assert dp.is_contiguous() and dp.device == x.device
+    scores = torch.empty((m, 8), device=x.device, dtype=torch.float32)
+    ids = torch.empty((m, 8), device=x.device, dtype=torch.int32)
+    expert_input = torch.empty((m, 4096), device=x.device, dtype=torch.bfloat16)
+    _route_preproject_epilogue[(2 * m,)](
+        rp,
+        dp,
+        bias,
+        norm_weight,
+        scores,
+        ids,
+        expert_input,
+        m,
+        4096,
+        1,
+        32,
+        multiplier,
+        scale,
+        1,
+        eps,
+        num_warps=4,
+        NREAL=num_real,
+        HAS_NREAL=num_real is not None,
     )
     return scores, ids, expert_input

@@ -93,11 +93,20 @@ from sglang.kernels.ops.attention.dcp_kernels import (
 )
 from sglang.kernels.ops.attention.gqa_verify_splitkv import gqa_verify_splitkv
 from sglang.kernels.ops.attention.gqa_verify_splitkv_2kv import (
+    can_gqa_verify_splitkv_4kv,
     gqa_verify_splitkv_2kv,
+    gqa_verify_splitkv_4kv,
+    pick_splits_4kv,
     pick_splits_v2,
 )
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.kernels.ops.attention.swa_verify_splitkv import swa_verify_splitkv
+from sglang.kernels.ops.attention.verify_tp4 import (
+    can_apply_output_gate,
+    can_verify_tp4,
+    verify_full_tp4,
+    verify_swa_tp4,
+)
 from sglang.kernels.ops.attention.utils import (
     launch_reshape_and_cache_flash,
     pad_sequence_with_mask,
@@ -199,6 +208,139 @@ _MUSE_VERIFY_FULL_GQA = (8, 64, 64, 4)
 _muse_verify_v2_logged: set = set()
 
 
+def _muse_tp4_native_low_warps_context(model_runner, kernels) -> bool:
+    """Source-isolated experiment: native full verify only, never draft/EP8."""
+    return (
+        "full_gqa" in kernels
+        and not model_runner.is_draft_worker
+        and "MuseSparkForConditionalGeneration"
+        in (getattr(model_runner.model_config.hf_config, "architectures", None) or ())
+        and get_parallel().tp_size == 4
+        and get_parallel().attn_tp_size == 4
+        and get_parallel().moe_ep_size == 4
+        and get_parallel().attn_dcp_size == 1
+        and torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).gcnArchName.split(":")[0]
+        == "gfx950"
+    )
+
+
+def _muse_tp4_native_low_warps_abi(
+    q,
+    k,
+    v,
+    out,
+    cu,
+    seq,
+    table,
+    scale,
+    k_descale,
+    v_descale,
+    splits,
+    bn,
+    warps,
+) -> bool:
+    """Metadata-only guard for the captured native FP8-KV ABI; no GPU reads."""
+    batch = len(seq)
+    return (
+        batch in (8, 10, 12, 14, 16)
+        and q.shape == out.shape == (batch * 8, 32, 64)
+        and k.shape == v.shape
+        and k.shape[1:] == (16, 4, 64)
+        and q.dtype == out.dtype == torch.bfloat16
+        and k.dtype == v.dtype == torch.float8_e4m3fn
+        and q.stride() == out.stride() == (2048, 64, 1)
+        and k.stride() == v.stride() == (4096, 256, 64, 1)
+        and cu.shape == (batch + 1,)
+        and cu.dtype == torch.int32
+        and seq.shape == (batch,)
+        and seq.dtype == torch.int64
+        and cu.stride() == seq.stride() == (1,)
+        and table.ndim == 2
+        and table.shape[0] == batch
+        and table.dtype == torch.int32
+        and table.stride(1) == 1
+        and table.stride(0) >= table.shape[1]
+        and scale == 0.125
+        and k_descale is not None
+        and v_descale is not None
+        and k_descale.dtype == v_descale.dtype == torch.float32
+        and k_descale.numel() == v_descale.numel() == 1
+        and q.is_cuda
+        and all(
+            t.device == q.device
+            for t in (k, v, out, cu, seq, table, k_descale, v_descale)
+        )
+        and (splits, bn, warps) == (64, 64, 4)
+    )
+
+
+def _muse_tp4_native_swa_low_warps_context(model_runner, kernels) -> bool:
+    # Same host-only architecture/topology guard; independent of full enablement.
+    return "swa_gqa" in kernels and _muse_tp4_native_low_warps_context(
+        model_runner, frozenset({"full_gqa"})
+    )
+
+
+def _muse_tp4_native_swa_low_warps_abi(
+    q,
+    k,
+    v,
+    out,
+    cu,
+    seq,
+    table,
+    scale,
+    k_descale,
+    v_descale,
+    splits,
+    bn,
+    warps,
+) -> bool:
+    """Metadata-only guard for the captured native FP8-KV ABI; no GPU reads."""
+    batch = len(seq)
+    return (
+        batch in (10, 12, 14, 16)
+        and q.shape == out.shape == (batch * 8, 32, 64)
+        and k.shape == v.shape
+        and k.shape[1:] == (16, 4, 64)
+        and q.dtype == out.dtype == torch.bfloat16
+        and k.dtype == v.dtype == torch.float8_e4m3fn
+        and q.stride() == out.stride() == (2048, 64, 1)
+        and k.stride() == v.stride() == (4096, 256, 64, 1)
+        and cu.shape == (batch + 1,)
+        and cu.dtype == torch.int32
+        and seq.shape == (batch,)
+        and seq.dtype == torch.int64
+        and cu.stride() == seq.stride() == (1,)
+        and table.ndim == 2
+        and table.shape[0] == batch
+        and table.dtype == torch.int32
+        and table.stride(1) == 1
+        and table.stride(0) >= table.shape[1]
+        and scale == 0.125
+        and k_descale is not None
+        and v_descale is not None
+        and k_descale.dtype == v_descale.dtype == torch.float32
+        and k_descale.numel() == v_descale.numel() == 1
+        and q.is_cuda
+        and all(
+            t.device == q.device
+            for t in (k, v, out, cu, seq, table, k_descale, v_descale)
+        )
+        and (splits, bn, warps) == (16, 64, 4)
+    )
+
+
+def _take_output_gate(out, output_gate):
+    """(gate, eps) for a verify_tp4 merge that applies the output norm and gate, marking it applied; else None."""
+    if output_gate is None or not can_apply_output_gate(out, output_gate.gate):
+        return None
+    output_gate.applied = True
+    return output_gate.gate, output_gate.eps
+
+
 def _muse_verify_attention(
     q,
     k,
@@ -215,14 +357,21 @@ def _muse_verify_attention(
     v_descale,
     sinks,
     kernels,
+    output_gate=None,
 ) -> bool:
     """Muse Spark target verify (8 tokens x GQA 8, head_dim 64, FP8 KV in 16-token
     pages) on the verify kernels; False leaves the call to unified_attention.
 
+    ``output_gate`` (``verify_tp4.OutputNormGate``): the verify_tp4 kernels also
+    apply the attention's output norm and gate when they can, and mark it applied.
+
     Sliding layers (2047-token window): split-KV up to 8 requests, GQA-folded
     tiles beyond. Full layers: the two-KV-head kernel (16 Q / 2 KV heads per
     rank, bitwise equal to the GQA-folded and 3D paths), else GQA-folded
-    split-KV from 8 requests. ``kernels`` holds the enabled kernel names.
+    split-KV from 8 requests. With 32 Q / 4 KV heads per rank (TP4) the TP4
+    switches select verify_tp4 at every batch size: verify_full_tp4 for full
+    layers (the four-KV-head kernel stays for layouts it does not accept) and
+    verify_swa_tp4 for sliding layers. ``kernels`` holds the enabled names.
     """
     num_tokens, num_query_heads, head_size = q.shape
     _, block_size, num_kv_heads, _ = k.shape
@@ -242,7 +391,35 @@ def _muse_verify_attention(
     ):
         return False
     if sliding_window == 2047 and window_size[1] == 0:
-        if "swa_splitkv" in kernels and num_query_heads == 16 and 0 < num_seqs <= 8:
+        # The existing kernels parameterize KV heads and all cache strides.
+        # Keep Q16 unchanged; Q32 is an independent opt-in, never a replacement
+        # for the global SWA split-KV opt-out. Inner Q/output dimensions are
+        # implicit unit strides in the kernel, unlike the cache dimensions.
+        tp4_swa = (
+            "swa_splitkv_tp4" in kernels
+            and num_query_heads == 32
+            and num_kv_heads == 4
+            and k.shape == v.shape
+            and k.shape[-1] == 64
+            and out.shape == q.shape
+            and out.dtype == torch.bfloat16
+            and q.stride(-1) == out.stride(-1) == 1
+            and (k_descale is None or k_descale.numel() == 1)
+            and (v_descale is None or v_descale.numel() == 1)
+        )
+        if tp4_swa and can_verify_tp4(
+            q, k, v, out, seqused_k, block_table, k_descale, v_descale
+        ):
+            verify_swa_tp4(
+                q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
+                window=sliding_window, output_gate=_take_output_gate(out, output_gate),
+            )  # fmt: skip
+            return True
+        if (
+            "swa_splitkv" in kernels
+            and (num_query_heads == 16 or tp4_swa)
+            and 0 < num_seqs <= 8
+        ):
             swa_verify_splitkv(
                 q, k, v, out, cu_seqlens_q, max_seqlen_q, seqused_k, None,
                 softmax_scale, True, window_size, block_table, softcap,
@@ -250,10 +427,19 @@ def _muse_verify_attention(
             )  # fmt: skip
             return True
         if "swa_gqa" in kernels and num_seqs > 8:
+            swa_warps = 4
+            if (
+                "swa_gqa_tp4_low_warps" in kernels
+                and _muse_tp4_native_swa_low_warps_abi(
+                    q, k, v, out, cu_seqlens_q, seqused_k, block_table,
+                    softmax_scale, k_descale, v_descale, 16, 64, 4,
+                )
+            ):
+                swa_warps = 2
             gqa_verify_splitkv(
                 q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale,
                 sliding_window, k_descale, v_descale,
-                splits=16 if num_seqs <= 16 else 8, bn=64, num_warps=4, num_stages=2,
+                splits=16 if num_seqs <= 16 else 8, bn=64, num_warps=swa_warps, num_stages=2,
             )  # fmt: skip
             return True
         return False
@@ -273,8 +459,62 @@ def _muse_verify_attention(
             splits=splits,
         )  # fmt: skip
         return True
+    # The TP4 opt-in is independent of the incumbent TP8 branch above.
+    # Both switches are required, and unsupported layouts keep their fallback.
+    if (
+        "full_v2" in kernels
+        and "full_v2_tp4" in kernels
+        and window_size == (-1, -1)
+        and can_verify_tp4(q, k, v, out, seqused_k, block_table, k_descale, v_descale)
+    ):
+        verify_full_tp4(
+            q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
+            output_gate=_take_output_gate(out, output_gate),
+        )  # fmt: skip
+        return True
+    if (
+        "full_v2" in kernels
+        and "full_v2_tp4" in kernels
+        and window_size == (-1, -1)
+        and can_gqa_verify_splitkv_4kv(
+            q, k, v, out, seqused_k, block_table, k_descale, v_descale
+        )
+    ):
+        gqa_verify_splitkv_4kv(
+            q,
+            k,
+            v,
+            out,
+            seqused_k,
+            block_table,
+            softmax_scale,
+            k_descale,
+            v_descale,
+            splits=pick_splits_4kv(num_seqs),
+        )
+        return True
     min_seqs, splits, bn, warps = _MUSE_VERIFY_FULL_GQA
     if "full_gqa" in kernels and num_seqs >= min_seqs:
+        if (
+            "full_gqa_tp4_low_warps" in kernels
+            and window_size == (-1, -1)
+            and _muse_tp4_native_low_warps_abi(
+                q,
+                k,
+                v,
+                out,
+                cu_seqlens_q,
+                seqused_k,
+                block_table,
+                softmax_scale,
+                k_descale,
+                v_descale,
+                splits,
+                bn,
+                warps,
+            )
+        ):
+            warps = 1 if num_seqs == 8 else 2
         gqa_verify_splitkv(
             q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale, 0,
             k_descale, v_descale, splits=splits, bn=bn, num_warps=warps, num_stages=2,
@@ -708,6 +948,11 @@ class AiterAttnBackend(AttentionBackend):
             and self.head_dim == 64
             and self.num_head == 8 * self.num_kv_head
         )
+        # Unified verify sizes from the page table, so spec_v2 overlap can resolve
+        # seq_lens on the forward stream instead of a host sync every step.
+        self.needs_cpu_seq_lens = not (
+            self.use_muse_attention_paths and self._use_unified_verify
+        )
         self.muse_reuse_extend_metadata = (
             self.use_muse_attention_paths
             and envs.SGLANG_MUSE_REUSE_EXTEND_METADATA.get()
@@ -725,12 +970,42 @@ class AiterAttnBackend(AttentionBackend):
             name
             for name, env in (
                 ("swa_splitkv", envs.SGLANG_MUSE_VERIFY_SWA_SPLITKV),
+                ("swa_splitkv_tp4", envs.SGLANG_MUSE_TP4_VERIFY_SWA_SPLITKV),
                 ("swa_gqa", envs.SGLANG_MUSE_VERIFY_SWA_GQA),
                 ("full_v2", envs.SGLANG_MUSE_VERIFY_FULL_V2),
                 ("full_gqa", envs.SGLANG_MUSE_VERIFY_FULL_GQA),
             )
-            if self.use_muse_attention_paths and self._use_unified_verify and env.get()
+            if self.use_muse_attention_paths
+            and self._use_unified_verify
+            and env.get()
+            and (
+                name != "swa_splitkv_tp4"
+                or (
+                    get_parallel().attn_tp_size == 4
+                    and "MuseSparkForConditionalGeneration"
+                    in (
+                        getattr(model_runner.model_config.hf_config, "architectures", None)
+                        or ()
+                    )
+                )
+            )
         )
+        if (
+            "full_v2" in self.muse_verify_kernels
+            and envs.SGLANG_MUSE_TP4_VERIFY_FULL_V2.get()
+            and "MuseSparkForConditionalGeneration"
+            in (model_runner.model_config.hf_config.architectures or ())
+            and not model_runner.is_draft_worker
+            and get_parallel().tp_size == 4
+            and get_parallel().attn_tp_size == 4
+            and get_parallel().moe_ep_size == 4
+            and get_parallel().attn_dcp_size == 1
+        ):
+            self.muse_verify_kernels |= {"full_v2_tp4"}
+        if _muse_tp4_native_low_warps_context(model_runner, self.muse_verify_kernels):
+            self.muse_verify_kernels |= {"full_gqa_tp4_low_warps"}
+        if _muse_tp4_native_swa_low_warps_context(model_runner, self.muse_verify_kernels):
+            self.muse_verify_kernels |= {"swa_gqa_tp4_low_warps"}
         # Extra unified_attention() arguments for Muse extend / verify calls.
         self.muse_unified_attention_kwargs = {}
         if self.use_muse_attention_paths and _unified_attention_has_muse_tiles:
@@ -1485,7 +1760,12 @@ class AiterAttnBackend(AttentionBackend):
                     q_u.shape[0],
                     self.forward_metadata.max_q_len,
                 )
-        unified_attention(
+        prefill_attention = unified_attention
+        if os.environ.get("SGLANG_MUSE_TP4_PREFILL_MAXSCALE", "0") == "1":
+            from functools import partial
+            from sglang.srt.rocm_muse_spark.prefill_maxscale import run
+            prefill_attention = partial(run, unified_attention)
+        prefill_attention(
             q=q_u,
             k=k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
             v=v_cache.view(-1, self.page_size, layer.tp_v_head_num, layer.v_head_dim),
@@ -3997,6 +4277,7 @@ class AiterAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         sinks=None,
+        output_gate=None,
     ):
         self.logits_soft_cap = layer.logit_cap
 
@@ -4539,6 +4820,7 @@ class AiterAttnBackend(AttentionBackend):
                             v_descale,
                             sinks,
                             self.muse_verify_kernels,
+                            output_gate,
                         )
                     ):
                         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -5263,6 +5545,30 @@ class AiterAttnBackend(AttentionBackend):
         return o
 
 
+# Measurement only: SGLANG_MUSE_HOST_SYNC_AB_DIR names a directory whose files switch the extend-path kv_indices
+# tail fill at run time, so one server can time both paths: "device-index" restores the original host-syncing
+# slice, "check" compares both fills (bitwise) on every prefill and appends the result to check.jsonl there.
+# Unset (production), the host-side sum is always used and no file is looked at.
+_HOST_SYNC_AB_DIR = os.environ.get("SGLANG_MUSE_HOST_SYNC_AB_DIR")
+
+
+def _host_sync_ab(name: str) -> bool:
+    return _HOST_SYNC_AB_DIR is not None and os.path.exists(os.path.join(_HOST_SYNC_AB_DIR, name))
+
+
+def _check_host_sum(kv_indices: torch.Tensor, kv_indptr: torch.Tensor, host_sum: int) -> None:
+    import json
+
+    device_sum = int(kv_indptr[-1])
+    by_device, by_host = kv_indices.clone(), kv_indices.clone()
+    by_device[device_sum:] = by_device[0]
+    by_host[host_sum:] = by_host[0]
+    record = dict(device_sum=device_sum, host_sum=host_sum, bitwise_equal=bool(torch.equal(by_device, by_host)),
+                  numel=kv_indices.numel(), rank=torch.cuda.current_device())
+    with open(os.path.join(_HOST_SYNC_AB_DIR, "check.jsonl"), "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
 class AiterIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
         # Parse Constants
@@ -5348,8 +5654,16 @@ class AiterIndicesUpdaterPrefill:
                 self.req_to_token.shape[1],
             )
 
-            token_num = kv_indptr[-1]
-            kv_indices[token_num:] = kv_indices[0]
+            # kv_indptr[-1] == paged_kernel_lens_sum, which the host already has; slicing with the device scalar
+            # would block the CPU until the forward stream drains (19-29 ms per prefill in serving: the CPU
+            # waits for the previous decode step instead of launching the prefill behind it).
+            if _host_sync_ab("device-index"):
+                token_num = kv_indptr[-1]
+                kv_indices[token_num:] = kv_indices[0]
+            else:
+                if _host_sync_ab("check"):
+                    _check_host_sum(kv_indices, kv_indptr, paged_kernel_lens_sum)
+                kv_indices[paged_kernel_lens_sum:] = kv_indices[0]
 
             extend_lens = seq_lens - prefix_lens
 
