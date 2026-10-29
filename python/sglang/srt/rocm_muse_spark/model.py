@@ -65,6 +65,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.rocm_muse_spark import (
     ep4_placement,
+    fused_collectives,
     mxfp4_moe,
     router_pooler,
     single_layout,
@@ -996,13 +997,23 @@ class MuseSpark1xMoE(nn.Module):
                 expert_input = sp_gather(expert_input, rows)
             topk_ids = sp_gather(topk_ids, rows)
             topk_scores = sp_gather(topk_scores, rows)
-        output = self.run_experts(
-            expert_input, topk_scores, topk_ids, target_verify, use_a4w4, quantized
+        output = (
+            fused_collectives.finalize_all_reduce(
+                self, expert_input, topk_scores, topk_ids
+            )
+            if sp is None
+            and not use_a4w4
+            and self.uses_compact_a4(expert_input, target_verify)
+            else None
         )
-        if sp is not None:
-            output = sp_reduce_scatter(output, sp.padded)
-        elif self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output)
+        if output is None:
+            output = self.run_experts(
+                expert_input, topk_scores, topk_ids, target_verify, use_a4w4, quantized
+            )
+            if sp is not None:
+                output = sp_reduce_scatter(output, sp.padded)
+            elif self.tp_size > 1:
+                output = tensor_model_parallel_all_reduce(output)
         if skip_post_expert_proj:
             return output
         return self.unpool(output)
@@ -1078,6 +1089,27 @@ class MuseSpark1xMoE(nn.Module):
             and getattr(self.experts, "a4w4_weights", None) is not None
         )
 
+    def uses_compact_a4(self, expert_input, target_verify: bool) -> bool:
+        """Whether the compact-A4 target-verify experts serve these rows."""
+        rows = expert_input.shape[0]
+        return (
+            mxfp4_moe.COMPACT_A4_ENABLED
+            and target_verify
+            and self.mxfp4_checkpoint
+            and (
+                (self.tp_size == self.ep_size == 8 and self.num_local_experts == 32)
+                or (
+                    mxfp4_moe.TP4_COMPACT_A4_ENABLED
+                    and self.tp_size == self.ep_size == 4
+                    and self.num_local_experts == 64
+                    and rows in mxfp4_moe.COMPACT_A4_TP4_ROWS
+                )
+            )
+            and self.top_k == 8
+            and rows % 8 == 0
+            and 0 < rows <= mxfp4_moe.COMPACT_A4_MAX_ROWS
+        )
+
     def run_experts(
         self,
         expert_input,
@@ -1102,23 +1134,7 @@ class MuseSpark1xMoE(nn.Module):
                 gain,
                 quantized=quantized,
             )
-        if (
-            mxfp4_moe.COMPACT_A4_ENABLED
-            and target_verify
-            and self.mxfp4_checkpoint
-            and (
-                (self.tp_size == self.ep_size == 8 and self.num_local_experts == 32)
-                or (
-                    mxfp4_moe.TP4_COMPACT_A4_ENABLED
-                    and self.tp_size == self.ep_size == 4
-                    and self.num_local_experts == 64
-                    and expert_input.shape[0] in mxfp4_moe.COMPACT_A4_TP4_ROWS
-                )
-            )
-            and self.top_k == 8
-            and expert_input.shape[0] % 8 == 0
-            and 0 < expert_input.shape[0] <= mxfp4_moe.COMPACT_A4_MAX_ROWS
-        ):
+        if self.uses_compact_a4(expert_input, target_verify):
             norm_weight, gain, has_norm = _post_expert_norm_args(self.post_expert_norm)
             assert has_norm and norm_weight is not None
             if not self._compact_a4_reported:
@@ -1256,11 +1272,20 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 reduce=False,
             )
             attn_output = sp_reduce_scatter(partial, sp.padded)
+        elif fused_collectives.fuses_attention_boundary(
+            self._fused_attn_boundary, attn_input, stream
+        ):
+            partial = self.self_attn(positions, attn_input, forward_batch, reduce=False)
+            ffn_input, stream = fused_collectives.all_reduce_attention_boundary(
+                self._fused_attn_boundary, partial, stream
+            )
+            attn_output = None
         else:
             attn_output = self.self_attn(positions, attn_input, forward_batch)
-        ffn_input, stream, _ = self._fused_attn_boundary.forward(
-            stream, attn_output, branch_dtype=torch.bfloat16
-        )
+        if attn_output is not None:
+            ffn_input, stream, _ = self._fused_attn_boundary.forward(
+                stream, attn_output, branch_dtype=torch.bfloat16
+            )
         target_verify = forward_batch.forward_mode.is_target_verify()
         if (
             sp is None
@@ -2092,6 +2117,7 @@ class MuseSparkTextForCausalLM(single_layout.SingleLayoutStateDictGuard, nn.Modu
             ensure = getattr(op, "_ensure_cached_weights", None)
             if ensure is not None:
                 ensure(torch.bfloat16)
+        fused_collectives.install(get_parallel().tp_group)
 
 
 __all__ = [

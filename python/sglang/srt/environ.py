@@ -1936,6 +1936,10 @@ class Envs:
     SGLANG_MUSE_EP4_PLACEMENT = EnvBool(False)
     # Padded target-verify graph rows get expert id -1 in the joint router/pooler.
     SGLANG_MUSE_TP4_VERIFY_PAD_MASK = EnvBool(False)
+    # TP4 target-verify graphs: the compact-A4 MoE finalize fused with its
+    # all-reduce, and the attention all-reduce fused with the attention boundary.
+    SGLANG_MUSE_TP4_FUSED_FINALIZE_AR = EnvBool(False)
+    SGLANG_MUSE_TP4_FUSED_AR_BOUNDARY = EnvBool(False)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )
