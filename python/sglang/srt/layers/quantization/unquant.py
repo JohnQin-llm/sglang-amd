@@ -82,6 +82,20 @@ _A16W16_TRITON_NARROW_K = 512
 _A16W16_TRITON_NARROW_K_MAX_M = 512
 
 
+_gfx950_tiled_weight_shapes: set = set()
+_gfx950_triton_a16w16_shapes: set = set()
+
+
+def register_gfx950_unquantized_gemm_shapes(
+    *, tiled_weights=(), triton_a16w16=()
+) -> None:
+    """Opt (N, K) weight shapes into the tiled small-M GEMM and exact (M, N, K)
+    shapes into the aiter Triton a16w16 GEMM. Recorded only; the dispatch here
+    does not read them, so there is no effect off gfx950."""
+    _gfx950_tiled_weight_shapes.update(tuple(s) for s in tiled_weights)
+    _gfx950_triton_a16w16_shapes.update(tuple(s) for s in triton_a16w16)
+
+
 def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """Return whether the Triton BF16 path supports this decode shape."""
     if x.dim() != 2 or weight.dim() != 2:
