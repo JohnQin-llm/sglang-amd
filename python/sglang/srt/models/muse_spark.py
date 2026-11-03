@@ -98,7 +98,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import add_prefix, is_cpu, use_intel_amx_backend
-from sglang.srt.utils.common import get_device_capability, is_cuda
+from sglang.srt.utils.common import get_device_capability, is_cuda, is_hip
 
 _is_cpu = is_cpu()
 
@@ -1635,6 +1635,12 @@ class MuseSparkTextForCausalLM(nn.Module):
                 and not self.int4_checkpoint
             ):
                 module.experts.prepare_trtllm_weights(module.experts.post_expert_norm)
+
+
+# The ROCm model keeps the Quark MXFP4 loader and the fused boundaries that were
+# validated together on MI355X.
+if is_hip():
+    from sglang.srt.rocm_muse_spark.model import MuseSparkTextForCausalLM
 
 
 __all__ = [
