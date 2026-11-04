@@ -93,6 +93,7 @@ from sglang.srt.rocm_muse_spark.sequence_parallel import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
+from sglang.srt.rocm_muse_spark import mono_gfx1250 as _k2g
 
 logger = logging.getLogger(__name__)
 
@@ -581,6 +582,7 @@ class MuseSpark1xAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         reduce: bool = True,
+        core_only: bool = False,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -611,6 +613,8 @@ class MuseSpark1xAttention(nn.Module):
             q, k = fused_qk if kv_written else self.qk_norm_rope(positions, q, k)
         output = self.attn(q, k, v, forward_batch, save_kv_cache=not kv_written)
         output = self._fused_o_norm_gate.forward(output, o_gate)
+        if core_only:
+            return output
         output, _ = self.o_proj(output, skip_all_reduce=not reduce)
         return output
 
@@ -1195,6 +1199,23 @@ class MuseSpark1xDecoderLayer(nn.Module):
         attn_input = (
             self.self_attn_input_norm(stream) if attn_input is None else attn_input
         )
+        k2r = _k2g.RUNNER
+        if (
+            k2r is not None
+            and sp is None
+            and ffn_boundary is not None
+            and k2r.takes(self.layer_idx, stream.shape[0], forward_batch)
+        ):
+            # K2: o_proj, attention boundary and the MoE branch in one launch a rank.
+            core = self.self_attn(positions, attn_input, forward_batch, core_only=True)
+            stream, branch = k2r.run(self.layer_idx, core, stream)
+            next_attn_input, stream, _ = ffn_boundary.forward(
+                stream,
+                branch,
+                branch_dtype=torch.bfloat16,
+                pre_norm_dtype=pre_norm_dtype,
+            )
+            return stream, next_attn_input
         if sp is not None and hasattr(self.self_attn, "ulysses_qkv_weight"):
             attn_output = ulysses_attention(
                 self.self_attn, attn_input, positions, forward_batch, sp
@@ -1390,6 +1411,12 @@ class MuseSpark1xModel(nn.Module):
             final_pre_norm_dtype = torch.bfloat16
             attn_input = self.layers[0].self_attn_input_norm(stream)
             last = len(self.layers) - 1
+            if (
+                _k2g.RUNNER is not None
+                and sp is None
+                and _k2g.RUNNER.takes_step(stream.shape[0], forward_batch)
+            ):
+                _k2g.RUNNER.begin_step()
             for i, layer in enumerate(self.layers):
                 stream, attn_input = layer(
                     positions,
@@ -1894,6 +1921,8 @@ class MuseSparkTextForCausalLM(nn.Module):
             ensure = getattr(op, "_ensure_cached_weights", None)
             if ensure is not None:
                 ensure(torch.bfloat16)
+        if _k2g.ENABLED:
+            _k2g.build_runner(self)
 
 
 __all__ = [
