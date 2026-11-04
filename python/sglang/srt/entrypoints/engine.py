@@ -1872,6 +1872,13 @@ class Engine(EngineScoreMixin, EngineBase):
 
 def _set_envs_and_config(server_args: ServerArgs):
     cfg = resolving_view(server_args)
+    # ROCm: HIP initializes in this process at import (the platform probe), and
+    # rocprofiler-register then exports ROCPROFILER_REGISTER_LIBRARY. A worker that
+    # starts with it set gets no GPU activity from torch.profiler (/start_profile
+    # traces hold CPU ops only), so the workers must not inherit it. It is set by
+    # native code after os.environ was read, so os.environ.pop alone would not unset it.
+    os.environ.pop("ROCPROFILER_REGISTER_LIBRARY", None)
+    os.unsetenv("ROCPROFILER_REGISTER_LIBRARY")
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
     # cuMem-based buffers and MNNVL transport. Default them on (user-set
