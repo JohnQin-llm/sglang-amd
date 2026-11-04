@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.gemm import gfx1250_decode_gemm
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
@@ -61,6 +62,15 @@ except ImportError:
     _flashinfer_top_k = None
 
 
+def _linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``x @ weight.T`` without bias; decode widths take the gfx1250 tuned GEMM when it covers the shape."""
+    if x.dim() >= 2 and x.is_contiguous():
+        y = gfx1250_decode_gemm.mm(x.view(-1, x.shape[-1]), weight, x.dtype)
+        if y is not None:
+            return y.view(*x.shape[:-1], weight.shape[0])
+    return F.linear(x, weight)
+
+
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     # The selector's largest single cost: it reads the whole logits tensor.
     if _flashinfer_top_k is not None:
@@ -92,7 +102,7 @@ def _project_candidate_logits(
     """Project draft hiddens through the target head, restricted to the org vocab."""
     if not use_quant_head:
         weight = lm_head.weight
-        return torch.matmul(hidden.to(weight.dtype), weight[:num_org].T)
+        return _linear(hidden.to(weight.dtype), weight[:num_org])
     # A packed weight can't be row-sliced to the org vocab like the dense path,
     # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
     # mask the padded tail out of the top-k instead.
@@ -547,7 +557,7 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def prepare(self, hidden_states: torch.Tensor):
-        coefficients = self.kernel_projection(hidden_states).reshape(
+        coefficients = _linear(hidden_states, self.kernel_projection.weight).reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
         return (
@@ -799,9 +809,10 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        projected = self.fc(target_hidden)
         if self.quantizable:
-            projected = projected[0]
+            projected = self.fc(target_hidden)[0]
+        else:
+            projected = _linear(target_hidden, self.fc.weight)
         return self.hidden_norm(projected)
 
     @torch.no_grad()
@@ -1145,7 +1156,7 @@ class CandidateSelector(nn.Module):
         """
         # Everything but the batch is a model constant. Left symbolic, inductor
         # recovers indices with an integer division per element instead of folding.
-        hidden = self.hidden_projection(hidden_states)
+        hidden = _linear(hidden_states, self.hidden_projection.weight)
         for tensor in (candidate_ids, unary_logits, hidden):
             torch._dynamo.mark_static(tensor, 1)
             torch._dynamo.mark_static(tensor, 2)

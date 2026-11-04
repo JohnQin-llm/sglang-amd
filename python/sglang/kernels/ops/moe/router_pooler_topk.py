@@ -14,6 +14,8 @@ Router ids follow the unfused routing sequence; the pooler and router projection
 FP32 summation order (and, for the joint form, the two-part BF16 router weights).
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -284,6 +286,14 @@ def _router_topk_completed_pooler(
     return scores, ids, expert_input
 
 
+@functools.cache
+def _is_gfx1250() -> bool:
+    return (
+        torch.version.hip is not None
+        and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    )
+
+
 def pack_joint_router_pooler_weight(router, pooler):
     """``[pooler; router.T high BF16; router.T low BF16]`` -> [4608, 8192] BF16."""
     assert router.shape == (8192, 256) and router.dtype == torch.float32
@@ -305,8 +315,17 @@ def joint_router_pooler_topk(x, packed, bias, norm, multiplier, scale, eps):
     else:
         sk = 8
         partial = torch.empty((sk, m, 4608), device=x.device, dtype=torch.float32)
+        # gfx1250: 32-column tiles on one warp, 3 stages (11.8 vs 14.4 us at 8 rows; same splits, same partials).
+        gfx1250 = _is_gfx1250()
         bf16_splitk_gemm_partials(
-            x, packed, partial, block_n=64, block_k=128, split_k=sk
+            x,
+            packed,
+            partial,
+            block_n=32 if gfx1250 else 64,
+            block_k=128,
+            split_k=sk,
+            num_warps=1 if gfx1250 else 4,
+            num_stages=3 if gfx1250 else 2,
         )
     assert partial.dtype == torch.float32 and sk & (sk - 1) == 0
     scores = torch.empty((m, 8), device=x.device, dtype=torch.float32)

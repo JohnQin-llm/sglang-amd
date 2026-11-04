@@ -2009,6 +2009,8 @@ class Envs:
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )
+    # DFlash draft block attention to its sliding window on the split-KV kernel.
+    SGLANG_MUSE_DFLASH_SPLITKV = EnvBool(False)
     # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
     # registers (O projection, MoE pooler, DFlash draft MLP).
     SGLANG_MUSE_DENSE_TILED = EnvBool(True)
@@ -2019,6 +2021,9 @@ class Envs:
     # and joint router/pooler projections.
     SGLANG_MUSE_FUSED_QKV_CACHE = EnvBool(True)
     SGLANG_MUSE_QK_ROPE_CACHE = EnvBool(True)
+    # TP4 (32 Q / 4 KV heads) forms of the two fused KV writes above.
+    SGLANG_MUSE_TP4_FUSED_QKV_CACHE = EnvBool(False)
+    SGLANG_MUSE_TP4_QK_ROPE_CACHE = EnvBool(False)
     SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY = EnvBool(True)
     SGLANG_MUSE_COMPACT_A4_VERIFY = EnvBool(True)
     SGLANG_MUSE_A4W4_MOE = EnvBool(True)

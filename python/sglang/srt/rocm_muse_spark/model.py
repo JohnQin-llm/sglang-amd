@@ -30,6 +30,7 @@ from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
     tiled_gemm,
     tiled_gemm_applies,
 )
+from sglang.kernels.ops.gemm import gfx1250_decode_gemm
 from sglang.kernels.ops.gemm.router_gemm_fp32 import (
     router_gemm_tuned,
     router_gemv_fp32,
@@ -118,6 +119,15 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
             or out.dtype != output_dtype
         ):
             out = None
+        if embedding_bias is None and hidden_states.dim() == 2:
+            logits = gfx1250_decode_gemm.mm(
+                hidden_states.to(lm_head.weight.dtype).contiguous(),
+                lm_head.weight,
+                output_dtype,
+                out,
+            )
+            if logits is not None:
+                return logits
         logits = torch.mm(
             hidden_states.to(lm_head.weight.dtype),
             lm_head.weight.T,
@@ -402,6 +412,10 @@ def _dense_linear(x: torch.Tensor, linear: nn.Linear, max_m: int) -> torch.Tenso
     tiled = getattr(linear, "small_m_tiled_weight", None)
     if tiled is not None and linear.bias is None and tiled_gemm_applies(x, tiled):
         return tiled_gemm(x, tiled, *linear.weight.shape)
+    if linear.bias is None:
+        y = gfx1250_decode_gemm.mm(x, linear.weight)
+        if y is not None:
+            return y
     if (
         _DENSE_TUNED
         and linear.bias is None

@@ -551,6 +551,12 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
+        # Unified verify sizes from the page table, so spec_v2 overlap can resolve
+        # seq_lens on the forward stream instead of a host sync every step.
+        self.needs_cpu_seq_lens = not (
+            self._use_unified_verify
+            and get_bool_env_var("SGLANG_AITER_SYNC_FREE_VERIFY", "0")
+        )
 
         # aiter kernel related initialization
         self.max_num_partitions = (

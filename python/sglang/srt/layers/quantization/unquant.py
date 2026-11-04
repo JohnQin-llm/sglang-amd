@@ -75,6 +75,8 @@ if _use_aiter:
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
 
+    from sglang.kernels.ops.gemm import gfx1250_decode_gemm
+
 # Route supported decode shapes that are absent from the tuned table.
 _A16W16_TRITON_MAX_K = 2048
 _A16W16_TRITON_MAX_M = 64
@@ -606,6 +608,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
+            if bias is None:
+                y = gfx1250_decode_gemm.mm(x, layer.weight, x.dtype)
+                if y is not None:
+                    return y
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
