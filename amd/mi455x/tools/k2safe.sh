@@ -1,15 +1,18 @@
 #!/bin/bash
 # Run one K2 GPU job safely: refuse if the GPUs are unhealthy or busy, hold all four GPU locks,
 # hard-timeout the job, then check the GPUs drained and the driver logged no MES/queue errors.
-# Usage: k2safe.sh [-t seconds] [-e VAR=val ...] <tree> <script under tree> [args...]
+# Usage: k2safe.sh [-t seconds] [-e VAR=val ...] [-w 'wrapper cmd'] <tree> <script under tree> [args...]
+#   -w runs the job under a wrapper inside the container (e.g. -w 'rocprofv3 --pmc SQ_WAVES -d /tmp/p --'
 #   e.g. k2safe.sh /data/muse455/k2/ep1 s3/run_k2.py --layers 31 --reps 20 --iters 20
 set -uo pipefail
 T=300
 ENVS=()
+WRAP=
 while [ $# -gt 0 ]; do
   case "$1" in
     -t) T=$2; shift 2 ;;
     -e) ENVS+=(-e "$2"); shift 2 ;;
+    -w) WRAP=$2; shift 2 ;;
     *) break ;;
   esac
 done
@@ -35,7 +38,7 @@ for fd in 10 11 12 13; do flock -w 900 $fd || { echo "[k2safe] could not take th
 [ -n "$(gpu_busy)" ] && { echo "[k2safe] refused: GPUs busy before the run"; exit 93; }
 m0=$(mes_errors)
 echo "[k2safe] $(date -u +%T) start: $SCRIPT $* (timeout ${T}s)"
-timeout -k 20 $T docker exec "${ENVS[@]}" $C bash -c "cd /tmp && PYTHONSAFEPATH=1 PYTHONPATH=$TREE timeout -k 10 $((T - 10)) python3 $TREE/$SCRIPT $*"
+timeout -k 20 $T docker exec "${ENVS[@]}" $C bash -c "cd /tmp && PYTHONSAFEPATH=1 PYTHONPATH=$TREE timeout -k 10 $((T - 10)) $WRAP python3 $TREE/$SCRIPT $*"
 rc=$?
 for i in $(seq 1 12); do [ -z "$(gpu_busy)" ] && break; sleep 5; done
 m1=$(mes_errors)

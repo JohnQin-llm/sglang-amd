@@ -1,0 +1,80 @@
+# K2 persistent MoE mono kernel, Muse Spark Open 816B, MI455X (gfx1250), TP4 / EP1, 8-row verify step.
+# Stage ledger of the kept tree (/data/muse455/k2/ep1) at layer 31, rank 0: measured times are the earliest-CTA
+# stamps of `s3/probe_b2b.py --timeline` (K2_DEBUG_TL=1, /data/muse455/k2/lane/test/tl_kept_L31.txt); the
+# kernel's time is the last CTA's end (CTA span max 76.0 us; the serving profile shows 76.7 us per layer).
+# Byte floors are the stage's weights per GPU; hop floors are the measured one-way XGMI hop inside a kernel
+# (2.05 us, lane D) and an on-GPU hop (0.5 us); 16.5 TB/s is the measured streaming rate (lane D stream_bw).
+
+task_id: k2_mono_gfx1250_c1
+description: >
+  Halve the K2 MoE mono kernel: 76 -> ~38-40 us per layer at 8 verify rows, numerics unchanged
+  (stream cosine >= 0.999 vs the stock served path, routes equal, graph replays bit-identical).
+operation: moe_mono_layer
+dtype: mxfp4
+gpu_target: gfx1250
+
+shapes:
+  primary: {tokens: 8, hidden_dim: 8192, core_per_rank: 2048, experts: 256, top_k: 8, intermediate_dim: 4096, tp: 4}
+
+targets:
+  speedup_vs_baseline: 1.9
+  baseline_desc: "kept K2 tree /data/muse455/k2/ep1, 76.0 us per layer (CTA span max), 80 us in the A/B harness"
+
+roofline_model:
+  complete: true
+  timing_domain: raw_kernel
+  measured_us: 76.0
+  hardware:
+    compute_tflops: 2500
+    hbm_tbs: 16.5
+    cache_tbs: 30.0
+    cu_count: 256
+    source: workload_matched_probe
+  stages:
+    - name: oproj_gemv
+      compulsory_hbm_bytes: 33554432
+      measured_us: 2.3
+      evidence: s3 timeline oproj CTA median
+    - name: allreduce1_hop
+      latency_floor_us: 2.05
+      measured_us: 7.6
+      evidence: launch -> seam sees AR 9.9 us, minus o_proj
+    - name: seam
+      latency_floor_us: 0.5
+      measured_us: 1.2
+    - name: router_route_chain
+      overlap_group: pre_expert
+      compulsory_hbm_bytes: 8388608
+      latency_floor_us: 3.05
+      measured_us: 9.8
+      evidence: seam done 11.1 -> route done 20.9 (router 1.8, RLOG hop 5.5, route 2.0)
+    - name: pool_xq_chain
+      overlap_group: pre_expert
+      compulsory_hbm_bytes: 16777216
+      latency_floor_us: 3.05
+      measured_us: 15.6
+      evidence: seam done 11.1 -> XQRDY seen 26.7 (pool done 14.8, all POOL seen 24.0, xq done 25.3)
+    - name: experts_ug_down
+      compulsory_hbm_bytes: 281000000
+      measured_us: 21.8
+      evidence: UG start 26.9 -> finalize start 48.7
+    - name: yr_hop
+      latency_floor_us: 2.05
+      measured_us: 5.3
+      evidence: finalize start 48.7 -> YR seen 54.0
+    - name: finalize
+      latency_floor_us: 1.0
+      measured_us: 4.6
+      evidence: YR seen 54.0 -> FIN done 58.6 (FMSQ device hop inside)
+    - name: fin_hop
+      latency_floor_us: 2.05
+      measured_us: 4.4
+      evidence: FIN done 58.6 -> unpooler sees FIN 63.0
+    - name: unpool_gemv
+      compulsory_hbm_bytes: 16777216
+      measured_us: 2.8
+      evidence: unpooler sees FIN 63.0 -> up done 65.8
+    - name: br_gather_done_tail
+      latency_floor_us: 4.6
+      measured_us: 10.2
+      evidence: up done 65.8 -> last CTA end 76.0 (BR hop, gather, done4 hop)

@@ -1,0 +1,77 @@
+{
+ "meta": {
+  "Kernel_Name": "muse_mono_k2g_s8_a8",
+  "Grid_Size": "131072",
+  "Workgroup_Size": "512",
+  "LDS_Block_Size": "145408",
+  "VGPR_Count": "112",
+  "SGPR_Count": "128",
+  "Scratch_Size": "0"
+ },
+ "per_agent": {
+  "Agent 2": {
+   "GL2C_EA_RDREQ_DRAM": 9986271.0,
+   "_dur_us": 166.0675,
+   "GL2C_EA_WRREQ_DRAM": 27778.0,
+   "GL2C_READ": 2292953.5,
+   "GL2C_WRITE": 41247.0,
+   "GL2C_HIT": 1091144.5,
+   "GL2C_MISS": 1262581.0,
+   "GL2C_BYPASS_REQ": 1684.0,
+   "GL2C_ATOMIC": 1.0,
+   "GL2C_EA_RDREQ_128B": 0.0,
+   "GL2C_EA_RDREQ_256B": 1264474.0,
+   "GL2C_EA_RDREQ_32B": 103.0,
+   "GL2C_EA_RDREQ_64B": 34.0,
+   "_launches": 48
+  },
+  "Agent 3": {
+   "GL2C_EA_RDREQ_DRAM": 10047316.5,
+   "_dur_us": 257.924,
+   "GL2C_EA_WRREQ_DRAM": 32152.0,
+   "GL2C_READ": 2448759.0,
+   "GL2C_WRITE": 41263.5,
+   "GL2C_HIT": 1186231.0,
+   "GL2C_MISS": 1267920.0,
+   "GL2C_BYPASS_REQ": 1710.0,
+   "GL2C_ATOMIC": 1.0,
+   "GL2C_EA_RDREQ_128B": 0.0,
+   "GL2C_EA_RDREQ_256B": 1269638.0,
+   "GL2C_EA_RDREQ_32B": 84.5,
+   "GL2C_EA_RDREQ_64B": 37.0,
+   "_launches": 48
+  },
+  "Agent 4": {
+   "GL2C_EA_RDREQ_DRAM": 10008670.0,
+   "_dur_us": 96.30449999999999,
+   "GL2C_EA_WRREQ_DRAM": 32942.0,
+   "GL2C_READ": 2201511.0,
+   "GL2C_WRITE": 41263.0,
+   "GL2C_HIT": 987307.5,
+   "GL2C_MISS": 1268403.5,
+   "GL2C_BYPASS_REQ": 1698.0,
+   "GL2C_ATOMIC": 1.0,
+   "GL2C_EA_RDREQ_128B": 0.0,
+   "GL2C_EA_RDREQ_256B": 1229149.5,
+   "GL2C_EA_RDREQ_32B": 98.5,
+   "GL2C_EA_RDREQ_64B": 37.0,
+   "_launches": 48
+  },
+  "Agent 5": {
+   "GL2C_EA_RDREQ_DRAM": 10029653.5,
+   "_dur_us": 245.0665,
+   "GL2C_EA_WRREQ_DRAM": 31783.0,
+   "GL2C_READ": 2378383.5,
+   "GL2C_WRITE": 41271.0,
+   "GL2C_HIT": 1187023.0,
+   "GL2C_MISS": 1259926.5,
+   "GL2C_BYPASS_REQ": 1697.5,
+   "GL2C_ATOMIC": 1.0,
+   "GL2C_EA_RDREQ_128B": 0.0,
+   "GL2C_EA_RDREQ_256B": 1270522.0,
+   "GL2C_EA_RDREQ_32B": 99.0,
+   "GL2C_EA_RDREQ_64B": 37.0,
+   "_launches": 48
+  }
+ }
+}

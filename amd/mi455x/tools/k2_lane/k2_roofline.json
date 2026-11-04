@@ -1,0 +1,258 @@
+{
+  "version": 1,
+  "status": "needs_evidence",
+  "operation": "moe_mono_layer",
+  "scope": {
+    "tokens": 8,
+    "hidden_dim": 8192,
+    "core_per_rank": 2048,
+    "experts": 256,
+    "top_k": 8,
+    "intermediate_dim": 4096,
+    "tp": 4
+  },
+  "timing_domain": "raw_kernel",
+  "acceptance_ready": false,
+  "evidence_level": "stage_ledger",
+  "hardware": {
+    "arch": "gfx1250/MI455X",
+    "cu_count": 256,
+    "compute_tflops": 2500.0,
+    "hbm_tbs": 16.5,
+    "cache_tbs": 30.0,
+    "source": "workload_matched_probe"
+  },
+  "measurement": {
+    "us": null,
+    "source": null
+  },
+  "stages": [
+    {
+      "name": "oproj_gemv",
+      "group": "oproj_gemv",
+      "terms_us": {
+        "hbm_us": 2.033602
+      },
+      "bound_us": 2.033602,
+      "governing_term": "hbm_us",
+      "diagnostic_only": false,
+      "measured_us": 2.3,
+      "gap_us": 0.266398,
+      "evidence": "s3 timeline oproj CTA median",
+      "compulsory_hbm_bytes": 33554432
+    },
+    {
+      "name": "allreduce1_hop",
+      "group": "allreduce1_hop",
+      "terms_us": {
+        "latency_us": 2.05
+      },
+      "bound_us": 2.05,
+      "governing_term": "latency_us",
+      "diagnostic_only": false,
+      "measured_us": 7.6,
+      "gap_us": 5.55,
+      "evidence": "launch -> seam sees AR 9.9 us, minus o_proj"
+    },
+    {
+      "name": "seam",
+      "group": "seam",
+      "terms_us": {
+        "latency_us": 0.5
+      },
+      "bound_us": 0.5,
+      "governing_term": "latency_us",
+      "diagnostic_only": false,
+      "measured_us": 1.2,
+      "gap_us": 0.7
+    },
+    {
+      "name": "router_route_chain",
+      "group": "pre_expert",
+      "terms_us": {
+        "hbm_us": 0.5084,
+        "latency_us": 3.05
+      },
+      "bound_us": 3.05,
+      "governing_term": "latency_us",
+      "diagnostic_only": false,
+      "measured_us": 9.8,
+      "gap_us": 6.75,
+      "evidence": "seam done 11.1 -> route done 20.9 (router 1.8, RLOG hop 5.5, route 2.0)",
+      "compulsory_hbm_bytes": 8388608
+    },
+    {
+      "name": "pool_xq_chain",
+      "group": "pre_expert",
+      "terms_us": {
+        "hbm_us": 1.016801,
+        "latency_us": 3.05
+      },
+      "bound_us": 3.05,
+      "governing_term": "latency_us",
+      "diagnostic_only": false,
+      "measured_us": 15.6,
+      "gap_us": 12.55,
+      "evidence": "seam done 11.1 -> XQRDY seen 26.7 (pool done 14.8, all POOL seen 24.0, xq done 25.3)",
+      "compulsory_hbm_bytes": 16777216
+    },
+    {
+      "name": "experts_ug_down",
+      "group": "experts_ug_down",
+      "terms_us": {
+        "hbm_us": 17.030303
+      },
+      "bound_us": 17.030303,
+      "governing_term": "hbm_us",
+      "diagnostic_only": false,
+      "measured_us": 21.8,
+      "gap_us": 4.769697,
+      "evidence": "UG start 26.9 -> finalize start 48.7",
+      "compulsory_hbm_bytes": 281000000
+    },
+    {
+      "name": "yr_hop",
+      "group": "yr_hop",
+      "terms_us": {
+        "latency_us": 2.05
+      },
+      "bound_us": 2.05,
+      "governing_term": "latency_us",
+      "diagnostic_only": false,
+      "measured_us": 5.3,
+      "gap_us": 3.25,
+      "evidence": "finalize start 48.7 -> YR seen 54.0"
+    },
+    {
+      "name": "finalize",
+      "group": "finalize",
+      "terms_us": {
+        "latency_us": 1.0
+      },
+      "bound_us": 1.0,
+      "governing_term": "latency_us",
+      "diagnostic_only": false,
+      "measured_us": 4.6,
+      "gap_us": 3.6,
+      "evidence": "YR seen 54.0 -> FIN done 58.6 (FMSQ device hop inside)"
+    },
+    {
+      "name": "fin_hop",
+      "group": "fin_hop",
+      "terms_us": {
+        "latency_us": 2.05
+      },
+      "bound_us": 2.05,
+      "governing_term": "latency_us",
+      "diagnostic_only": false,
+      "measured_us": 4.4,
+      "gap_us": 2.35,
+      "evidence": "FIN done 58.6 -> unpooler sees FIN 63.0"
+    },
+    {
+      "name": "unpool_gemv",
+      "group": "unpool_gemv",
+      "terms_us": {
+        "hbm_us": 1.016801
+      },
+      "bound_us": 1.016801,
+      "governing_term": "hbm_us",
+      "diagnostic_only": false,
+      "measured_us": 2.8,
+      "gap_us": 1.783199,
+      "evidence": "unpooler sees FIN 63.0 -> up done 65.8",
+      "compulsory_hbm_bytes": 16777216
+    },
+    {
+      "name": "br_gather_done_tail",
+      "group": "br_gather_done_tail",
+      "terms_us": {
+        "latency_us": 4.6
+      },
+      "bound_us": 4.6,
+      "governing_term": "latency_us",
+      "diagnostic_only": false,
+      "measured_us": 10.2,
+      "gap_us": 5.6,
+      "evidence": "up done 65.8 -> last CTA end 76.0 (BR hop, gather, done4 hop)"
+    }
+  ],
+  "diagnostic_floor_us": 35.380706,
+  "engineering_bound_us": 35.380706,
+  "target_fraction": 0.85,
+  "efficiency": null,
+  "gap_us": null,
+  "target_latency_us": 41.62436,
+  "gap_distribution": [
+    {
+      "name": "oproj_gemv",
+      "gap_us": 0.266398,
+      "share": null,
+      "evidence": "s3 timeline oproj CTA median"
+    },
+    {
+      "name": "allreduce1_hop",
+      "gap_us": 5.55,
+      "share": null,
+      "evidence": "launch -> seam sees AR 9.9 us, minus o_proj"
+    },
+    {
+      "name": "seam",
+      "gap_us": 0.7,
+      "share": null,
+      "evidence": null
+    },
+    {
+      "name": "router_route_chain",
+      "gap_us": 6.75,
+      "share": null,
+      "evidence": "seam done 11.1 -> route done 20.9 (router 1.8, RLOG hop 5.5, route 2.0)"
+    },
+    {
+      "name": "pool_xq_chain",
+      "gap_us": 12.55,
+      "share": null,
+      "evidence": "seam done 11.1 -> XQRDY seen 26.7 (pool done 14.8, all POOL seen 24.0, xq done 25.3)"
+    },
+    {
+      "name": "experts_ug_down",
+      "gap_us": 4.769697,
+      "share": null,
+      "evidence": "UG start 26.9 -> finalize start 48.7"
+    },
+    {
+      "name": "yr_hop",
+      "gap_us": 3.25,
+      "share": null,
+      "evidence": "finalize start 48.7 -> YR seen 54.0"
+    },
+    {
+      "name": "finalize",
+      "gap_us": 3.6,
+      "share": null,
+      "evidence": "YR seen 54.0 -> FIN done 58.6 (FMSQ device hop inside)"
+    },
+    {
+      "name": "fin_hop",
+      "gap_us": 2.35,
+      "share": null,
+      "evidence": "FIN done 58.6 -> unpooler sees FIN 63.0"
+    },
+    {
+      "name": "unpool_gemv",
+      "gap_us": 1.783199,
+      "share": null,
+      "evidence": "unpooler sees FIN 63.0 -> up done 65.8"
+    },
+    {
+      "name": "br_gather_done_tail",
+      "gap_us": 5.6,
+      "share": null,
+      "evidence": "up done 65.8 -> last CTA end 76.0 (BR hop, gather, done4 hop)"
+    }
+  ],
+  "warnings": [],
+  "missing_evidence": [
+    "scope-matched measured latency"
+  ]
+}
