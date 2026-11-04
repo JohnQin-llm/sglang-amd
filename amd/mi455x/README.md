@@ -33,3 +33,11 @@ checks); no clusters or multicast; waits use `s_sleep(32)` polls (`K2_POLL_SLEEP
 - `decode_stack/`: microbenchmarks of the per-layer decode kernels at the served shapes (fused QKV projection on
   Triton and on AITER's gfx1250 TDM GEMM, the whole QKV op bit-compared, the fused norm launch sweep) with their
   JSON results.
+
+## `aiter/`
+
+`served-aiter-on-2bb549102.patch`: the AITER the served tree runs (`/sgl-workspace/aiter` in the image, upstream
+`2bb549102`) carries the kept attention iterations as working-tree edits: the gfx1250 spec-decode verify backport
+(AITER #6896 with #6336 / #6661 / #6581 / #6888) and the gfx1250 attention series (window-aware split-KV for the
+sliding-window layers, device-side segment ranges for long context, tuned configs). Apply with
+`git -C <aiter> apply served-aiter-on-2bb549102.patch` on that commit.
