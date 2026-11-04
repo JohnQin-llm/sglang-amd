@@ -1,0 +1,35 @@
+{
+ "served": {
+  "us": 13.119564902397894,
+  "bytes_differing_vs_served": [
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ]
+ },
+ "triton_sk16": {
+  "us": 10.528597139543102,
+  "bytes_differing_vs_served": [
+   6,
+   0,
+   0,
+   5,
+   0,
+   0
+  ]
+ },
+ "gluon_tdm_sk8": {
+  "us": 10.091822954916186,
+  "bytes_differing_vs_served": [
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ]
+ }
+}

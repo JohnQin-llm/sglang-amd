@@ -1,0 +1,90 @@
+{
+ "label": "current tree, 128K",
+ "trace": "/data/muse455/prof/it9/1793788929.745972-TP-0-EP-0.trace.json.gz",
+ "cycles": 9,
+ "cycle_ms": 9.05200173611111,
+ "rows": [
+  {
+   "name": "MoE mono kernel (K2)",
+   "ms": 4.60024122222222,
+   "pct": 50.82015399831949
+  },
+  {
+   "name": "MoE expert GEMMs",
+   "ms": 0.1445542222222222,
+   "pct": 1.5969310041728415
+  },
+  {
+   "name": "MoE routing / align / finalize",
+   "ms": 0.035896333333333336,
+   "pct": 0.3965568542716055
+  },
+  {
+   "name": "attention: 16 full-attention layers",
+   "ms": 0.5151637777777777,
+   "pct": 5.691158627628595
+  },
+  {
+   "name": "attention: 46 sliding-window layers",
+   "ms": 0.5501834444444423,
+   "pct": 6.078030699547901
+  },
+  {
+   "name": "dense GEMMs (QKV, o_proj, router, lm_head)",
+   "ms": 0.724255888888892,
+   "pct": 8.001057777083949
+  },
+  {
+   "name": "all-reduce / all-gather",
+   "ms": 0.09683755555555554,
+   "pct": 1.0697916149224973
+  },
+  {
+   "name": "norms, RoPE, QKV epilogue, KV-cache write",
+   "ms": 0.7439604444444489,
+   "pct": 8.218739524502858
+  },
+  {
+   "name": "copies and small elementwise",
+   "ms": 0.15553544444444448,
+   "pct": 1.7182436435464614
+  },
+  {
+   "name": "draft model (whole step)",
+   "ms": 0.8518822222222221,
+   "pct": 9.410981648664649
+  },
+  {
+   "name": "other verify kernels",
+   "ms": 0.021525111111111116,
+   "top": [
+    [
+     "void at::native::(anonymous namespace)::CatArrayBatchedCopy_",
+     0.01
+    ],
+    [
+     "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<",
+     0.005
+    ],
+    [
+     "_vocab_parallel_embedding_kernel.kd",
+     0.002
+    ],
+    [
+     "void at::native::_assert_async_cuda_kernel<bool>(bool const*",
+     0.001
+    ],
+    [
+     "alloc_extend_kernel.kd",
+     0.001
+    ]
+   ],
+   "pct": 0.2377939348513499
+  },
+  {
+   "name": "GPU idle inside the steps",
+   "ms": 0.6119660694444415,
+   "pct": 6.76056067248781
+  }
+ ]
+}
