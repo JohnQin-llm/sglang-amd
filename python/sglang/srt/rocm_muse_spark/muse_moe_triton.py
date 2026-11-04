@@ -27,6 +27,7 @@ Everything is shape-static and free of host syncs so it can be captured in a HIP
 
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
@@ -409,10 +410,18 @@ except Exception:  # pragma: no cover
 
 _ALIGN_ENV = os.environ.get("MUSE_MOE_ALIGN", "auto")
 FP4_MODE = os.environ.get("MUSE_MOE_FP4_MODE", "dot_scaled")  # dot_scaled | manual
-SPLIT_K_SMALL = int(
-    os.environ.get("MUSE_MOE_SPLITK", "4")
-)  # K-split factor for <=32 routed slots (1 = off)
+_SPLITK_ENV = os.environ.get("MUSE_MOE_SPLITK")
+SPLIT_K_SMALL = (
+    int(_SPLITK_ENV) if _SPLITK_ENV else None
+)  # K-split factor for <=32 local routed slots (1 = off; None = per-arch default)
 SPLIT_K_MAX_SLOTS = 32
+
+
+@functools.lru_cache(maxsize=None)
+def _is_gfx1250() -> bool:
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).gcnArchName.startswith("gfx1250")
 ALIGN_BACKEND = (
     "sgl"
     if (_ALIGN_ENV == "sgl" or (_ALIGN_ENV == "auto" and _HAS_SGL_ALIGN))
@@ -465,42 +474,55 @@ def _align_small_kernel(
     cap,
     num_blocks,
     E: tl.constexpr,
+    E_P2: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK: tl.constexpr,
-    CAP_BLOCK: tl.constexpr,
     NB_BLOCK: tl.constexpr,
 ):
     """One program: local-id mapping + per-expert counting + BLOCK_M-padded slot sort for n <= BLOCK
     routed slots. Same contract as the sgl_kernel path: sorted_ptr[cap] (sentinel = n for padding),
-    expert_ptr[num_blocks] (-1 for unused blocks), num_post_ptr[1]."""
+    expert_ptr[num_blocks] (-1 for unused blocks), num_post_ptr[1].
+
+    Branch-free: counts, ranks and block offsets come from [BLOCK, BLOCK] / [E_P2, BLOCK] / [NB, E_P2]
+    compare-and-reduce tiles instead of a per-expert loop of scans (64 serial scans at EP4 cost ~30 us
+    on gfx1250). The sentinel fill and the slot scatter write disjoint positions, so no ordering
+    between them is needed."""
     offs = tl.arange(0, BLOCK)
     valid_slot = offs < n
     g = tl.load(ids_ptr + offs, mask=valid_slot, other=-1)
     local = g - local_start
     ok = valid_slot & (local >= 0) & (local < E)
-    # sentinel / -1 fills first, then overwrite the used positions
-    for c in tl.static_range(0, CAP_BLOCK, BLOCK):
-        po = c + offs
-        tl.store(sorted_ptr + po, tl.full((BLOCK,), 0, tl.int32) + n, mask=po < cap)
+    key = tl.where(ok, local, -1)
+    # rank of slot i among the earlier slots of its expert (slot order = token-major, as before)
+    earlier = (key[:, None] == key[None, :]) & (offs[None, :] < offs[:, None])
+    rank = tl.sum(earlier.to(tl.int32), axis=1)
+    ev = tl.arange(0, E_P2)
+    hit = key[None, :] == ev[:, None]  # [E_P2, BLOCK]; key -1 never matches
+    cnt = tl.sum(hit.to(tl.int32), axis=1)
+    nb = (cnt + BLOCK_M - 1) // BLOCK_M
+    blk_end = tl.cumsum(nb, axis=0)
+    blk_start = blk_end - nb
+    total = tl.sum(nb, axis=0)
+    slot_blk = tl.sum(tl.where(hit, blk_start[:, None], 0), axis=0)  # [BLOCK]
+    pos = slot_blk * BLOCK_M + rank
+    tl.store(sorted_ptr + pos, offs.to(tl.int32), mask=ok)
+    # per block: owning expert and the number of real rows it holds
     bo = tl.arange(0, NB_BLOCK)
-    tl.store(expert_ptr + bo, tl.full((NB_BLOCK,), -1, tl.int32), mask=bo < num_blocks)
-    block_start = 0
-    for e in tl.static_range(E):
-        hit = ok & (local == e)
-        cnt = tl.sum(hit.to(tl.int32), axis=0)
-        rank = (
-            tl.cumsum(hit.to(tl.int32), axis=0) - 1
-        )  # 0-based rank among this expert's slots
-        pos = block_start * BLOCK_M + rank
-        tl.store(sorted_ptr + pos, offs.to(tl.int32), mask=hit)
-        nb = (cnt + BLOCK_M - 1) // BLOCK_M
-        tl.store(
-            expert_ptr + bo,
-            tl.full((NB_BLOCK,), e, tl.int32),
-            mask=(bo >= block_start) & (bo < block_start + nb),
-        )
-        block_start += nb
-    tl.store(num_post_ptr, (block_start * BLOCK_M).to(tl.int32))
+    own = (bo[:, None] >= blk_start[None, :]) & (bo[:, None] < blk_end[None, :])  # [NB, E_P2]
+    has = tl.sum(own.to(tl.int32), axis=1) > 0
+    eid = tl.sum(tl.where(own, ev[None, :], 0), axis=1)
+    rows_before = tl.sum(tl.where(own, (bo[:, None] - blk_start[None, :]) * BLOCK_M, 0), axis=1)
+    rows_in = tl.sum(tl.where(own, cnt[None, :], 0), axis=1) - rows_before
+    tl.store(expert_ptr + bo, tl.where(has, eid, -1), mask=bo < num_blocks)
+    q = tl.arange(0, BLOCK_M)
+    fill_pos = bo[:, None] * BLOCK_M + q[None, :]
+    pad = q[None, :] >= rows_in[:, None]  # positions not taken by a real slot
+    tl.store(
+        sorted_ptr + fill_pos,
+        tl.full((NB_BLOCK, BLOCK_M), 0, tl.int32) + n,
+        mask=pad & (fill_pos < cap),
+    )
+    tl.store(num_post_ptr, (total * BLOCK_M).to(tl.int32))
 
 
 ALIGN_SMALL_MAX = 64
@@ -514,7 +536,6 @@ def moe_align_block_size_small(
     E = num_local_experts
     cap = n + E * (block_m - 1)
     num_blocks = triton.cdiv(cap, block_m)
-    cap_block = max(64, triton.next_power_of_2(cap))
     sorted_ids = torch.empty(cap, dtype=torch.int32, device=dev)
     expert_ids = torch.empty(num_blocks, dtype=torch.int32, device=dev)
     num_post = torch.empty(1, dtype=torch.int32, device=dev)
@@ -528,11 +549,11 @@ def moe_align_block_size_small(
         cap,
         num_blocks,
         E=E,
+        E_P2=max(2, triton.next_power_of_2(E)),
         BLOCK_M=block_m,
-        BLOCK=64,
-        CAP_BLOCK=cap_block,
+        BLOCK=max(16, triton.next_power_of_2(n)),
         NB_BLOCK=max(2, triton.next_power_of_2(num_blocks)),
-        num_warps=1,
+        num_warps=4,
     )
     return sorted_ids, expert_ids, num_post
 
@@ -577,12 +598,27 @@ _LARGE_M_FP4 = dict(
     BLOCK_M=64, BLOCK_N=64, BLOCK_K=128, GROUP_M=8, num_warps=4, num_stages=2
 )  # M=1024 564->485us
 CONFIG_TABLE_FP4 = {"small": _SMALL_M_FP4, "mid": _MID_M_FP4, "large": _LARGE_M_FP4}
+CONFIG_TABLE_S2 = None  # stage-2 overrides (None = same table as stage 1)
+CONFIG_TABLE_FP4_S2 = None
+# MI455X (gfx1250, wave32), EP4 64 local experts, K=I=4096, 8 rows x top-8, graph replay
+# (k2/quickwin sweeps 2026-11-03): stage 1 BN32/BK256/nw2 82.7 vs 91.4 us/layer, stage 2
+# BK256 87.1 vs 91.0. Split-K (2/4/8) is slower on both stages at these shapes.
+_SMALL_M_FP4_GFX1250 = dict(
+    BLOCK_M=16, BLOCK_N=32, BLOCK_K=256, GROUP_M=1, num_warps=2, num_stages=2
+)
+_SMALL_M_FP4_GFX1250_S2 = dict(
+    BLOCK_M=16, BLOCK_N=64, BLOCK_K=256, GROUP_M=1, num_warps=4, num_stages=2
+)
 
 
-def _pick_config(M: int, topk: int, num_local: int, mxfp4: bool = False):
+def _pick_config(M: int, topk: int, num_local: int, mxfp4: bool = False, stage: int = 1):
     rows = M * topk
     table = CONFIG_TABLE_FP4 if mxfp4 else CONFIG_TABLE
+    if stage == 2:
+        table = (CONFIG_TABLE_FP4_S2 if mxfp4 else CONFIG_TABLE_S2) or table
     if rows <= 64:
+        if mxfp4 and table is CONFIG_TABLE_FP4 and _is_gfx1250():
+            return _SMALL_M_FP4_GFX1250 if stage == 1 else _SMALL_M_FP4_GFX1250_S2
         return table["small"]
     # mid/large crossover measured on MI355X (32 local experts, K=I=4096, graph replay):
     # MXFP4 mid wins up to M=768 (rows 6144), BF16 mid only up to M=256 (rows 2048).
@@ -660,6 +696,36 @@ def _launch_gemm(
     )
 
 
+FORCE_SPLIT_K = None  # benchmarking override: (stage-1 split, stage-2 split)
+
+
+def _pick_split_k(
+    M: int,
+    topk: int,
+    num_local: int,
+    K: int,
+    cfg: dict,
+    stage: int,
+    num_global: int | None = None,
+) -> int:
+    """Decode-sized batches: the per-program K loop (K/BLOCK_K serial MFMA steps on a mostly
+    empty M tile) is latency bound, so split K across programs and reduce fp32 partials.
+    The threshold counts the routes expected on this EP rank (all of them without EP)."""
+    if FORCE_SPLIT_K is not None:
+        split_k = FORCE_SPLIT_K[stage - 1]
+    else:
+        factor = SPLIT_K_SMALL
+        if factor is None:
+            factor = 1 if _is_gfx1250() else 4
+        slots = M * topk
+        if num_global and num_global > num_local:
+            slots = -(-slots * num_local // num_global)
+        split_k = factor if (slots <= SPLIT_K_MAX_SLOTS and factor > 1) else 1
+    while split_k > 1 and K % (split_k * cfg["BLOCK_K"]):
+        split_k //= 2
+    return split_k
+
+
 def muse_moe_triton(
     hidden_states: torch.Tensor,  # [M, K] bf16 (already pooled + pre-expert-normed)
     topk_scores: torch.Tensor,  # [M, topk] fp32
@@ -674,6 +740,8 @@ def muse_moe_triton(
     has_norm: bool = True,  # False -> plain weighted sum (no per-expert RMSNorm)
     w13_scale: torch.Tensor | None = None,  # MXFP4: [E_local, 2I, K//32] uint8 e8m0
     w2_scale: torch.Tensor | None = None,  # MXFP4: [E_local, H, I//32] uint8 e8m0
+    cfg2: dict | None = None,  # stage-2 config (same BLOCK_M as cfg); defaults to cfg's table
+    num_global_experts: int | None = None,  # EP: total routed experts (split-K threshold)
 ) -> torch.Tensor:
     M, K = hidden_states.shape
     topk = topk_ids.shape[1]
@@ -701,11 +769,15 @@ def muse_moe_triton(
         )
     else:
         assert K == kw and I == iw, "shape mismatch between w13/w2/hidden"
-    cfg = cfg or _pick_config(M, topk, E, mxfp4)
-    assert (
-        K % cfg["BLOCK_K"] == 0 and I % cfg["BLOCK_K"] == 0 and cfg["BLOCK_K"] % 32 == 0
-    )
-    assert I % cfg["BLOCK_N"] == 0 and H % cfg["BLOCK_N"] == 0
+    if cfg is None:
+        cfg, cfg2_default = _pick_config(M, topk, E, mxfp4), _pick_config(M, topk, E, mxfp4, stage=2)
+    else:
+        cfg2_default = cfg
+    cfg2 = cfg2 or cfg2_default
+    assert cfg2["BLOCK_M"] == cfg["BLOCK_M"], "both stages share the alignment block"
+    assert K % cfg["BLOCK_K"] == 0 and I % cfg2["BLOCK_K"] == 0
+    assert cfg["BLOCK_K"] % 32 == 0 and cfg2["BLOCK_K"] % 32 == 0
+    assert I % cfg["BLOCK_N"] == 0 and H % cfg2["BLOCK_N"] == 0
 
     assert topk_ids.shape[0] == M and topk_scores.shape == topk_ids.shape, (
         f"routing/hidden shape mismatch: hidden {tuple(hidden_states.shape)} ids {tuple(topk_ids.shape)} scores {tuple(topk_scores.shape)}"
@@ -718,21 +790,14 @@ def muse_moe_triton(
         ids32, E, local_expert_start, cfg["BLOCK_M"]
     )
     num_valid = M * topk
-    # Decode-sized batches: the per-program K loop (K/BLOCK_K serial MFMA steps on a mostly
-    # empty M tile) is latency bound, so split K across programs and reduce fp32 partials.
-    split_k = (
-        SPLIT_K_SMALL if (num_valid <= SPLIT_K_MAX_SLOTS and SPLIT_K_SMALL > 1) else 1
-    )
-    while split_k > 1 and (
-        K % (split_k * cfg["BLOCK_K"]) or I % (split_k * cfg["BLOCK_K"])
-    ):
-        split_k //= 2
+    split1 = _pick_split_k(M, topk, E, K, cfg, 1, num_global_experts)
+    split2 = _pick_split_k(M, topk, E, I, cfg2, 2, num_global_experts)
     dev = hidden_states.device
 
     inter = torch.empty((num_valid, I), dtype=hidden_states.dtype, device=dev)
-    if split_k > 1:
+    if split1 > 1:
         part1 = torch.empty(
-            (split_k, num_valid, 2 * I), dtype=torch.float32, device=dev
+            (split1, num_valid, 2 * I), dtype=torch.float32, device=dev
         )
         _launch_gemm(
             hidden_states,
@@ -750,7 +815,7 @@ def muse_moe_triton(
             True,
             mxfp4,
             cfg,
-            split_k,
+            split1,
         )
         _splitk_silu_mul_kernel[(num_valid, triton.cdiv(I, 1024))](
             part1,
@@ -758,30 +823,10 @@ def muse_moe_triton(
             I,
             part1.stride(0),
             part1.stride(1),
-            SPLIT_K=split_k,
+            SPLIT_K=split1,
             BLOCK=1024,
             num_warps=4,
         )
-        y = torch.empty((split_k, num_valid, H), dtype=torch.float32, device=dev)
-        _launch_gemm(
-            inter,
-            w2,
-            w2_scale,
-            y,
-            sorted_ids,
-            expert_ids,
-            num_post,
-            H,
-            I,
-            num_valid,
-            topk,
-            False,
-            False,
-            mxfp4,
-            cfg,
-            split_k,
-        )
-        stride_yk = y.stride(0)
     else:
         _launch_gemm(
             hidden_states,
@@ -800,25 +845,30 @@ def muse_moe_triton(
             mxfp4,
             cfg,
         )
+    if split2 > 1:
+        y = torch.empty((split2, num_valid, H), dtype=torch.float32, device=dev)
+        stride_yk = y.stride(0)
+    else:
         y = torch.empty((num_valid, H), dtype=hidden_states.dtype, device=dev)
-        _launch_gemm(
-            inter,
-            w2,
-            w2_scale,
-            y,
-            sorted_ids,
-            expert_ids,
-            num_post,
-            H,
-            I,
-            num_valid,
-            topk,
-            False,
-            False,
-            mxfp4,
-            cfg,
-        )
         stride_yk = 0
+    _launch_gemm(
+        inter,
+        w2,
+        w2_scale,
+        y,
+        sorted_ids,
+        expert_ids,
+        num_post,
+        H,
+        I,
+        num_valid,
+        topk,
+        False,
+        False,
+        mxfp4,
+        cfg2,
+        split2,
+    )
 
     out = torch.empty((M, H), dtype=hidden_states.dtype, device=dev)
     has_scale = has_norm and post_norm_weight is not None
@@ -839,7 +889,7 @@ def muse_moe_triton(
         HAS_NORM=has_norm,
         HAS_SCALE=has_scale,
         BLOCK_H=triton.next_power_of_2(H),
-        SPLIT_K=split_k,
+        SPLIT_K=split2,
         num_warps=4,
     )
     return out

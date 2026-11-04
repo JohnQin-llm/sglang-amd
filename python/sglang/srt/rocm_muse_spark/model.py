@@ -169,7 +169,9 @@ def _run_fused_moe(
     post_expert_norm: nn.Module | None,
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
+    num_global_experts: int | None = None,
 ) -> torch.Tensor:
+    kwargs = {}
     if _moe_backend() == "flydsl":
         from sglang.srt.rocm_muse_spark.muse_moe_flydsl import (
             muse_moe_flydsl as fused_moe,
@@ -179,9 +181,10 @@ def _run_fused_moe(
             muse_moe_triton as fused_moe,
         )
 
+        kwargs["num_global_experts"] = num_global_experts
+
     weight, gain, has_norm = _post_expert_norm_args(post_expert_norm)
     eps = float(post_expert_norm.eps) if post_expert_norm is not None else 0.0
-    kwargs = {}
     if w13_scale is not None or w2_scale is not None:
         kwargs["w13_scale"] = w13_scale
         kwargs["w2_scale"] = w2_scale
@@ -645,9 +648,11 @@ class MuseSpark1xNativeExperts(nn.Module):
         num_local_experts: int,
         expert_hidden_size: int,
         intermediate_size: int,
+        num_global_experts: int | None = None,
     ):
         super().__init__()
         self.num_local_experts = num_local_experts
+        self.num_global_experts = num_global_experts
         self.expert_hidden_size = expert_hidden_size
         self.intermediate_size = intermediate_size
         self.w13_weight = nn.Parameter(
@@ -686,6 +691,7 @@ class MuseSpark1xNativeExperts(nn.Module):
                 self.w2_weight,
                 int(local_expert_start),
                 post_expert_norm,
+                num_global_experts=self.num_global_experts,
             )
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             return self._forward_capturable(
@@ -753,9 +759,11 @@ class MuseSpark1xMxfp4Experts(nn.Module):
         num_local_experts: int,
         expert_hidden_size: int,
         intermediate_size: int,
+        num_global_experts: int | None = None,
     ):
         super().__init__()
         self.num_local_experts = num_local_experts
+        self.num_global_experts = num_global_experts
         self.expert_hidden_size = expert_hidden_size
         self.intermediate_size = intermediate_size
         self.w13_weight = nn.Parameter(
@@ -819,6 +827,7 @@ class MuseSpark1xMxfp4Experts(nn.Module):
             post_expert_norm,
             w13_scale=self.w13_weight_scale,
             w2_scale=self.w2_weight_scale,
+            num_global_experts=self.num_global_experts,
         )
 
     _forward_capturable = forward
@@ -913,12 +922,14 @@ class MuseSpark1xMoE(nn.Module):
                 self.num_local_experts,
                 self.expert_hidden_size,
                 self.intermediate_size,
+                num_global_experts=self.num_experts,
             )
         else:
             self.experts = MuseSpark1xNativeExperts(
                 self.num_local_experts,
                 self.expert_hidden_size,
                 self.intermediate_size,
+                num_global_experts=self.num_experts,
             )
 
     def _routing_op(self) -> FusedMuseSparkRouting:
