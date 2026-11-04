@@ -1,0 +1,603 @@
+"""gfx1250 (MI455X) port of K2's MoE stage (``k2bundle/ops/stages/moe.py``) at TP4 / EP1, 8 verify rows.
+
+Scope: the routed-expert half of the MoE block, from the replicated pooled rows (POOL) and the route table
+(ROUTE) to the finalized MoE rows replicated on every rank (FIN), the input of the unpooler:
+
+    xq      (token t on CTA t)  POOL row -> pre_expert_norm -> bf16 xe -> MX activations (``mxq``) -> XQ / XSC
+    route   (every expert CTA)  ROUTE ids -> the union U in LDS: expert_of[slot] (ascending id), kof[slot][t]
+                                (token t's top-k index of that expert, -1 if not picked), |U|
+    ug      (slot, 32-col group) a wave a 16-col tile of this rank's 1024-wide slice: gate and up chains
+                                over K = 4096 (V_WMMA_SCALE_F32_16X16X128_F8F6F4, weights FP4, acts FP4/FP8);
+                                silu(g) u -> bf16 -> MX requant per 32-group -> INTER / ISC of each pick
+    down    (slot, 16-row MH tiles) a wave a tile: one chain over the rank's K = 1024 -> bf16 partial per
+                                route (unweighted) -> YR[src = rank][t][k] on row t's owner (rank t // 2)
+    fin     (owned token, 128-col slice; a wave a route): the 4 ranks' partials in rank order (fp32) -> bf16 y;
+                                v = bf16(y bf16(w_post + 1)); per-slice sum of v^2 -> FMSQ; the 32 slices'
+                                sums -> sc_k = w_k / sqrt(mean + eps); fin = bf16(sum_k sc_k v_k), k in order
+    fin_gather                  the owner's 2 FIN rows -> every rank's FIN (the all-gather)
+
+Not in this module (other helpers of the parallel port): router / pooler GEMVs and the route stage (their
+outputs ROUTE / POOL are this stage's inputs), the unpooler and the branch gather.
+
+Hand-offs. In the persistent K2 every arrow above is a tagged mailbox put / poll (device scope inside a GPU,
+system scope for YR and FIN). The sync primitives (``ep1/port/sync``) did not exist when this was written, so
+each stage is its own launch here and a launch boundary stands in for each poll; the stage functions take the
+same context dict ``c`` as the MI355X stages and touch every hand-off through ``c`` entries named after the
+MI355X regions (``xqb``, ``xscb``, ``interb``, ``iscb``, ``yr_owner``, ``fmsq``, ``fin``), so the mailbox can be
+substituted without changing the arithmetic.
+
+Layers 0 and 61 have BF16 experts: this stage is MXFP4-only and the host refuses them (``check_layer``); they
+stay on the served BF16 path, as on MI355X.
+"""
+
+import functools
+import os
+import sys
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr.typing import Int32, Int64, T
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mxq as Q  # noqa: E402
+from port.common.ops import traced  # noqa: E402
+
+TP = 4
+MAX_TOKENS = 8
+H = 8192
+MH = 4096  # pooled expert hidden
+E = 256
+TOPK = 8
+I_FULL = 4096
+RI = I_FULL // TP  # 1024: the rank's slice of every expert's intermediate (EP1)
+ROWS = 16  # WMMA tile rows / columns
+W13_STEPS = MH // 128  # 32
+W2_STEPS = RI // 128  # 8
+W13_TILES = RI // ROWS  # 64 gate (and 64 up) tiles a slice
+DOWN_TILES = MH // ROWS  # 256
+UG_GROUPS = RI // 32  # 32 32-column groups a slice
+MAX_U = MAX_TOKENS * TOPK  # 64
+OWN = MAX_TOKENS // TP  # 2 rows a rank owns
+FIN_COLS = 128
+FIN_SLICES = MH // FIN_COLS  # 32
+XQ_THREADS = MH // 8  # 512
+FIN_THREADS = 32 * TOPK  # 256: a wave a route
+BF16_LAYERS = (0, 61)
+REGIONS = ("xqb", "xscb", "interb", "iscb", "yr", "fmsq", "fin")
+
+
+def check_layer(layer):
+    if layer in BF16_LAYERS:
+        raise ValueError(f"layer {layer} has BF16 experts: not an MXFP4 K2 layer (served BF16 path)")
+
+
+def xq_words(act):
+    """dwords an activation row of MH holds."""
+    return MH // 8 * Q.words_per8(act)
+
+
+def inter_words(act):
+    return RI // 8 * Q.words_per8(act)
+
+
+def scratch_plain(s, act):
+    """Per-rank plain buffers (bytes), the MI355X ``scratch_plain`` names."""
+    return {
+        "xqb": s * xq_words(act) * 4,  # xe activations [t][MH] (E2M1 pairs or E4M3)
+        "xscb": s * MH // 32,  # xe E8M0 codes [t][MH / 32], a byte each
+        "interb": s * TOPK * inter_words(act) * 4,  # a2 [pick][RI]
+        "iscb": s * TOPK * RI // 32,  # a2 codes [pick][RI / 32]
+        "fmsq": s * TOPK * FIN_SLICES * 4,  # per-slice sums of v^2 [t][k][slice] fp32 (owned rows)
+    }
+
+
+def peer_plain(s):
+    """Per-rank peer-visible buffers (bytes): what other ranks write into."""
+    return {
+        "yr": TP * s * TOPK * MH * 2,  # [src][t][k][MH] bf16 partials (owned rows only are written)
+        "fin": s * MH * 2,  # [t][MH] bf16, every row (the all-gather)
+    }
+
+
+def _rsrc(addr, nbytes):
+    return bo.create_buffer_resource_from_addr(addr, num_records_bytes=nbytes)
+
+
+def _ld(ptr, nbytes, i, n=1, cm=0):
+    v = bo.buffer_load(_rsrc(ptr, nbytes), i, vec_width=n, dtype=T.i32, cache_modifier=cm)
+    return fx.Int32(v) if n == 1 else fx.Vector(v)
+
+
+def _k2(c):
+    """Inside the persistent K2 (``c`` carries the mailbox): hand-offs are tagged polls and published flags;
+    otherwise (this module's one-stage launchers) a launch boundary stands in for each."""
+    return "poll" in c
+
+
+def _publish(c, a, i):
+    from port.sync.sync import publish
+
+    publish(c["put"], a, i, 1, c["tid"] == 0)
+
+
+@traced
+def _put_if(c, cond, a, i, v):
+    if cond:
+        c["put"](a, i, v)
+
+
+@traced
+def _poll_if(c, cond, a, i):
+    if cond:
+        c["poll"]([(a, i, 1)])
+
+
+def wait_xq(c):
+    """K2: every token's XQ / XSC announced (XQRDY), before the first ``stage_ug``."""
+    _poll_if(c, c["tid"] < c["S"], c["xqrdy"], fx.min(c["tid"], c["S"] - 1))
+    gpu.barrier()
+
+
+@traced
+def _yr_put(c, picked, owner, el, acc):
+    """K2 down: route (t, k)'s 8 bf16 of this lane as tagged pairs into row t's owner's YR."""
+    for p in range_constexpr(TP):
+        if picked & (owner == p):
+            for h in range_constexpr(2):
+                c["put_bf"](c["yr_owner"][p], el + 4 * h, [acc[4 * h + v] for v in range(4)])
+
+
+# ---------------------------------------------------------------- xq
+def stage_xq(c, t):
+    """Token t (512 threads, a thread 8 columns): POOL row -> pre_expert_norm (sum of squares: a thread's 8 in
+    order, the wave butterfly, the 16 waves in order; r = 1 / sqrt(mean + eps); xe = bf16((x r) bf16(w + 1)))
+    -> MX activations (4 threads a 32-group) -> XQ words, XSC codes."""
+    s, tid, lane, wave, red, act = c["S"], c["tid"], c["lane"], c["wave"], c["red"], c["act"]
+    a = c["args"]
+    wp = Q.words_per8(act)
+    c0 = tid * 8
+    if _k2(c):
+        pw = c["poll"]([(c["peer"]["pool_own"], (t * MH + c0) // 2, 2), (c["peer"]["pool_own"], (t * MH + c0) // 2 + 2, 2)])
+        xw = pw[0] + pw[1]
+    else:
+        xw = _ld(a["pool"], s * MH * 2, (t * MH + c0) // 2, 4)
+    ww = _ld(a["w_pre"], MH * 2, c0 // 2, 4)
+    xs, ws = [], []
+    for d in range(4):
+        xs += [Q.bf_lo(xw[d]), Q.bf_hi(xw[d])]
+        ws += [Q.bf_lo(ww[d]), Q.bf_hi(ww[d])]
+    sq = fx.Float32(0.0)
+    for x in xs:
+        sq = sq + Q.opaque(x * x)
+    sq = Q.xsum(sq)
+    fx.ptr_store(sq, red + wave)
+    gpu.barrier()
+    tot = fx.ptr_load(red + 0)
+    for w in range(1, XQ_THREADS // 32):
+        tot = tot + fx.ptr_load(red + w)
+    r = Q.inv_sqrt_ieee(tot * fx.Float32(1.0 / MH) + fx.Float32(c["eps_pre"]))
+    xe = [Q.bf16_round((xs[i] * r) * Q.bf16_round(ws[i] + fx.Float32(1.0))) for i in range(8)]
+    am = abs(xe[0])
+    for v in xe[1:]:
+        am = fx.max(am, abs(v))
+    am = Q.xmax(am, (2, 1))
+    code = Q.code(am, act)
+    words = Q.pack8(xe, code, act)
+    out = words[0] if wp == 1 else fx.Vector.from_elements(words, fx.Int32)
+    bo.buffer_store(out, _rsrc(c["xqb"], s * xq_words(act) * 4), t * xq_words(act) + tid * wp)
+    bo.buffer_store(fx.Int8(code), _rsrc(c["xscb"], s * MH // 32), t * (MH // 32) + tid // 4, mask=(lane % 4) == 0)
+    if _k2(c):
+        _publish(c, c["xqrdy"], t)
+
+
+# ---------------------------------------------------------------- route table
+def load_route(c):
+    """ROUTE ids -> the union U in LDS (``c['rt']``): ``expert`` [slot] (distinct experts, ascending id; slot
+    MAX_U is a trash slot), ``kof`` [slot][t] (-1: t did not pick it); returns |U| (wave-uniform).
+    Needs >= S * TOPK threads; branch-free (spare threads repeat thread S TOPK - 1's identical stores)."""
+    s, tid, rt = c["S"], c["tid"], c["rt"]
+    n = s * TOPK
+    i = fx.min(tid, n - 1)
+    if _k2(c):
+        e = c["poll"]([(c["route"], (i // TOPK) * (2 * TOPK) + i % TOPK, 1)])[0][0]
+    else:
+        e = _ld(c["args"]["route"], s * 2 * TOPK * 4, (i // TOPK) * (2 * TOPK) + i % TOPK)
+    e = fx.max(fx.min(e, fx.Int32(E - 1)), fx.Int32(0))
+    fx.ptr_store(e, rt["ids"] + i)
+    nk = (MAX_U + 1) * 8
+    for q in range((nk + c["threads"] - 1) // c["threads"]):
+        fx.ptr_store(fx.Int32(-1), rt["kof"] + fx.min(tid + c["threads"] * q, nk - 1))
+    gpu.barrier()
+    first = fx.Int32(1)
+    for j in range(n):
+        dup = (fx.ptr_load(rt["ids"] + j) == e) & (fx.Int32(j) < i)
+        first = dup.select(fx.Int32(0), first)
+    fx.ptr_store(first, rt["fl"] + i)
+    gpu.barrier()
+    slot = fx.Int32(0)
+    nu = fx.Int32(0)
+    for j in range(n):
+        fj = fx.ptr_load(rt["fl"] + j)
+        nu = nu + fj
+        slot = slot + (fx.ptr_load(rt["ids"] + j) < e).select(fj, fx.Int32(0))
+    fx.ptr_store(e, rt["expert"] + (first == 1).select(slot, fx.Int32(MAX_U)))
+    fx.ptr_store(i % TOPK, rt["kof"] + (slot * 8 + i // TOPK))
+    gpu.barrier()
+    return Q.uniform(nu)
+
+
+# ---------------------------------------------------------------- the scaled-WMMA chain
+def _chain(c, wbases, sbases, rw, rws, rx, rxs, xbase, xsbase, steps, st0, prefetch):
+    """One wave: ``len(wbases)`` fp32 chains (16 weight rows x 16 activation rows) over steps st0 .. st0 + steps,
+    weights FP4 (two b128 a step), activations FP4 (two b128) / FP8 (four b128), scales a dword a step pair
+    (opsel = step parity), every operand from global (weights NT). ``st0`` may be traced (a wave's K part) and
+    must be even; step parity and the ring are over the static i = st - st0."""
+    act, nt = c["act"], c["nt"]
+    xcm = c.get("xcm", 0)
+    a8 = act == "a8"
+    assert steps % 2 == 0 or (isinstance(st0, int) and st0 % 2 == 0)
+
+    def load(i):
+        st = st0 + i
+        ops = {"a": [fx.Vector(bo.buffer_load(rw, wb + st * 256, vec_width=4, dtype=T.i32, cache_modifier=nt))
+                     .shuffle(fx.Vector(bo.buffer_load(rw, wb + st * 256 + 128, vec_width=4, dtype=T.i32,
+                                                       cache_modifier=nt)), list(range(8))) for wb in wbases]}
+        if a8:
+            bq = [fx.Vector(bo.buffer_load(rx, xbase + st * 32 + 8 * q, vec_width=4, dtype=T.i32, cache_modifier=xcm))
+                  for q in range(4)]
+            ops["b"] = bq[0].shuffle(bq[1], list(range(8))).shuffle(bq[2].shuffle(bq[3], list(range(8))),
+                                                                    list(range(16)))
+        else:
+            ops["b"] = fx.Vector(bo.buffer_load(rx, xbase + st * 16, vec_width=4, dtype=T.i32, cache_modifier=xcm)).shuffle(
+                fx.Vector(bo.buffer_load(rx, xbase + st * 16 + 8, vec_width=4, dtype=T.i32, cache_modifier=xcm)),
+                list(range(8)))
+        if i % 2 == 0:
+            ops["sa"] = [bo.buffer_load(rws, sb + (st0 // 2 + i // 2) * 32, vec_width=1, dtype=T.i32) for sb in sbases]
+            ops["sb"] = bo.buffer_load(rxs, xsbase + st, vec_width=1, dtype=T.i32, cache_modifier=xcm)
+        return ops
+
+    accs = [fx.Vector.filled(8, 0.0, fx.Float32) for _ in wbases]
+    ring = {i: load(i) for i in range(min(prefetch, steps))}
+    sa = sb = None
+    for i in range(steps):
+        if i + prefetch < steps:
+            ring[i + prefetch] = load(i + prefetch)
+        ops = ring.pop(i)
+        if i % 2 == 0:
+            sa, sb = ops["sa"], ops["sb"]
+        for j in range_constexpr(len(accs)):
+            accs[j] = fx.Vector(rocdl.wmma_scale_f32_16x16x128_f8f6f4(
+                T.vec(8, T.f32), ops["a"][j], ops["b"], accs[j], sa[j], sb, fmtA=4, fmtB=0 if a8 else 4,
+                scaleAType=i % 2, scaleBType=i % 2))
+    return accs
+
+
+def _ksplit_reduce(c, accs, part, nparts, slot_base):
+    """In-CTA split-K: parts 1.. park their chains in LDS, part 0 adds them in part order."""
+    lane, red = c["lane"], c["kred"]
+    n = len(accs)
+    if nparts == 1:
+        return accs
+    for j in range(n):
+        for v in range(8):
+            fx.ptr_store(accs[j][v], red + (((slot_base + part) * n + j) * 8 + v) * 32 + lane)
+    gpu.barrier()
+    out = []
+    for j in range(n):
+        vals = []
+        for v in range(8):
+            x = fx.ptr_load(red + (((slot_base + 0) * n + j) * 8 + v) * 32 + lane)
+            for p in range(1, nparts):
+                x = x + fx.ptr_load(red + (((slot_base + p) * n + j) * 8 + v) * 32 + lane)
+            vals.append(x)
+        out.append(vals)
+    return out
+
+
+# ---------------------------------------------------------------- ug
+def stage_ug(c, slot, g):
+    """Slot ``slot`` (expert ``expert[slot]``), 32-column group g of the rank's slice: wave w = tile 2 g + w % 2,
+    K part w // 2 (``ksplit`` parts); gate and up chains vs the 8 tokens' xe; silu(g) u -> bf16; the 32-group
+    amax over the two tiles (LDS); MX requant -> INTER words / ISC code of each picking token."""
+    s, lane, wave, act, rt = c["S"], c["lane"], c["wave"], c["act"], c["rt"]
+    ks = c["ksplit"]
+    a = c["args"]
+    wp = Q.words_per8(act)
+    tile = wave % 2
+    part = wave // 2
+    rg = 2 * g + tile
+    e = Q.uniform(fx.ptr_load(rt["expert"] + slot))
+    gq = lane // 16
+    w_dw_e = 2 * RI * MH // 8
+    rw = _rsrc(a["w13"], E * w_dw_e * 4)
+    rws = _rsrc(a["w13s"], E * w_dw_e // 4)
+    rx = _rsrc(c["xqb"], s * xq_words(act) * 4)
+    rxs = _rsrc(c["xscb"], s * MH // 32)
+    wbases = [e * w_dw_e + (rg + j * W13_TILES) * (2 * MH) + gq * 64 + (lane % 16) * 4 for j in range(2)]
+    sbases = [(e * (2 * RI // 16) + rg + j * W13_TILES) * (MH // 256) * 32 + lane for j in range(2)]
+    arow = fx.min(lane % 16, s - 1)
+    xbase = arow * xq_words(act) + gq * 4
+    xsbase = arow * (MH // 128) + gq
+    steps = W13_STEPS // ks
+    accs = _chain(c, wbases, sbases, rw, rws, rx, rxs, xbase, xsbase, steps, part * steps, c["prefetch"])
+    accs = _ksplit_reduce(c, accs, part, ks, tile * ks)
+    t = lane % 16
+    tt = fx.min(t, s - 1)
+    kk = fx.ptr_load(rt["kof"] + (slot * 8 + tt))
+    picked = (t < s) & (kk >= 0) & (part == 0)
+    vals = [Q.bf16_round(Q.silu_mul(accs[0][v], accs[1][v])) for v in range(8)]
+    am = abs(vals[0])
+    for v in vals[1:]:
+        am = fx.max(am, abs(v))
+    am = Q.xmax(am, (16,))
+    fx.ptr_store(am, c["amx"] + (tile * 16 + t))
+    gpu.barrier()
+    am = fx.max(fx.ptr_load(c["amx"] + t), fx.ptr_load(c["amx"] + (16 + t)))
+    code = Q.code(am, act, inter=True)
+    words = Q.pack8(vals, code, act)
+    pick = tt * TOPK + fx.max(kk, fx.Int32(0))
+    out = words[0] if wp == 1 else fx.Vector.from_elements(words, fx.Int32)
+    bo.buffer_store(out, _rsrc(c["interb"], s * TOPK * inter_words(act) * 4),
+                    pick * inter_words(act) + (16 * rg + 8 * gq) // 8 * wp, mask=picked)
+    bo.buffer_store(fx.Int8(code), _rsrc(c["iscb"], s * TOPK * RI // 32), pick * (RI // 32) + g,
+                    mask=picked & (tile == 0) & (gq == 0))
+    if _k2(c):
+        _publish(c, c["ugrdy"], slot * UG_GROUPS + g)
+
+
+# ---------------------------------------------------------------- down
+def stage_down(c, slot, rgd):
+    """Slot ``slot``, MH tile ``rgd`` (this wave): one chain over K = RI (8 steps) of w2 vs the picks' INTER
+    -> bf16 per route (unweighted) -> YR[rank][t][k] on row t's owner."""
+    s, lane, act, rt = c["S"], c["lane"], c["act"], c["rt"]
+    a = c["args"]
+    e = Q.uniform(fx.ptr_load(rt["expert"] + slot))
+    gq = lane // 16
+    t = lane % 16
+    tt = fx.min(t, s - 1)
+    kk = fx.ptr_load(rt["kof"] + (slot * 8 + tt))
+    picked = (t < s) & (kk >= 0)
+    pick = tt * TOPK + fx.max(kk, fx.Int32(0))
+    w_dw_e = MH * RI // 8
+    rw = _rsrc(a["w2"], E * w_dw_e * 4)
+    rws = _rsrc(a["w2s"], E * w_dw_e // 4)
+    rx = _rsrc(c["interb"], s * TOPK * inter_words(act) * 4)
+    rxs = _rsrc(c["iscb"], s * TOPK * RI // 32)
+    wbases = [e * w_dw_e + rgd * (2 * RI) + gq * 64 + (lane % 16) * 4]
+    sbases = [(e * (MH // 16) + rgd) * (RI // 256) * 32 + lane]
+    xbase = pick * inter_words(act) + gq * 4
+    xsbase = pick * (RI // 128) + gq
+    if _k2(c):
+        c["poll"]([(c["ugrdy"], slot * UG_GROUPS + lane, 1)])
+    acc = _chain(c, wbases, sbases, rw, rws, rx, rxs, xbase, xsbase, W2_STEPS, 0, c["dprefetch"])[0]
+    if _k2(c):
+        el = ((c["rank"] * s + tt) * TOPK + fx.max(kk, fx.Int32(0))) * MH + rgd * ROWS + 8 * gq
+        _yr_put(c, picked, tt // (s // TP), el, acc)
+        return
+    packed = fx.Vector.from_elements([acc[v] for v in range(8)], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+    off = (((c["rank"] * s + tt) * TOPK + kk) * MH + rgd * ROWS + 8 * gq) // 2
+    for p in range(TP):
+        bo.buffer_store(packed, _rsrc(c["yr_owner"][p], TP * s * TOPK * MH * 2), off,
+                        mask=picked & (tt // (s // TP) == p))
+
+
+# ---------------------------------------------------------------- finalize
+def _fin_out(c, t, j, k, col, vs, tot, wk):
+    """K2 tail of ``stage_fin`` (``upto`` = 2 arithmetic): FIN plain into every rank's peer copy, then FRDY
+    (row t, slice j) published at system scope on every rank."""
+    from port.sync.memmodel import CM_SYS
+
+    s, lane, wave = c["S"], c["lane"], c["wave"]
+    sc = wk * Q.inv_sqrt_ieee(tot * fx.Float32(1.0 / MH) + fx.Float32(c["eps_post"]))
+    for i in range(4):
+        fx.ptr_store(Q.opaque(sc * vs[i]), c["red"] + ((k * 4 + i) * 32 + lane))
+    gpu.barrier()
+    acc = []
+    for i in range(4):
+        x = fx.Float32(0.0)
+        for kq in range(TOPK):
+            x = x + fx.ptr_load(c["red"] + ((kq * 4 + i) * 32 + lane))
+        acc.append(x)
+    fw = fx.Vector.from_elements(acc, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+    for p in range(TP):
+        bo.buffer_store(fw, _rsrc(c["fin_peer"][p], s * MH * 2), (t * MH + col) // 2, mask=wave == 0,
+                        cache_modifier=CM_SYS)
+    _publish(c, c["frdy_peer"][0], t * FIN_SLICES + j)
+    for p in range(1, TP):
+        _put_if(c, c["tid"] == 0, c["frdy_peer"][p], t * FIN_SLICES + j, fx.Int32(1))
+    gpu.barrier()
+
+
+def stage_fin(c, tl, j, upto):
+    """Owned token ``rank * OWN + tl``, columns 128 j .. (wave k = route k, a lane 4 columns): YR from the 4
+    ranks in rank order (fp32) -> bf16 y; v = bf16(y bf16(w_post + 1)); the slice's sum of v^2 (lane's 4 in
+    order, butterfly) -> FMSQ[t][k][j]; [``upto`` = 1 stops here: the launch boundary is the FMSQ poll]; the 32
+    slices' sums (butterfly over slices) -> sc_k = w_k / sqrt(sum / MH + eps); fin = bf16(sum_k sc_k v_k) in
+    k order (products rounded) -> FIN rows of every rank."""
+    s, lane, wave, rank = c["S"], c["lane"], c["wave"], c["rank"]
+    a = c["args"]
+    t = rank * (s // TP) + tl
+    k = fx.min(wave, TOPK - 1) if _k2(c) else wave  # K2: 16 waves; waves 8.. repeat route 7's identical work
+    col = j * FIN_COLS + 4 * lane
+    ww = _ld(a["w_post"], MH * 2, col // 2, 2)
+    w1 = [Q.bf16_round(Q.bf_lo(ww[0]) + fx.Float32(1.0)), Q.bf16_round(Q.bf_hi(ww[0]) + fx.Float32(1.0)),
+          Q.bf16_round(Q.bf_lo(ww[1]) + fx.Float32(1.0)), Q.bf16_round(Q.bf_hi(ww[1]) + fx.Float32(1.0))]
+    if _k2(c):
+        parts = c["poll"]([(c["yr"], (((src * s + t) * TOPK + k) * MH + col) // 2, 2) for src in range(TP)])
+    else:
+        ry = _rsrc(c["yr"], TP * s * TOPK * MH * 2)
+        parts = [fx.Vector(bo.buffer_load(ry, (((src * s + t) * TOPK + k) * MH + col) // 2, vec_width=2,
+                                          dtype=T.i32)) for src in range(TP)]
+    ys = []
+    for h in range(2):
+        for f in (Q.bf_lo, Q.bf_hi):
+            y = f(parts[0][h])
+            for src in range(1, TP):
+                y = y + f(parts[src][h])
+            ys.append(Q.bf16_round(y))
+    vs = [Q.bf16_round(ys[i] * w1[i]) for i in range(4)]
+    ssl = fx.Float32(0.0)
+    for v in vs:
+        ssl = ssl + Q.opaque(v * v)
+    ss = Q.xsum(ssl)
+    if _k2(c):
+        _put_if(c, lane == 0, c["fmsq"], (t * TOPK + k) * FIN_SLICES + j, ss)
+        got = c["poll"]([(c["fmsq"], (t * TOPK + k) * FIN_SLICES + lane, 1),
+                         (c["route"], t * 2 * TOPK + TOPK + k, 1)])
+        tot = Q.xsum(got[0][0].bitcast(fx.Float32))
+        wk = got[1][0].bitcast(fx.Float32)
+        _fin_out(c, t, j, k, col, vs, tot, wk)
+        return
+    rf = _rsrc(c["fmsq"], s * TOPK * FIN_SLICES * 4)
+    if upto == 1:
+        bo.buffer_store(ss, rf, (t * TOPK + k) * FIN_SLICES + j, mask=lane == 0)
+        return
+    tot = Q.xsum(fx.Float32(bo.buffer_load(rf, (t * TOPK + k) * FIN_SLICES + lane, vec_width=1, dtype=T.f32)))
+    wk = fx.Float32(bo.buffer_load(_rsrc(a["route"], s * 2 * TOPK * 4), t * 2 * TOPK + TOPK + k, vec_width=1,
+                                   dtype=T.f32))
+    sc = wk * Q.inv_sqrt_ieee(tot * fx.Float32(1.0 / MH) + fx.Float32(c["eps_post"]))
+    for i in range(4):
+        fx.ptr_store(Q.opaque(sc * vs[i]), c["red"] + ((k * 4 + i) * 32 + lane))
+    gpu.barrier()
+    if upto == 2:
+        acc = []
+        for i in range(4):
+            x = fx.Float32(0.0)
+            for kq in range(TOPK):
+                x = x + fx.ptr_load(c["red"] + ((kq * 4 + i) * 32 + lane))
+            acc.append(x)
+        fw = fx.Vector.from_elements(acc, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
+        for p in range(TP):  # fin_gather: the owner's rows to every rank's FIN
+            bo.buffer_store(fw, _rsrc(c["fin_peer"][p], s * MH * 2), (t * MH + col) // 2, mask=wave == 0)
+
+
+# ---------------------------------------------------------------- launchers (one stage a launch)
+_STREAM = fx.Stream(None)
+
+
+@functools.cache
+def make_xq(s, act, eps_pre=1e-5):
+    @flyc.kernel(name=f"k2g_moe_xq_s{s}_{act}", known_block_size=[XQ_THREADS, 1, 1])
+    def kern(pool: Int64, w_pre: Int64, xqb: Int64, xscb: Int64):
+        tid = fx.thread_idx.x
+
+        @fx.struct
+        class L:
+            red: fx.Array[fx.Float32, XQ_THREADS // 32, 16]
+
+        lds = fx.SharedAllocator().allocate(L).peek()
+        c = dict(S=s, act=act, tid=tid, lane=tid % 32, wave=tid // 32, red=lds.red.ptr, eps_pre=eps_pre,
+                 args=dict(pool=pool, w_pre=w_pre), xqb=xqb, xscb=xscb)
+        stage_xq(c, fx.block_idx.x)
+
+    @flyc.jit
+    def launch(pool: Int64, w_pre: Int64, xqb: Int64, xscb: Int64, stream: fx.Stream = _STREAM):
+        kern(pool, w_pre, xqb, xscb).launch(grid=(s,), block=(XQ_THREADS,), stream=stream)
+
+    return launch
+
+
+def _route_lds():
+    @fx.struct
+    class RouteLds:
+        ids: fx.Array[fx.Int32, MAX_U, 16]
+        fl: fx.Array[fx.Int32, MAX_U, 16]
+        expert: fx.Array[fx.Int32, MAX_U + 1, 16]
+        kof: fx.Array[fx.Int32, (MAX_U + 1) * 8, 16]
+
+    return RouteLds
+
+
+def _rt(r):
+    return {"ids": r.ids.ptr, "fl": r.fl.ptr, "expert": r.expert.ptr, "kof": r.kof.ptr}
+
+
+@functools.cache
+def make_ug(s, act, ksplit=1, prefetch=16, nt=1):
+    waves = 2 * ksplit
+    threads = 32 * waves
+    assert W13_STEPS % (2 * ksplit) == 0
+
+    @flyc.kernel(name=f"k2g_moe_ug_s{s}_{act}_k{ksplit}_p{prefetch}_nt{nt}", known_block_size=[threads, 1, 1])
+    def kern(route: Int64, xqb: Int64, xscb: Int64, w13: Int64, w13s: Int64, interb: Int64, iscb: Int64):
+        tid = fx.thread_idx.x
+        alloc = fx.SharedAllocator()
+        rl = alloc.allocate(_route_lds()).peek()
+
+        @fx.struct
+        class L:
+            amx: fx.Array[fx.Float32, 32, 16]
+            kred: fx.Array[fx.Float32, max(1, waves * 2 * 8 * 32 if ksplit > 1 else 1), 16]
+
+        lds = alloc.allocate(L).peek()
+        c = dict(S=s, act=act, tid=tid, lane=tid % 32, wave=tid // 32, threads=threads, ksplit=ksplit,
+                 prefetch=prefetch, nt=nt, rt=_rt(rl), amx=lds.amx.ptr, kred=lds.kred.ptr,
+                 args=dict(route=route, w13=w13, w13s=w13s), xqb=xqb, xscb=xscb, interb=interb, iscb=iscb)
+        nu = load_route(c)
+        slot = fx.block_idx.x
+        if slot < nu:
+            stage_ug(c, slot, fx.block_idx.y)
+
+    @flyc.jit
+    def launch(route: Int64, xqb: Int64, xscb: Int64, w13: Int64, w13s: Int64, interb: Int64, iscb: Int64,
+               stream: fx.Stream = _STREAM):
+        kern(route, xqb, xscb, w13, w13s, interb, iscb).launch(grid=(MAX_U, UG_GROUPS), block=(threads,),
+                                                                stream=stream)
+
+    return launch
+
+
+@functools.cache
+def make_down(s, act, waves=4, prefetch=8, nt=1):
+    threads = 32 * waves
+    assert DOWN_TILES % waves == 0
+
+    @flyc.kernel(name=f"k2g_moe_down_s{s}_{act}_w{waves}_p{prefetch}_nt{nt}", known_block_size=[threads, 1, 1])
+    def kern(route: Int64, interb: Int64, iscb: Int64, w2: Int64, w2s: Int64, rank: fx.Int32, yr0: Int64,
+             yr1: Int64, yr2: Int64, yr3: Int64):
+        tid = fx.thread_idx.x
+        rl = fx.SharedAllocator().allocate(_route_lds()).peek()
+        c = dict(S=s, act=act, tid=tid, lane=tid % 32, wave=tid // 32, threads=threads, dprefetch=prefetch,
+                 nt=nt, rt=_rt(rl), rank=rank, args=dict(route=route, w2=w2, w2s=w2s), interb=interb, iscb=iscb,
+                 yr_owner=[yr0, yr1, yr2, yr3])
+        nu = load_route(c)
+        slot = fx.block_idx.x
+        if slot < nu:
+            stage_down(c, slot, fx.block_idx.y * waves + Q.uniform(tid // 32))
+
+    @flyc.jit
+    def launch(route: Int64, interb: Int64, iscb: Int64, w2: Int64, w2s: Int64, rank: fx.Int32, yr0: Int64,
+               yr1: Int64, yr2: Int64, yr3: Int64, stream: fx.Stream = _STREAM):
+        kern(route, interb, iscb, w2, w2s, rank, yr0, yr1, yr2, yr3).launch(
+            grid=(MAX_U, DOWN_TILES // waves), block=(threads,), stream=stream)
+
+    return launch
+
+
+@functools.cache
+def make_fin(s, upto, eps_post=1e-8):
+    @flyc.kernel(name=f"k2g_moe_fin_s{s}_u{upto}", known_block_size=[FIN_THREADS, 1, 1])
+    def kern(route: Int64, w_post: Int64, yr: Int64, fmsq: Int64, rank: fx.Int32, fin0: Int64, fin1: Int64,
+             fin2: Int64, fin3: Int64):
+        tid = fx.thread_idx.x
+
+        @fx.struct
+        class L:
+            red: fx.Array[fx.Float32, TOPK * 4 * 32, 16]
+
+        lds = fx.SharedAllocator().allocate(L).peek()
+        c = dict(S=s, tid=tid, lane=tid % 32, wave=Q.uniform(tid // 32), rank=rank, red=lds.red.ptr,
+                 eps_post=eps_post, args=dict(route=route, w_post=w_post), yr=yr, fmsq=fmsq,
+                 fin_peer=[fin0, fin1, fin2, fin3])
+        b = fx.block_idx.x
+        stage_fin(c, b // FIN_SLICES, b % FIN_SLICES, upto)
+
+    @flyc.jit
+    def launch(route: Int64, w_post: Int64, yr: Int64, fmsq: Int64, rank: fx.Int32, fin0: Int64, fin1: Int64,
+               fin2: Int64, fin3: Int64, stream: fx.Stream = _STREAM):
+        kern(route, w_post, yr, fmsq, rank, fin0, fin1, fin2, fin3).launch(
+            grid=((s // TP) * FIN_SLICES,), block=(FIN_THREADS,), stream=stream)
+
+    return launch

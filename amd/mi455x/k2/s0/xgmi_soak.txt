@@ -1,0 +1,10 @@
+wall clock 100000 kHz, rounds 5000
+== 1. pair ping-pong, us per one-way hop (pairs 0-1, 0-2, 0-3, 1-2, 1-3, 2-3)
+  SOAK P=32768 G=256 bar=1 rounds=1000000: 9.197 us/exchange bad=0
+  SOAK P=8192 G=256 bar=1 rounds=1000000: 7.214 us/exchange bad=0
+  SOAK P=1 G=256 bar=1 rounds=1000000: 6.097 us/exchange bad=0
+    rank 0: value-mismatch 0, recv-timeouts 768, barrier-timeouts 0
+    rank 1: value-mismatch 0, recv-timeouts 768, barrier-timeouts 0
+    rank 2: value-mismatch 0, recv-timeouts 768, barrier-timeouts 0
+    rank 3: value-mismatch 0, recv-timeouts 768, barrier-timeouts 0
+  SOAK P=32768 G=256 bar=0 rounds=200000: 0.000 us/exchange bad=3072

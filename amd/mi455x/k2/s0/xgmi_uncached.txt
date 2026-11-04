@@ -1,0 +1,8 @@
+wall clock 100000 kHz, rounds 5000
+== 1. pair ping-pong, us per one-way hop (pairs 0-1, 0-2, 0-3, 1-2, 1-3, 2-3)
+  uncached     push sleep : 2.372 2.488 2.413 2.363 2.337 2.376  mean 2.391
+  uncached     push busy  : 2.416 2.454 2.372 2.382 2.281 2.341  mean 2.374
+  uncached     pull sleep : 3.670 3.542 3.667 3.561 3.607 3.503  mean 3.592
+  uncached     pull busy  : 3.692 3.570 3.681 3.588 3.539 3.517  mean 3.598
+  uncached     same-GPU two-CTA hop: -0.000 us
+  uncached     4-rank barrier (push, 1 CTA/rank): 3.679 us per barrier

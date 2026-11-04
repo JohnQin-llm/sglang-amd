@@ -1,0 +1,14 @@
+{
+ "act": "a8",
+ "compile_s": 5.9,
+ "peer_bytes": 12366336,
+ "scratch_bytes": 580096,
+ "isa": "/data/muse455/k2/ep1/s3/asm/muse_mono_k2g_s8_a8/22_final_isa.s",
+ "vgpr_count": 215,
+ "sgpr_count": 107,
+ "group_segment_fixed_size": 145168,
+ "private_segment_fixed_size": 0,
+ "vgpr_spill_count": 0,
+ "sgpr_spill_count": 38,
+ "lines": 9210
+}

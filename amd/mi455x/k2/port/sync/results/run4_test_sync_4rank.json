@@ -1,0 +1,473 @@
+{
+ "wall_s": 7.5,
+ "ranks": [
+  {
+   "rank": 0,
+   "compile_s": 2.5,
+   "eager_full": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 20,
+    "alarm_words": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "steps": 20,
+    "exchange_us_max_cta": 7.34,
+    "exchange_us_median_cta": 4.28,
+    "publish_us_median": 0.72,
+    "publish_wait_us_median": 0.68,
+    "cta_body_us_max": 218.66,
+    "terminal_us_cta0": 7.54,
+    "clock_spread_us": 13205.83,
+    "barrier_us_per_round": 2.2683870967741937,
+    "pingpong_us_per_hop": 2.0621875,
+    "pingpong_min": 2.0425,
+    "barrier_min": 2.2296774193548385,
+    "exchange_min": 7.12
+   },
+   "graph_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 521,
+    "alarm_words": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "replays": 500,
+    "epoch_advanced": 500,
+    "us_per_step": 32.40483093261719,
+    "last_step": {
+     "exchange_us_max_cta": 6.48,
+     "exchange_us_median_cta": 4.56,
+     "publish_us_median": 0.72,
+     "publish_wait_us_median": 0.84,
+     "cta_body_us_max": 22.04,
+     "terminal_us_cta0": 6.16,
+     "clock_spread_us": 13207.95
+    },
+    "epoch_bump_only_us": 7.421855926513672
+   },
+   "eager_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1041,
+    "alarm_words": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "exchange_us_max_cta": 7.02,
+    "exchange_us_median_cta": 4.52,
+    "publish_us_median": 0.72,
+    "publish_wait_us_median": 0.76,
+    "cta_body_us_max": 16.5,
+    "terminal_us_cta0": 7.539999999999999,
+    "clock_spread_us": 13207.689999999999
+   },
+   "eager_nofence": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1061,
+    "alarm_words": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "exchange_us_max_cta": 8.219999999999999,
+    "exchange_us_median_cta": 4.52,
+    "publish_us_median": 0.56,
+    "publish_wait_us_median": 0.66,
+    "cta_body_us_max": 17.259999999999998,
+    "terminal_us_cta0": 6.300000000000001,
+    "clock_spread_us": 13207.59
+   },
+   "failstop_dead_rank": {
+    "errors": 43648,
+    "failed": 1,
+    "epoch": 1062,
+    "alarm_words": [
+     1,
+     1,
+     1,
+     0
+    ],
+    "returned_after_s": 0.511,
+    "wait_budget_s": 0.25,
+    "check_raised": "MonoKernel step failed: TP ranks [0, 1, 2] gave up an in-kernel wait; the step's tokens are discarded",
+    "given_up": {
+     "ctas": 103,
+     "by_region": {
+      "go": 102,
+      "bar": 1
+     },
+     "cta0": "+51 us CTA 0: bar pair 0 waited for tag 271617, saw 271617"
+    }
+   },
+   "failstop_stall": {
+    "errors": 80544,
+    "failed": 1,
+    "epoch": 1063,
+    "alarm_words": [
+     1,
+     1,
+     1,
+     1
+    ],
+    "returned_after_s": 0.41,
+    "stall_s": 0.4,
+    "wait_budget_s": 0.25,
+    "check_raised": "MonoKernel step failed: TP ranks [0, 1, 2, 3] gave up an in-kernel wait; the step's tokens are discarded",
+    "given_up": {
+     "ctas": 136,
+     "by_region": {
+      "go": 135,
+      "bar": 1
+     },
+     "cta0": "+34 us CTA 0: bar pair 0 waited for tag 271873, saw 271873"
+    }
+   },
+   "after_reset": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1064,
+    "alarm_words": [
+     0,
+     0,
+     0,
+     0
+    ]
+   },
+   "residency": [
+    {
+     "name": "k2sync_t4_w200000000_b32_p32_x32768_f1",
+     "block": 512,
+     "blocks_per_cu": 1,
+     "regs": 256,
+     "lds": 0,
+     "scratch": 52,
+     "fits_256": true,
+     "cus": 256
+    },
+    {
+     "name": "k2sync_t4_w200000000_b32_p32_x32768_f1",
+     "block": 512,
+     "blocks_per_cu": 1,
+     "regs": 256,
+     "lds": 0,
+     "scratch": 52,
+     "fits_256": true,
+     "cus": 256
+    }
+   ]
+  },
+  {
+   "rank": 1,
+   "compile_s": 2.3,
+   "eager_full": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 20,
+    "steps": 20,
+    "exchange_us_max_cta": 7.88,
+    "exchange_us_median_cta": 5.56,
+    "publish_us_median": 0.6,
+    "publish_wait_us_median": 0.64,
+    "cta_body_us_max": 263.06,
+    "terminal_us_cta0": 13.42,
+    "clock_spread_us": 19226.86,
+    "barrier_us_per_round": 2.2670967741935484,
+    "pingpong_us_per_hop": 2.0303125,
+    "pingpong_min": 2.006875,
+    "barrier_min": 2.2503225806451614,
+    "exchange_min": 7.28
+   },
+   "graph_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 521,
+    "replays": 500,
+    "epoch_advanced": 500,
+    "us_per_step": 32.426998138427734,
+    "last_step": {
+     "exchange_us_max_cta": 6.72,
+     "exchange_us_median_cta": 4.12,
+     "publish_us_median": 0.6,
+     "publish_wait_us_median": 0.72,
+     "cta_body_us_max": 14.84,
+     "terminal_us_cta0": 15.16,
+     "clock_spread_us": 19226.82
+    },
+    "epoch_bump_only_us": 6.330386161804199
+   },
+   "eager_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1041,
+    "exchange_us_max_cta": 6.72,
+    "exchange_us_median_cta": 4.12,
+    "publish_us_median": 0.6,
+    "publish_wait_us_median": 0.68,
+    "cta_body_us_max": 57.76,
+    "terminal_us_cta0": 12.219999999999999,
+    "clock_spread_us": 19226.66
+   },
+   "eager_nofence": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1061,
+    "exchange_us_max_cta": 6.72,
+    "exchange_us_median_cta": 4.2,
+    "publish_us_median": 0.48,
+    "publish_wait_us_median": 0.6,
+    "cta_body_us_max": 64.48,
+    "terminal_us_cta0": 15.34,
+    "clock_spread_us": 19226.66
+   },
+   "failstop_dead_rank": {
+    "errors": 121600,
+    "failed": 1,
+    "epoch": 1062,
+    "returned_after_s": 0.51,
+    "wait_budget_s": 0.25,
+    "check_raised": null,
+    "given_up": {
+     "ctas": 248,
+     "by_region": {
+      "go": 247,
+      "bar": 1
+     },
+     "cta0": "+41 us CTA 0: bar pair 0 waited for tag 271617, saw 271617"
+    }
+   },
+   "failstop_stall": {
+    "errors": 160000,
+    "failed": 1,
+    "epoch": 1063,
+    "returned_after_s": 0.41,
+    "stall_s": 0.4,
+    "wait_budget_s": 0.25,
+    "check_raised": null,
+    "given_up": {
+     "ctas": 255,
+     "by_region": {
+      "go": 255
+     },
+     "cta0": null
+    }
+   },
+   "after_reset": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1064
+   }
+  },
+  {
+   "rank": 2,
+   "compile_s": 2.6,
+   "eager_full": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 20,
+    "steps": 20,
+    "exchange_us_max_cta": 135.78,
+    "exchange_us_median_cta": 133.92000000000002,
+    "publish_us_median": 0.64,
+    "publish_wait_us_median": 0.68,
+    "cta_body_us_max": 217.74,
+    "terminal_us_cta0": 13.5,
+    "clock_spread_us": 598.52,
+    "barrier_us_per_round": 2.281290322580645,
+    "pingpong_us_per_hop": 0.005625,
+    "pingpong_min": 0.00375,
+    "barrier_min": 2.2606451612903227,
+    "exchange_min": 133.48
+   },
+   "graph_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 521,
+    "replays": 500,
+    "epoch_advanced": 500,
+    "us_per_step": 32.41590118408203,
+    "last_step": {
+     "exchange_us_max_cta": 6.64,
+     "exchange_us_median_cta": 4.04,
+     "publish_us_median": 0.6,
+     "publish_wait_us_median": 0.64,
+     "cta_body_us_max": 14.96,
+     "terminal_us_cta0": 12.48,
+     "clock_spread_us": 468.04
+    },
+    "epoch_bump_only_us": 7.924228191375732
+   },
+   "eager_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1041,
+    "exchange_us_max_cta": 6.4,
+    "exchange_us_median_cta": 4.04,
+    "publish_us_median": 0.6,
+    "publish_wait_us_median": 0.68,
+    "cta_body_us_max": 15.26,
+    "terminal_us_cta0": 12.36,
+    "clock_spread_us": 469.86
+   },
+   "eager_nofence": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1061,
+    "exchange_us_max_cta": 6.36,
+    "exchange_us_median_cta": 4.18,
+    "publish_us_median": 0.48,
+    "publish_wait_us_median": 0.62,
+    "cta_body_us_max": 15.780000000000001,
+    "terminal_us_cta0": 15.16,
+    "clock_spread_us": 470.38
+   },
+   "failstop_dead_rank": {
+    "errors": 149344,
+    "failed": 1,
+    "epoch": 1062,
+    "returned_after_s": 0.511,
+    "wait_budget_s": 0.25,
+    "check_raised": null,
+    "given_up": {
+     "ctas": 256,
+     "by_region": {
+      "go": 255,
+      "bar": 1
+     },
+     "cta0": "+467 us CTA 0: bar pair 0 waited for tag 271617, saw 271617"
+    }
+   },
+   "failstop_stall": {
+    "errors": 62048,
+    "failed": 1,
+    "epoch": 1063,
+    "returned_after_s": 0.41,
+    "stall_s": 0.4,
+    "wait_budget_s": 0.25,
+    "check_raised": null,
+    "given_up": {
+     "ctas": 256,
+     "by_region": {
+      "go": 255,
+      "bar": 1
+     },
+     "cta0": "+465 us CTA 0: bar pair 0 waited for tag 271873, saw 271873"
+    }
+   },
+   "after_reset": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1064
+   }
+  },
+  {
+   "rank": 3,
+   "compile_s": 2.4,
+   "eager_full": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 20,
+    "steps": 20,
+    "exchange_us_max_cta": 135.72,
+    "exchange_us_median_cta": 134.0,
+    "publish_us_median": 0.64,
+    "publish_wait_us_median": 0.68,
+    "cta_body_us_max": 268.56,
+    "terminal_us_cta0": 15.2,
+    "clock_spread_us": 9492.560000000001,
+    "barrier_us_per_round": 2.2683870967741937,
+    "pingpong_us_per_hop": 0.0053124999999999995,
+    "pingpong_min": 0.005,
+    "barrier_min": 2.238709677419355,
+    "exchange_min": 133.76
+   },
+   "graph_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 521,
+    "replays": 500,
+    "epoch_advanced": 500,
+    "us_per_step": 32.374534606933594,
+    "last_step": {
+     "exchange_us_max_cta": 6.92,
+     "exchange_us_median_cta": 4.08,
+     "publish_us_median": 0.6,
+     "publish_wait_us_median": 0.68,
+     "cta_body_us_max": 14.68,
+     "terminal_us_cta0": 12.92,
+     "clock_spread_us": 9362.3
+    },
+    "epoch_bump_only_us": 6.200369834899902
+   },
+   "eager_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1041,
+    "exchange_us_max_cta": 6.64,
+    "exchange_us_median_cta": 4.08,
+    "publish_us_median": 0.6,
+    "publish_wait_us_median": 0.68,
+    "cta_body_us_max": 62.36,
+    "terminal_us_cta0": 14.48,
+    "clock_spread_us": 9362.119999999999
+   },
+   "eager_nofence": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1061,
+    "exchange_us_max_cta": 6.68,
+    "exchange_us_median_cta": 4.16,
+    "publish_us_median": 0.48,
+    "publish_wait_us_median": 0.56,
+    "cta_body_us_max": 64.0,
+    "terminal_us_cta0": 14.04,
+    "clock_spread_us": 9362.02
+   },
+   "failstop_dead_rank": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1062,
+    "returned_after_s": 0.0,
+    "wait_budget_s": 0.25,
+    "check_raised": null,
+    "given_up": {
+     "ctas": 0,
+     "by_region": {},
+     "cta0": null
+    }
+   },
+   "failstop_stall": {
+    "errors": 93216,
+    "failed": 1,
+    "epoch": 1063,
+    "returned_after_s": 0.41,
+    "stall_s": 0.4,
+    "wait_budget_s": 0.25,
+    "check_raised": null,
+    "given_up": {
+     "ctas": 256,
+     "by_region": {
+      "go": 255,
+      "bar": 1
+     },
+     "cta0": "+40 us CTA 0: bar pair 0 waited for tag 271873, saw 271873"
+    }
+   },
+   "after_reset": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 1064
+   }
+  }
+ ]
+}

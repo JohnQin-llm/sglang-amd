@@ -1,0 +1,74 @@
+{
+ "0": {
+  "layers": 300,
+  "span_kernel_us_mean": 170.90061666666668,
+  "span_kernel_us_median": 170.08100000000002,
+  "span_wall_us_mean": 181.33637532552083,
+  "parts_us_mean": {
+   "_gemm_a16w16_gfx1250_bandwidth_bound_ker": 8.4242,
+   "__amd_rocclr_copyBuffer.kd": 3.4958933333333335,
+   "void aiter::ar_ll_gfx1250<std::bfloat16_": 32.15391,
+   "_fused_norm_residual_triton_kernel.kd": 5.550046666666667,
+   "_dense_partial.kd": 10.236803333333333,
+   "_joint_epilogue.kd": 5.1911233333333335,
+   "_align_small_kernel.kd": 31.831453333333332,
+   "fused_moe_gemm_kernel.kd": 49.80833666666667,
+   "finalize_norm_weighted_sum_kernel.kd": 5.449526666666666,
+   "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_User": 18.759323333333334
+  }
+ },
+ "1": {
+  "layers": 300,
+  "span_kernel_us_mean": 170.99175,
+  "span_kernel_us_median": 169.2,
+  "span_wall_us_mean": 181.25381022135417,
+  "parts_us_mean": {
+   "_gemm_a16w16_gfx1250_bandwidth_bound_ker": 8.50688,
+   "__amd_rocclr_copyBuffer.kd": 3.4438033333333338,
+   "void aiter::ar_ll_gfx1250<std::bfloat16_": 28.386223333333334,
+   "_fused_norm_residual_triton_kernel.kd": 5.581223333333333,
+   "_dense_partial.kd": 10.20229,
+   "_joint_epilogue.kd": 5.14482,
+   "_align_small_kernel.kd": 33.50993666666667,
+   "fused_moe_gemm_kernel.kd": 51.60687333333333,
+   "finalize_norm_weighted_sum_kernel.kd": 5.398236666666667,
+   "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_User": 19.211463333333334
+  }
+ },
+ "2": {
+  "layers": 300,
+  "span_kernel_us_mean": 168.59366,
+  "span_kernel_us_median": 167.0565,
+  "span_wall_us_mean": 178.99007161458334,
+  "parts_us_mean": {
+   "_gemm_a16w16_gfx1250_bandwidth_bound_ker": 8.70614,
+   "__amd_rocclr_copyBuffer.kd": 3.484036666666667,
+   "void aiter::ar_ll_gfx1250<std::bfloat16_": 22.03732,
+   "_fused_norm_residual_triton_kernel.kd": 5.593866666666667,
+   "_dense_partial.kd": 10.290653333333333,
+   "_joint_epilogue.kd": 5.26527,
+   "_align_small_kernel.kd": 35.71072,
+   "fused_moe_gemm_kernel.kd": 52.43879333333334,
+   "finalize_norm_weighted_sum_kernel.kd": 5.588263333333333,
+   "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_User": 19.478596666666668
+  }
+ },
+ "3": {
+  "layers": 300,
+  "span_kernel_us_mean": 170.01771666666667,
+  "span_kernel_us_median": 167.798,
+  "span_wall_us_mean": 180.154189453125,
+  "parts_us_mean": {
+   "_gemm_a16w16_gfx1250_bandwidth_bound_ker": 8.37415,
+   "__amd_rocclr_copyBuffer.kd": 3.437966666666666,
+   "void aiter::ar_ll_gfx1250<std::bfloat16_": 28.145826666666665,
+   "_fused_norm_residual_triton_kernel.kd": 5.64813,
+   "_dense_partial.kd": 10.13425,
+   "_joint_epilogue.kd": 5.131983333333333,
+   "_align_small_kernel.kd": 34.08045666666667,
+   "fused_moe_gemm_kernel.kd": 50.51215666666667,
+   "finalize_norm_weighted_sum_kernel.kd": 5.387736666666667,
+   "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_User": 19.16506
+  }
+ }
+}

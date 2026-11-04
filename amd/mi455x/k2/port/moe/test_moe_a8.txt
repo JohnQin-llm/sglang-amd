@@ -1,0 +1,27 @@
+layer 1: distinct [44, 47, 41, 42]
+  exact (mismatching elements / total): {'xq': '0/131072', 'xsc': '0/4096', 'inter': '2182/1048576', 'isc': '0/32768', 'yr': '249694/4194304', 'fin': '0/131072', 'fin_replicas': '0/393216', 'e2e_fin': '34076/131072'}
+  same vs single-rounding chain ref: {'inter': '2182/1048576', 'yr': '249693/4194304', 'e2e_fin': '34076/131072'}
+  rel-L2 max vs ref: inter_dequant 3.78e-03, yr 6.51e-04, fin 0.00e+00, e2e_fin 5.73e-04
+  cos fin_vs_stock_a16     min 0.999718 mean 0.999956
+  cos fin_vs_ref64_a16     min 0.999727 mean 0.999958
+  cos stock_vs_ref64       min 0.999996 mean 0.999999
+  cos ref_a4w4_vs_stock    min 0.999719 mean 0.999956
+  time per rank (us): ug 24.5, ug+down 38.0, xq 3.5, fin 4.2, all 45.7, down 13.6
+layer 31: distinct [47, 47, 50, 45]
+  exact (mismatching elements / total): {'xq': '0/131072', 'xsc': '0/4096', 'inter': '2223/1048576', 'isc': '0/32768', 'yr': '160127/4194304', 'fin': '0/131072', 'fin_replicas': '0/393216', 'e2e_fin': '50346/131072'}
+  same vs single-rounding chain ref: {'inter': '2223/1048576', 'yr': '160127/4194304', 'e2e_fin': '50346/131072'}
+  rel-L2 max vs ref: inter_dequant 1.76e-03, yr 4.88e-04, fin 0.00e+00, e2e_fin 1.76e-03
+  cos fin_vs_stock_a16     min 0.999215 mean 0.999585
+  cos fin_vs_ref64_a16     min 0.999222 mean 0.999588
+  cos stock_vs_ref64       min 0.999993 mean 0.999997
+  cos ref_a4w4_vs_stock    min 0.999216 mean 0.999585
+  time per rank (us): ug 24.9, ug+down 39.0, xq 3.7, fin 4.1, all 47.8, down 14.1
+layer 60: distinct [46, 45, 39, 44]
+  exact (mismatching elements / total): {'xq': '0/131072', 'xsc': '0/4096', 'inter': '2065/1048576', 'isc': '1/32768', 'yr': '203995/4194304', 'fin': '0/131072', 'fin_replicas': '0/393216', 'e2e_fin': '46629/131072'}
+  same vs single-rounding chain ref: {'inter': '2065/1048576', 'yr': '203995/4194304', 'e2e_fin': '46629/131072'}
+  rel-L2 max vs ref: inter_dequant 3.41e-03, yr 5.86e-04, fin 0.00e+00, e2e_fin 2.36e-03
+  cos fin_vs_stock_a16     min 0.998593 mean 0.999070
+  cos fin_vs_ref64_a16     min 0.998607 mean 0.999072
+  cos stock_vs_ref64       min 0.999986 mean 0.999993
+  cos ref_a4w4_vs_stock    min 0.998600 mean 0.999071
+  time per rank (us): ug 25.4, ug+down 39.8, xq 3.7, fin 4.1, all 46.4, down 14.4

@@ -1,0 +1,31 @@
+{
+ "ep1_bytes_per_gpu_GB": 102.67656192,
+ "layer1": {
+  "L1 A: 4 rank slices reassemble every byte of 256 experts": true,
+  "L1 B: gfx1250 layout round trip of every rank slice": true,
+  "L1 B: EP1-shape kernel addressing gathers WMMA operands + scales": true,
+  "L1 C: rel-L2 sum-of-rank-partials vs full FFN, float64": 1.972829689447156e-15,
+  "L1 C: rel-L2 sum-of-rank-partials vs full FFN, fp32": 1.0689071814340423e-06,
+  "L1 C: float64 partial-sum == full expert FFN (rel 1.97e-15 <= 1e-12, fp32 rel 1.07e-06) on cuda": true,
+  "seconds": 2.5479049682617188
+ },
+ "layer31": {
+  "L31 A: 4 rank slices reassemble every byte of 256 experts": true,
+  "L31 B: gfx1250 layout round trip of every rank slice": true,
+  "L31 B: EP1-shape kernel addressing gathers WMMA operands + scales": true,
+  "L31 C: rel-L2 sum-of-rank-partials vs full FFN, float64": 2.1187301850367775e-15,
+  "L31 C: rel-L2 sum-of-rank-partials vs full FFN, fp32": 1.13996156869689e-06,
+  "L31 C: float64 partial-sum == full expert FFN (rel 2.12e-15 <= 1e-12, fp32 rel 1.14e-06) on cuda": true,
+  "seconds": 2.288797616958618
+ },
+ "layer60": {
+  "L60 A: 4 rank slices reassemble every byte of 256 experts": true,
+  "L60 B: gfx1250 layout round trip of every rank slice": true,
+  "L60 B: EP1-shape kernel addressing gathers WMMA operands + scales": true,
+  "L60 C: rel-L2 sum-of-rank-partials vs full FFN, float64": 2.1038493449664965e-15,
+  "L60 C: rel-L2 sum-of-rank-partials vs full FFN, fp32": 1.1276407576588099e-06,
+  "L60 C: float64 partial-sum == full expert FFN (rel 2.10e-15 <= 1e-12, fp32 rel 1.13e-06) on cuda": true,
+  "seconds": 2.5206375122070312
+ },
+ "all_pass": true
+}

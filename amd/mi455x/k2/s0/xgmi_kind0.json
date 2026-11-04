@@ -1,0 +1,8 @@
+{
+  "pair_uncached_push_sleep": 2.3804,
+  "pair_uncached_push_busy": 2.3849,
+  "pair_uncached_pull_sleep": 3.6240,
+  "pair_uncached_pull_busy": 3.5914,
+  "self_uncached": 0.9804,
+  "barrier4_uncached": 3.5704
+}

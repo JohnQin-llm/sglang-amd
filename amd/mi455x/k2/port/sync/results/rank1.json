@@ -1,0 +1,101 @@
+{
+ "rank": 1,
+ "compile_s": 2.7,
+ "eager_full": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 20,
+  "steps": 20,
+  "exchange_us_max_cta": 7.64,
+  "exchange_us_median_cta": 5.6,
+  "publish_us_median": 0.6,
+  "publish_wait_us_median": 0.68,
+  "cta_body_us_max": 239.06,
+  "terminal_us_cta0": 12.44,
+  "clock_spread_us": 19226.8,
+  "barrier_us_per_round": 2.250967741935484,
+  "pingpong_us_per_hop": 2.033125,
+  "pingpong_min": 1.980625,
+  "barrier_min": 2.216774193548387,
+  "exchange_min": 7.36
+ },
+ "graph_lean": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 521,
+  "replays": 500,
+  "epoch_advanced": 500,
+  "us_per_step": 32.6302604675293,
+  "last_step": {
+   "exchange_us_max_cta": 7.0,
+   "exchange_us_median_cta": 4.12,
+   "publish_us_median": 0.6,
+   "publish_wait_us_median": 0.68,
+   "cta_body_us_max": 15.56,
+   "terminal_us_cta0": 16.24,
+   "clock_spread_us": 19226.52
+  },
+  "epoch_bump_only_us": 6.297855854034424
+ },
+ "eager_lean": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 1041,
+  "exchange_us_max_cta": 6.96,
+  "exchange_us_median_cta": 4.2,
+  "publish_us_median": 0.6,
+  "publish_wait_us_median": 0.64,
+  "cta_body_us_max": 26.94,
+  "terminal_us_cta0": 13.879999999999999,
+  "clock_spread_us": 19226.58
+ },
+ "eager_nofence": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 1061,
+  "exchange_us_max_cta": 6.74,
+  "exchange_us_median_cta": 4.300000000000001,
+  "publish_us_median": 0.48,
+  "publish_wait_us_median": 0.56,
+  "cta_body_us_max": 17.060000000000002,
+  "terminal_us_cta0": 15.34,
+  "clock_spread_us": 19227.04
+ },
+ "failstop_dead_rank": {
+  "errors": 127776,
+  "failed": 1,
+  "epoch": 1062,
+  "returned_after_s": 0.511,
+  "wait_budget_s": 0.25,
+  "check_raised": null,
+  "given_up": {
+   "ctas": 256,
+   "by_region": {
+    "go": 255,
+    "bar": 1
+   },
+   "cta0": "+40 us CTA 0: bar pair 3 waited for tag 271617, saw 271105"
+  }
+ },
+ "failstop_stall": {
+  "errors": 60896,
+  "failed": 1,
+  "epoch": 1063,
+  "returned_after_s": 0.413,
+  "stall_s": 0.4,
+  "wait_budget_s": 0.25,
+  "check_raised": null,
+  "given_up": {
+   "ctas": 255,
+   "by_region": {
+    "go": 255
+   },
+   "cta0": null
+  }
+ },
+ "after_reset": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 1064
+ }
+}

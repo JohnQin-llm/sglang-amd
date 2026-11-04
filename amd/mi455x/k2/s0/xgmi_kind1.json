@@ -1,0 +1,8 @@
+{
+  "pair_finegrained_push_sleep": 2.3830,
+  "pair_finegrained_push_busy": 2.4003,
+  "pair_finegrained_pull_sleep": 3.6489,
+  "pair_finegrained_pull_busy": 3.6590,
+  "self_finegrained": 0.9909,
+  "barrier4_finegrained": 3.6293
+}

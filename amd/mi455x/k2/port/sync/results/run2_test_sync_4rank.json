@@ -1,0 +1,416 @@
+{
+ "wall_s": 7.5,
+ "ranks": [
+  {
+   "rank": 0,
+   "compile_s": 2.4,
+   "eager_full": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 20,
+    "alarm_words": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "steps": 20,
+    "barrier_us_per_round": 2.2787499999999996,
+    "exchange_us": 13212.75,
+    "publish_us_median": 0.68,
+    "publish_wait_us_median": 0.62,
+    "kernel_body_us": 13425.61,
+    "pingpong_us_per_hop": 2.06625,
+    "pingpong_min": 1.93375,
+    "barrier_min": 2.23,
+    "exchange_min": 13212.27
+   },
+   "graph_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 521,
+    "alarm_words": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "replays": 500,
+    "epoch_advanced": 500,
+    "us_per_step": 32.35203170776367,
+    "last_step": {
+     "barrier_us_per_round": 9.92,
+     "exchange_us": 13213.59,
+     "publish_us_median": 0.68,
+     "publish_wait_us_median": 0.72,
+     "kernel_body_us": 13227.47
+    }
+   },
+   "eager_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 541,
+    "alarm_words": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "barrier_us_per_round": 21.2,
+    "exchange_us": 13213.630000000001,
+    "publish_us_median": 0.68,
+    "publish_wait_us_median": 0.68,
+    "kernel_body_us": 13238.310000000001
+   },
+   "eager_nofence": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 561,
+    "alarm_words": [
+     0,
+     0,
+     0,
+     0
+    ],
+    "barrier_us_per_round": 22.56,
+    "exchange_us": 13213.65,
+    "publish_us_median": 0.56,
+    "publish_wait_us_median": 0.64,
+    "kernel_body_us": 13239.01
+   },
+   "failstop_dead_rank": {
+    "errors": 116544,
+    "failed": 1,
+    "epoch": 562,
+    "alarm_words": [
+     1,
+     1,
+     1,
+     0
+    ],
+    "returned_after_s": 0.511,
+    "wait_budget_s": 0.25,
+    "check_raised": "MonoKernel step failed: TP ranks [0, 1, 2] gave up an in-kernel wait; the step's tokens are discarded",
+    "given_up": [
+     "+0 us CTA 45: go pair 0 waited for tag 143617, saw 143361",
+     "+0 us CTA 101: go pair 0 waited for tag 143617, saw 143361",
+     "+0 us CTA 165: go pair 0 waited for tag 143617, saw 143361",
+     "+0 us CTA 205: go pair 0 waited for tag 143617, saw 143361"
+    ]
+   },
+   "failstop_stall": {
+    "errors": 113280,
+    "failed": 1,
+    "epoch": 563,
+    "alarm_words": [
+     1,
+     1,
+     1,
+     1
+    ],
+    "returned_after_s": 0.412,
+    "stall_s": 0.4,
+    "wait_budget_s": 0.25,
+    "check_raised": "MonoKernel step failed: TP ranks [0, 1, 2, 3] gave up an in-kernel wait; the step's tokens are discarded",
+    "given_up": [
+     "+0 us CTA 37: go pair 0 waited for tag 143873, saw 143617",
+     "+0 us CTA 77: go pair 0 waited for tag 143873, saw 143617",
+     "+0 us CTA 5: go pair 0 waited for tag 143873, saw 143617",
+     "+0 us CTA 213: go pair 0 waited for tag 143873, saw 143617"
+    ]
+   },
+   "after_reset": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 564,
+    "alarm_words": [
+     0,
+     0,
+     0,
+     0
+    ]
+   },
+   "residency": [
+    {
+     "name": "k2sync_t4_w200000000_b32_p32_x32768_f1",
+     "block": 512,
+     "blocks_per_cu": 1,
+     "regs": 256,
+     "lds": 0,
+     "scratch": 52,
+     "fits_256": true,
+     "cus": 256
+    },
+    {
+     "name": "k2sync_t4_w200000000_b32_p32_x32768_f1",
+     "block": 512,
+     "blocks_per_cu": 1,
+     "regs": 256,
+     "lds": 0,
+     "scratch": 52,
+     "fits_256": true,
+     "cus": 256
+    }
+   ]
+  },
+  {
+   "rank": 1,
+   "compile_s": 2.4,
+   "eager_full": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 20,
+    "steps": 20,
+    "barrier_us_per_round": 3.088125,
+    "exchange_us": 19234.14,
+    "publish_us_median": 0.64,
+    "publish_wait_us_median": 0.72,
+    "kernel_body_us": 19462.22,
+    "pingpong_us_per_hop": 2.0403124999999998,
+    "pingpong_min": 1.901875,
+    "barrier_min": 2.245,
+    "exchange_min": 19233.7
+   },
+   "graph_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 521,
+    "replays": 500,
+    "epoch_advanced": 500,
+    "us_per_step": 32.362098693847656,
+    "last_step": {
+     "barrier_us_per_round": 2.08,
+     "exchange_us": 19233.54,
+     "publish_us_median": 0.6,
+     "publish_wait_us_median": 0.76,
+     "kernel_body_us": 19238.86
+    }
+   },
+   "eager_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 541,
+    "barrier_us_per_round": 9.940000000000001,
+    "exchange_us": 19233.379999999997,
+    "publish_us_median": 0.6,
+    "publish_wait_us_median": 0.72,
+    "kernel_body_us": 19245.86
+   },
+   "eager_nofence": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 561,
+    "barrier_us_per_round": 16.88,
+    "exchange_us": 19233.16,
+    "publish_us_median": 0.48,
+    "publish_wait_us_median": 0.68,
+    "kernel_body_us": 19252.239999999998
+   },
+   "failstop_dead_rank": {
+    "errors": 85632,
+    "failed": 1,
+    "epoch": 562,
+    "returned_after_s": 0.511,
+    "wait_budget_s": 0.25,
+    "check_raised": null,
+    "given_up": [
+     "+0 us CTA 61: go pair 0 waited for tag 143617, saw 143361",
+     "+0 us CTA 157: go pair 0 waited for tag 143617, saw 143361",
+     "+0 us CTA 53: go pair 0 waited for tag 143617, saw 143361",
+     "+0 us CTA 173: go pair 0 waited for tag 143617, saw 143361"
+    ]
+   },
+   "failstop_stall": {
+    "errors": 71392,
+    "failed": 1,
+    "epoch": 563,
+    "returned_after_s": 0.412,
+    "stall_s": 0.4,
+    "wait_budget_s": 0.25,
+    "check_raised": null,
+    "given_up": [
+     "+0 us CTA 5: go pair 0 waited for tag 143873, saw 143617",
+     "+0 us CTA 45: go pair 0 waited for tag 143873, saw 143617",
+     "+0 us CTA 61: go pair 0 waited for tag 143873, saw 143617",
+     "+0 us CTA 101: go pair 0 waited for tag 143873, saw 143617"
+    ]
+   },
+   "after_reset": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 564
+   }
+  },
+  {
+   "rank": 2,
+   "compile_s": 2.5,
+   "eager_full": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 20,
+    "steps": 20,
+    "barrier_us_per_round": 2.274375,
+    "exchange_us": 604.74,
+    "publish_us_median": 0.64,
+    "publish_wait_us_median": 0.74,
+    "kernel_body_us": 687.04,
+    "pingpong_us_per_hop": 0.005625,
+    "pingpong_min": 0.005,
+    "barrier_min": 2.24,
+    "exchange_min": 595.84
+   },
+   "graph_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 521,
+    "replays": 500,
+    "epoch_advanced": 500,
+    "us_per_step": 32.36366653442383,
+    "last_step": {
+     "barrier_us_per_round": 1.88,
+     "exchange_us": 473.36,
+     "publish_us_median": 0.64,
+     "publish_wait_us_median": 0.84,
+     "kernel_body_us": 480.12
+    }
+   },
+   "eager_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 541,
+    "barrier_us_per_round": 0.5800000000000001,
+    "exchange_us": 475.36,
+    "publish_us_median": 0.6,
+    "publish_wait_us_median": 0.78,
+    "kernel_body_us": 481.91999999999996
+   },
+   "eager_nofence": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 561,
+    "barrier_us_per_round": 0.5800000000000001,
+    "exchange_us": 475.5,
+    "publish_us_median": 0.48,
+    "publish_wait_us_median": 0.72,
+    "kernel_body_us": 481.96
+   },
+   "failstop_dead_rank": {
+    "errors": 128096,
+    "failed": 1,
+    "epoch": 562,
+    "returned_after_s": 0.51,
+    "wait_budget_s": 0.25,
+    "check_raised": null,
+    "given_up": [
+     "+0 us CTA 1: go pair 0 waited for tag 143617, saw 143361",
+     "+0 us CTA 105: go pair 0 waited for tag 143617, saw 143361",
+     "+0 us CTA 9: go pair 0 waited for tag 143617, saw 143361",
+     "+0 us CTA 89: go pair 0 waited for tag 143617, saw 143361"
+    ]
+   },
+   "failstop_stall": {
+    "errors": 96704,
+    "failed": 1,
+    "epoch": 563,
+    "returned_after_s": 0.412,
+    "stall_s": 0.4,
+    "wait_budget_s": 0.25,
+    "check_raised": null,
+    "given_up": [
+     "+0 us CTA 1: go pair 0 waited for tag 143873, saw 143617",
+     "+0 us CTA 161: go pair 0 waited for tag 143873, saw 143617",
+     "+0 us CTA 41: go pair 0 waited for tag 143873, saw 143617",
+     "+0 us CTA 57: go pair 0 waited for tag 143873, saw 143617"
+    ]
+   },
+   "after_reset": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 564
+   }
+  },
+  {
+   "rank": 3,
+   "compile_s": 2.4,
+   "eager_full": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 20,
+    "steps": 20,
+    "barrier_us_per_round": 3.1725,
+    "exchange_us": 9499.42,
+    "publish_us_median": 0.62,
+    "publish_wait_us_median": 0.64,
+    "kernel_body_us": 9603.740000000002,
+    "pingpong_us_per_hop": 0.005625,
+    "pingpong_min": 0.004375,
+    "barrier_min": 2.3025,
+    "exchange_min": 9490.22
+   },
+   "graph_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 521,
+    "replays": 500,
+    "epoch_advanced": 500,
+    "us_per_step": 32.41523361206055,
+    "last_step": {
+     "barrier_us_per_round": 3.6,
+     "exchange_us": 9368.22,
+     "publish_us_median": 0.6,
+     "publish_wait_us_median": 0.64,
+     "kernel_body_us": 9374.62
+    }
+   },
+   "eager_lean": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 541,
+    "barrier_us_per_round": 14.719999999999999,
+    "exchange_us": 9368.2,
+    "publish_us_median": 0.6,
+    "publish_wait_us_median": 0.64,
+    "kernel_body_us": 9387.18
+   },
+   "eager_nofence": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 561,
+    "barrier_us_per_round": 9.22,
+    "exchange_us": 9368.220000000001,
+    "publish_us_median": 0.48,
+    "publish_wait_us_median": 0.62,
+    "kernel_body_us": 9381.099999999999
+   },
+   "failstop_dead_rank": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 562,
+    "returned_after_s": 0.0,
+    "wait_budget_s": 0.25,
+    "check_raised": null,
+    "given_up": []
+   },
+   "failstop_stall": {
+    "errors": 117504,
+    "failed": 1,
+    "epoch": 563,
+    "returned_after_s": 0.412,
+    "stall_s": 0.4,
+    "wait_budget_s": 0.25,
+    "check_raised": null,
+    "given_up": [
+     "+0 us CTA 101: go pair 0 waited for tag 143873, saw 143361",
+     "+0 us CTA 5: go pair 0 waited for tag 143873, saw 143361",
+     "+0 us CTA 21: go pair 0 waited for tag 143873, saw 143361",
+     "+0 us CTA 77: go pair 0 waited for tag 143873, saw 143361"
+    ]
+   },
+   "after_reset": {
+    "errors": 0,
+    "failed": 0,
+    "epoch": 564
+   }
+  }
+ ]
+}

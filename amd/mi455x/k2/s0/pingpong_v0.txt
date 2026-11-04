@@ -1,0 +1,9 @@
+flag ping-pong, 20000 rounds a cycle, uncached device memory, system-scope acquire/release
+  cycle [0 1]: 40000 hops, 2.358 us/hop (device clock 100000 kHz; host-timed 2.370 us/hop)
+  cycle [0 2]: 40000 hops, 2.403 us/hop (device clock 100000 kHz; host-timed 2.410 us/hop)
+  cycle [0 3]: 40000 hops, 2.351 us/hop (device clock 100000 kHz; host-timed 2.358 us/hop)
+  cycle [1 2]: 40000 hops, 2.329 us/hop (device clock 100000 kHz; host-timed 2.333 us/hop)
+  cycle [1 3]: 40000 hops, 2.235 us/hop (device clock 100000 kHz; host-timed 2.239 us/hop)
+  cycle [2 3]: 40000 hops, 2.327 us/hop (device clock 100000 kHz; host-timed 2.331 us/hop)
+  cycle [0 1 2 3]: 80000 hops, 2.331 us/hop (device clock 100000 kHz; host-timed 2.335 us/hop)
+  cycle [0 2 1 3]: 80000 hops, 2.397 us/hop (device clock 100000 kHz; host-timed 2.402 us/hop)

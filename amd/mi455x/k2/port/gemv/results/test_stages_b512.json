@@ -1,0 +1,34 @@
+{
+ "oproj": {
+  "exact_vs_bf16_ref": 0.999893,
+  "max_ulp": 11.0,
+  "cos": 0.9999986204390798,
+  "cos_bf16_ref_floor": 0.9999986204391729,
+  "tags_ok": true
+ },
+ "variant": {
+  "interleave": 1,
+  "shuffled": 1,
+  "weight_cm": 1,
+  "xrows_cm": 16,
+  "blocks": 512,
+  "threads": 512
+ },
+ "bench": {
+  "oproj": {
+   "us_per_call": 4.38,
+   "empty_kernel_us": 1.285,
+   "net_us": 3.095,
+   "bytes": 33587200,
+   "floor_us_23.3TBs": 1.442,
+   "achieved_TBs_net": 10.85,
+   "copies_rotated": 48,
+   "grid": 512,
+   "copy_kernel_at_64MB": {
+    "TBs": 11.53,
+    "us": 5.8
+   },
+   "floor_us_at_copy_bw": 2.913
+  }
+ }
+}

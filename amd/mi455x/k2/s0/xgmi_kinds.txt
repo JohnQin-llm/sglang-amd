@@ -1,0 +1,24 @@
+wall clock 100000 kHz, rounds 5000
+== 1. pair ping-pong, us per one-way hop (pairs 0-1, 0-2, 0-3, 1-2, 1-3, 2-3)
+  uncached     push sleep : 2.395 2.469 2.386 2.345 2.324 2.364  mean 2.380
+  uncached     push busy  : 2.420 2.435 2.376 2.375 2.317 2.386  mean 2.385
+  uncached     pull sleep : 3.633 3.588 3.628 3.550 3.814 3.532  mean 3.624
+  uncached     pull busy  : 3.684 3.587 3.673 3.580 3.463 3.560  mean 3.591
+  uncached     same-GPU two-CTA hop: 0.980 us
+  uncached     4-rank barrier (push, 1 CTA/rank): 3.570 us per barrier
+wall clock 100000 kHz, rounds 5000
+== 1. pair ping-pong, us per one-way hop (pairs 0-1, 0-2, 0-3, 1-2, 1-3, 2-3)
+  finegrained  push sleep : 2.389 2.514 2.341 2.404 2.259 2.390  mean 2.383
+  finegrained  push busy  : 2.386 2.440 2.409 2.413 2.341 2.413  mean 2.400
+  finegrained  pull sleep : 3.675 3.621 3.689 3.636 3.642 3.630  mean 3.649
+  finegrained  pull busy  : 3.683 3.758 3.647 3.600 3.643 3.623  mean 3.659
+  finegrained  same-GPU two-CTA hop: 0.991 us
+  finegrained  4-rank barrier (push, 1 CTA/rank): 3.629 us per barrier
+wall clock 100000 kHz, rounds 5000
+== 1. pair ping-pong, us per one-way hop (pairs 0-1, 0-2, 0-3, 1-2, 1-3, 2-3)
+  coarse       push sleep : 2.411 2.469 2.426 2.424 2.302 2.390  mean 2.403
+  coarse       push busy  : 2.384 2.468 2.432 2.410 2.330 2.409  mean 2.405
+  coarse       pull sleep : 3.673 3.476 3.679 3.656 3.663 3.598  mean 3.624
+  coarse       pull busy  : 3.669 3.849 3.669 3.607 3.542 3.584  mean 3.653
+  coarse       same-GPU two-CTA hop: 1.076 us
+  coarse       4-rank barrier (push, 1 CTA/rank): 3.605 us per barrier

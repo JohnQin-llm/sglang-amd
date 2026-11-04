@@ -1,0 +1,5 @@
+wmma_builtin_test-hip-amdgpu-amd-amdhsa-amdgpu12.50-amd-amdhsa-gfx1250.o
+-r=wmma_builtin_test-hip-amdgpu-amd-amdhsa-amdgpu12.50-amd-amdhsa-gfx1250.o,__assert_fail,pl
+-r=wmma_builtin_test-hip-amdgpu-amd-amdhsa-amdgpu12.50-amd-amdhsa-gfx1250.o,__assertfail,pl
+-r=wmma_builtin_test-hip-amdgpu-amd-amdhsa-amdgpu12.50-amd-amdhsa-gfx1250.o,_Z1kPKDv16_iS1_PKiS3_PDv8_f,plx
+-r=wmma_builtin_test-hip-amdgpu-amd-amdhsa-amdgpu12.50-amd-amdhsa-gfx1250.o,__hip_cuid_130363cb5bd5ab3b,px

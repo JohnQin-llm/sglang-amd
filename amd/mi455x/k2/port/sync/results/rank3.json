@@ -1,0 +1,99 @@
+{
+ "rank": 3,
+ "compile_s": 2.5,
+ "eager_full": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 20,
+  "steps": 20,
+  "exchange_us_max_cta": 135.45999999999998,
+  "exchange_us_median_cta": 133.88,
+  "publish_us_median": 0.62,
+  "publish_wait_us_median": 0.64,
+  "cta_body_us_max": 266.96,
+  "terminal_us_cta0": 14.32,
+  "clock_spread_us": 9492.2,
+  "barrier_us_per_round": 2.256774193548387,
+  "pingpong_us_per_hop": 0.004375,
+  "pingpong_min": 0.00375,
+  "barrier_min": 2.233548387096774,
+  "exchange_min": 131.92
+ },
+ "graph_lean": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 521,
+  "replays": 500,
+  "epoch_advanced": 500,
+  "us_per_step": 32.606956481933594,
+  "last_step": {
+   "exchange_us_max_cta": 6.6,
+   "exchange_us_median_cta": 4.12,
+   "publish_us_median": 0.6,
+   "publish_wait_us_median": 0.6,
+   "cta_body_us_max": 14.72,
+   "terminal_us_cta0": 13.88,
+   "clock_spread_us": 9362.26
+  },
+  "epoch_bump_only_us": 6.143645763397217
+ },
+ "eager_lean": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 1041,
+  "exchange_us_max_cta": 6.859999999999999,
+  "exchange_us_median_cta": 4.16,
+  "publish_us_median": 0.6,
+  "publish_wait_us_median": 0.64,
+  "cta_body_us_max": 36.22,
+  "terminal_us_cta0": 15.399999999999999,
+  "clock_spread_us": 9361.9
+ },
+ "eager_nofence": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 1061,
+  "exchange_us_max_cta": 7.1,
+  "exchange_us_median_cta": 4.24,
+  "publish_us_median": 0.48,
+  "publish_wait_us_median": 0.56,
+  "cta_body_us_max": 28.3,
+  "terminal_us_cta0": 12.1,
+  "clock_spread_us": 9361.94
+ },
+ "failstop_dead_rank": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 1062,
+  "returned_after_s": 0.0,
+  "wait_budget_s": 0.25,
+  "check_raised": null,
+  "given_up": {
+   "ctas": 0,
+   "by_region": {},
+   "cta0": null
+  }
+ },
+ "failstop_stall": {
+  "errors": 160032,
+  "failed": 1,
+  "epoch": 1063,
+  "returned_after_s": 0.413,
+  "stall_s": 0.4,
+  "wait_budget_s": 0.25,
+  "check_raised": null,
+  "given_up": {
+   "ctas": 256,
+   "by_region": {
+    "go": 255,
+    "bar": 1
+   },
+   "cta0": "+40 us CTA 0: bar pair 1 waited for tag 271873, saw 271361"
+  }
+ },
+ "after_reset": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 1064
+ }
+}

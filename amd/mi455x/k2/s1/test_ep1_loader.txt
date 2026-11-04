@@ -1,0 +1,17 @@
+EP1 MXFP4 expert copy per GPU (layers 1-60): 102.68 GB
+layer 1
+  [PASS] L1 A: 4 rank slices reassemble every byte of 256 experts
+  [PASS] L1 B: gfx1250 layout round trip of every rank slice
+  [PASS] L1 B: EP1-shape kernel addressing gathers WMMA operands + scales
+  [PASS] L1 C: float64 partial-sum == full expert FFN (rel 1.97e-15 <= 1e-12, fp32 rel 1.07e-06) on cuda
+layer 31
+  [PASS] L31 A: 4 rank slices reassemble every byte of 256 experts
+  [PASS] L31 B: gfx1250 layout round trip of every rank slice
+  [PASS] L31 B: EP1-shape kernel addressing gathers WMMA operands + scales
+  [PASS] L31 C: float64 partial-sum == full expert FFN (rel 2.12e-15 <= 1e-12, fp32 rel 1.14e-06) on cuda
+layer 60
+  [PASS] L60 A: 4 rank slices reassemble every byte of 256 experts
+  [PASS] L60 B: gfx1250 layout round trip of every rank slice
+  [PASS] L60 B: EP1-shape kernel addressing gathers WMMA operands + scales
+  [PASS] L60 C: float64 partial-sum == full expert FFN (rel 2.10e-15 <= 1e-12, fp32 rel 1.13e-06) on cuda
+ALL EP1 LOADER CHECKS PASSED

@@ -1,0 +1,8 @@
+{
+  "pair_coarse_push_sleep": 2.4034,
+  "pair_coarse_push_busy": 2.4054,
+  "pair_coarse_pull_sleep": 3.6242,
+  "pair_coarse_pull_busy": 3.6534,
+  "self_coarse": 1.0755,
+  "barrier4_coarse": 3.6049
+}

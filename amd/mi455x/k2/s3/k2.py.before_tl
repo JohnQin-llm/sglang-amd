@@ -1,0 +1,415 @@
+"""K2 on MI455X (gfx1250) at TP4 / EP1: one Muse Spark sparse decoder layer from the attention's core output
+(o_proj's input) to the MoE branch, one persistent launch a layer and TP rank, every TP collective inside the
+kernel. Port of the MI355X ``k2bundle/ops/k2.py`` (TP8 / EP1, q8 schedule); stages from the helpers' modules
+(``port/gemv`` o_proj / seam / router / pooler / route / unpooler / gather, ``port/moe`` xq / UG / down /
+finalize), sync from ``port/sync``. Contract: ``port/INTERFACE.md``.
+
+Width: T = 8 rows only (C1 verify step). Other widths take the served path (``step_disable_reason``).
+
+CTA roles (256 CTAs x 512 threads, one a CU, all co-resident). No CTA waits on a stage later in its own program:
+
+    CTAs 0 .. 255     o_proj: tiles bid, bid + 256 (16 rows x K 2048 each) -> AR#1 reduce-scatter to the owners
+    CTAs 0 .. 31      AR#1 owner sum (quarter seam) -> XG / XSQ; CTAs 0 .. 7 then seam token t -> stream_out, x, XRDY
+    CTAs 0 .. 7       route token t (after the router's RLOG_PARTS) -> ROUTE
+    CTAs 32 .. 95     router: 64 q8 tasks (16 experts x K quarter x token pair), weights in flight before XRDY
+    CTAs 0 .. 255     pooler task bid (64 groups x K quarter) -> POOL all-gather (CTAs 0 .. 31 after the seam)
+    CTAs 8 .. 15      xq token t: POOL row -> pre_expert_norm -> MXFP8 -> XQ / XSC (+ XQRDY)
+    every CTA         route table (LDS); UG tasks u = bid + 256 i < |U| 32 (slot, 32-column group)
+    every wave        down tasks v = 16 bid + wave + 4096 i < |U| 256 (slot, 16-row MH tile) -> YR (row owner)
+    CTAs 192 .. 255   finalize (owned row tl, 128-column slice j) -> FIN rows (plain) + FRDY on every rank
+    CTAs 0 .. 127     unpooler task bid (16 branch columns) -> BR all-gather; W_unpool issued before FRDY
+    CTAs 128 .. 191   gather: BR -> ``branch_out``
+    every CTA         finish consensus (fan-in tree, then the 4 ranks' done pairs)
+"""
+
+import os
+from dataclasses import dataclass
+
+import flydsl.compiler as flyc
+import flydsl.expr as fx
+from flydsl.expr import const_expr, gpu
+from aiter.ops.flydsl.kernels import buffer_ops as bo
+from flydsl.expr.typing import Int32, Int64, T
+
+from port import consts as K
+from port.common.ops import ld_i32, load_ptr64, rsrc, traced, uniform, vm_wait
+from port.gemv import moe_dense as MD
+from port.gemv import oproj, quarter_seam
+from port.moe import moe as X
+from port.sync.abi import K2_DONE_BYTES, K2_DONE_OFFSET
+from port.sync.debug import region_ids
+from port.sync.epoch import EPOCH_TAG_PERIOD, TAG_SLOTS
+from port.sync.memmodel import CM_DEV, CM_SYS, memrealtime
+from port.sync.plan import KernelAbi, enter_stage, key_tuple, pair_layout, source_digest
+from port.sync.ranks import peer_bases
+from port.sync.sync import Mailbox, import_alarms, preg, publish, shift, sreg
+
+TP = K.TP
+BLOCKS = K.BLOCKS
+THREADS = K.THREADS
+WAVES = K.WAVES
+MAX_TOKENS = K.MAX_TOKENS
+K2_SLOT0 = 128  # K2 of layer i is mailbox slot 128 + i
+
+# ---- CTA roles (T = 8)
+OWNER0, OWNER_CTAS = 0, 4 * MAX_TOKENS  # AR#1 owner sum: 32 CTAs (P4: four a token)
+R0 = OWNER0 + OWNER_CTAS  # 32: router CTAs
+P0 = 0  # pooler task p on CTA p
+XQ0 = MAX_TOKENS  # 8: xq CTAs (seam CTAs after their pooler task)
+FIN_CTAS = (MAX_TOKENS // TP) * X.FIN_SLICES  # 64: (owned row, slice)
+FIN0 = BLOCKS - FIN_CTAS  # 192
+U0 = 0  # unpooler CTAs
+G0 = MD.UP_TASKS  # 128: gather CTAs
+UG_GROUPS = K.RI // 32  # 32 UG tasks a slot
+DOWN_TILES = K.MH // K.ROWS  # 256 down wave-tasks a slot
+assert MD.P_TASKS == BLOCKS
+assert R0 + MD.R_TASKS_Q8 <= BLOCKS
+assert G0 + MD.GATHER_TASKS <= FIN0 and U0 + MD.UP_TASKS <= G0
+assert oproj.OTASKS == 2 * BLOCKS
+
+FINISH_FANIN = 8
+FINISH_GROUPS = BLOCKS // FINISH_FANIN  # 32
+FINISH_ROOTS = FINISH_GROUPS // FINISH_FANIN  # 4
+
+# ---- regions
+_PEER_PAIRS = {
+    "ar": oproj.ar_pairs(MAX_TOKENS),
+    **MD.peer_pairs(MAX_TOKENS),  # rlog, rlog_parts, pool, br
+    "xg": MAX_TOKENS * K.H // 2,
+    "xsq": MAX_TOKENS * 64,
+    "yr": TP * MAX_TOKENS * K.TOPK * K.MH // 2,  # [src][t][k][MH] bf16 pairs (owned rows written)
+    "frdy": MAX_TOKENS * X.FIN_SLICES,  # row t, slice j
+}
+_PEER_PLAIN = {"fin": MAX_TOKENS * K.MH * 2}  # [t][MH] bf16, written by the row owners
+_SCRATCH_PAIRS = {
+    "msq1": 64 * MAX_TOKENS,
+    "msq2": 64 * MAX_TOKENS,
+    "xrdy": max(64, 4 * MAX_TOKENS),
+    "p1": 64 * MAX_TOKENS,
+    "p2": 64 * MAX_TOKENS,
+    "rpart": MD.R_TASKS * MAX_TOKENS * WAVES,
+    "ppart": MD.P_TASKS * MAX_TOKENS * K.ROWS,
+    "route": MAX_TOKENS * 2 * K.TOPK,
+    "xqrdy": MAX_TOKENS,
+    "ugrdy": X.MAX_U * UG_GROUPS,
+    "fmsq": MAX_TOKENS * K.TOPK * X.FIN_SLICES,
+    "finish": BLOCKS + FINISH_GROUPS + FINISH_ROOTS,
+}
+_SCRATCH_PLAIN = dict(X.scratch_plain(MAX_TOKENS, "a8"))  # xqb, xscb, interb, iscb (fmsq: pairs above)
+_SCRATCH_PLAIN.pop("fmsq", None)
+_SCRATCH_PLAIN["xrow"] = MAX_TOKENS * K.H * 2
+
+REGIONS = tuple(_PEER_PAIRS) + tuple(_SCRATCH_PAIRS) + ("done",)
+
+_SOURCES = source_digest("common", "sync", "gemv", "moe", "consts.py", "k2.py")
+_STREAM = fx.Stream(None)
+
+
+def _layout(pairs, plain, align=256):
+    lay = pair_layout(pairs.items(), align=align)
+    end = max(o + n for o, n in lay.values())
+    for name, nbytes in plain.items():
+        off = (end + align - 1) // align * align
+        lay[name] = (off, nbytes)
+        end = off + nbytes
+    return lay, (end + align - 1) // align * align
+
+
+def peer_layout() -> dict:
+    """One parity's peer regions (name -> (byte offset, bytes))."""
+    return _layout(_PEER_PAIRS, _PEER_PLAIN)[0]
+
+
+def _half() -> int:
+    return _layout(_PEER_PAIRS, _PEER_PLAIN)[1]
+
+
+def peer_bytes() -> int:
+    """Both parities' peer bytes (past the runner's PEER_HEAD)."""
+    return 2 * _half()
+
+
+def scratch_layout() -> dict:
+    return _layout(_SCRATCH_PAIRS, _SCRATCH_PLAIN, align=16)[0]
+
+
+def scratch_bytes() -> int:
+    return _layout(_SCRATCH_PAIRS, _SCRATCH_PLAIN, align=16)[1]
+
+
+# ---- build key / ABI
+@dataclass(frozen=True)
+class K2Build:
+    tokens: int = MAX_TOKENS
+    eps_post_attn: float = K.EPS_POST_ATTN
+    eps_ffn: float = K.EPS_FFN
+    eps_pre_expert: float = K.EPS_PRE_EXPERT
+    eps_post_expert: float = K.EPS_POST_EXPERT
+    router_output_multiplier: float = K.ROUTER_MULT
+    act: str = "a8"
+    ug_ksplit: int = 8  # in-CTA split-K of a UG task (16 waves: 2 tiles x 8 K parts)
+    ug_prefetch: int = 4
+    down_prefetch: int = 8
+    fault_rank: int = -1
+    fault_epoch: int = 0
+    fault_layer: int = 0
+    fault_ticks: int = 0
+
+    def __post_init__(self):
+        if self.tokens != MAX_TOKENS:
+            raise ValueError(f"gfx1250 K2 supports T = {MAX_TOKENS} only (got {self.tokens})")
+        if self.act not in ("a8", "a4"):
+            raise ValueError(self.act)
+
+
+def make_key(**kw) -> K2Build:
+    return K2Build(**kw)
+
+
+ABI = KernelAbi(
+    (
+        "core", "stream_a", "w_o", "alpha_a", "beta_a", "w_fn", "w_router", "expert_bias", "w_pool", "w_pre",
+        "w13", "w13s", "w2", "w2s", "w_post", "w_unpool", "stream_out", "branch_out", "scratch", "peers", "rank",
+        "epoch", "layer", "health", "alarm", "tl",
+    )
+)  # fmt: skip
+
+
+def step_tag(epoch, slot):
+    """The launch's mailbox tag (epoch and slot packed; never 0)."""
+    return (epoch % EPOCH_TAG_PERIOD) * TAG_SLOTS + slot + 1
+
+
+def step_disable_reason(rows: int) -> str | None:
+    if rows != MAX_TOKENS:
+        return f"K2 gfx1250 runs T={MAX_TOKENS} only (step has {rows} rows)"
+    return None
+
+
+@traced
+def finish_consensus(c, done, health, alarm):
+    """Keep CTA 0 live until every local CTA and every TP rank reached the tail (MI355X default fan-in tree)."""
+    tid, bid = c["tid"], c["bid"]
+    publish(c["put"], c["finish"], bid, 1, tid == 0)
+    if (bid < FINISH_GROUPS) & (tid == 0):
+        lo = bid * FINISH_FANIN
+        c["poll_terminal"]([(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)])
+        c["put"](c["finish"], BLOCKS + bid, 1)
+    if (bid < FINISH_ROOTS) & (tid == 0):
+        lo = BLOCKS + bid * FINISH_FANIN
+        c["poll_terminal"]([(c["finish"], lo + i, 1) for i in range(FINISH_FANIN)])
+        c["put"](c["finish"], BLOCKS + FINISH_GROUPS + bid, 1)
+    if (bid == 0) & (tid == 0):
+        c["poll_terminal"]([(c["finish"], BLOCKS + FINISH_GROUPS + i, 1) for i in range(FINISH_ROOTS)])
+        c["put"](done, c["rank"], 1)
+        vm_wait()
+        c["poll_terminal"]([(done, r, 1) for r in range(TP)])
+        import_alarms(health, alarm, c["rank"], TP)
+
+
+# ---- build
+_BUILDS: dict = {}
+
+
+def _make(key: K2Build):
+    s = key.tokens
+    lay = scratch_layout()
+    play = peer_layout()
+    half = _half()
+    xrow_max = max(oproj.CORE_ROW, MD.EARLY_K + 8, K.MH + 8)
+    nk = (X.MAX_U + 1) * 8
+
+    @fx.struct
+    class RouteLds:
+        ids: fx.Array[fx.Int32, s * K.TOPK, 16]
+        fl: fx.Array[fx.Int32, s * K.TOPK, 16]
+        expert: fx.Array[fx.Int32, X.MAX_U + 1, 16]
+        kof: fx.Array[fx.Int32, nk, 16]
+
+    @fx.struct
+    class Smem:
+        red: fx.Array[fx.Float32, WAVES * 256, 16]
+        av: fx.Array[fx.Float32, THREADS, 16]
+        xl: fx.Array[fx.Int32, s * xrow_max // 2, 16]
+        kred: fx.Array[fx.Float32, 2 * key.ug_ksplit * 2 * 8 * 32, 16]
+        amx: fx.Array[fx.Float32, 32, 16]
+
+    from port.sync import sync as _S
+
+    keyed = key_tuple(key, f"{_SOURCES}|inv{int(_S._INV_POLL)}|{_S._INV_SCOPE}|th{_S._POLL_TH}|dbg{os.environ.get('K2_DEBUG_EPOCH', '0')}")
+    name = f"muse_mono_k2g_s{s}_{key.act}"
+    if key.fault_rank >= 0:
+        name += f"_f{key.fault_rank}_{key.fault_epoch}_{key.fault_layer}_{key.fault_ticks}"
+    rids = region_ids(REGIONS)
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def k2(
+        core: Int64, stream_a: Int64, w_o: Int64, alpha_a: Int64, beta_a: Int64, w_fn: Int64, w_router: Int64,
+        expert_bias: Int64, w_pool: Int64, w_pre: Int64, w13: Int64, w13s: Int64, w2: Int64, w2s: Int64,
+        w_post: Int64, w_unpool: Int64, stream_out: Int64, branch_out: Int64, scratch: Int64, peers: Int64,
+        rank: Int32, epoch: Int64, layer: Int32, health: Int64, alarm: Int64, tl: Int64,
+    ):  # fmt: skip
+        _ = keyed
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        alloc = fx.SharedAllocator()
+        lds = alloc.allocate(Smem).peek()
+        rl = alloc.allocate(RouteLds).peek()
+        # The epoch word is written by the previous launch (epoch.add_); per-XCD L2s are not coherent, so a
+        # plain load can return a stale epoch and pass every wait on that epoch's leftover tags.
+        ep = uniform(fx.Int32(bo.buffer_load(rsrc(epoch), 0, vec_width=1, dtype=T.i32, cache_modifier=CM_SYS)))
+        if const_expr(os.environ.get("K2_DEBUG_EPOCH") == "1"):
+            if tid == 0:
+                bo.buffer_store(ep, rsrc(health), (bid + 1) * 8 + 7, cache_modifier=CM_SYS)
+                bo.buffer_store(fx.Int32(memrealtime() & 0x7FFFFFFF), rsrc(health), (bid + 1) * 8 + 5, cache_modifier=CM_SYS)
+        mb = Mailbox(step_tag(ep, K2_SLOT0 + layer) - 1, health, alarm, rids)
+        par = ep % 2
+        bases = peer_bases(peers, TP)
+        own = load_ptr64(peers, rank)
+        output_head = alarm - fx.Int64(rank) * 4
+        done = preg(output_head, K2_DONE_OFFSET, "done", K2_DONE_BYTES)
+        poff = fx.Int64(par) * half
+        peer = {}
+        for region in _PEER_PAIRS:
+            off, extent = play[region]
+            peer[region] = [shift(preg(b, off, region, extent), poff) for b in bases]
+            peer[region + "_own"] = shift(preg(own, off, region, extent), poff)
+        args = dict(
+            core=core, stream_a=stream_a, w_o=w_o, alpha_a=alpha_a, beta_a=beta_a, w_fn=w_fn, w_router=w_router,
+            expert_bias=expert_bias, w_pool=w_pool, w_pre=w_pre, w13=w13, w13s=w13s, w2=w2, w2s=w2s,
+            w_post=w_post, w_unpool=w_unpool, stream_out=stream_out, branch_out=branch_out,
+        )  # fmt: skip
+        fin_off = play["fin"][0]
+        c = {
+            "S": s, "T": s, "tid": tid, "bid": bid, "lane": tid % K.LANES, "wave": tid // K.LANES, "rank": rank,
+            "threads": THREADS, "act": key.act, "nt": 1, "ksplit": key.ug_ksplit, "prefetch": key.ug_prefetch,
+            "dprefetch": key.down_prefetch,
+            "quarter_seam": True, "rlog_parts": True, "experimental_two_cta": True,
+            "eps_attn": key.eps_post_attn, "eps_ffn": key.eps_ffn, "eps_pre": key.eps_pre_expert,
+            "eps_post": key.eps_post_expert, "router_output_multiplier": key.router_output_multiplier,
+            "put": mb.put, "put_bf": mb.put_bf, "put_words": mb.put_words, "poll": mb.poll,
+            "poll_terminal": mb.poll_terminal,
+            "red": lds.red.ptr, "av": lds.av.ptr, "xl": lds.xl.ptr, "kred": lds.kred.ptr, "amx": lds.amx.ptr,
+            "rt": {"ids": rl.ids.ptr, "fl": rl.fl.ptr, "expert": rl.expert.ptr, "kof": rl.kof.ptr},
+            "peer": peer, "ar_peer": peer["ar"], "ar_own": peer["ar_own"],
+            "yr": peer["yr_own"], "yr_owner": peer["yr"], "frdy_peer": peer["frdy"], "frdy": peer["frdy_own"],
+            "fin": own + fx.Int64(fin_off) + poff,
+            "fin_peer": [b + fx.Int64(fin_off) + poff for b in bases],
+            "xbuf": scratch + fx.Int64(lay["xrow"][0]),
+            "args": args, "stamp": lambda k: None, "xcm": CM_DEV, "frdy_flags": s * X.FIN_SLICES,
+        }  # fmt: skip
+        for region in _SCRATCH_PAIRS:
+            c[region] = sreg(scratch, lay[region][0], region, lay[region][1])
+        for region in _SCRATCH_PLAIN:
+            c[region] = scratch + fx.Int64(lay[region][0])
+        off_ar, ext_ar = play["ar"]
+        c["ar_owner"] = [
+            shift(preg(load_ptr64(peers, oproj.owner_of_tile(bid + BLOCKS * j)), off_ar, "ar", ext_ar), poff)
+            for j in range(oproj.O_ROUNDS)
+        ]
+
+        # ---- o_proj (every CTA) -> AR#1 to the column owners
+        enter_stage("oproj")
+        oproj.stage_oproj_deep(c, bid)
+        # ---- router CTAs: weights in flight, then x
+        is_r = (bid >= R0) & (bid < R0 + MD.R_TASKS_Q8)
+        r_task = fx.max(fx.min(bid - R0, MD.R_TASKS_Q8 - 1), 0)
+        if is_r:
+            enter_stage("router")
+            ri = (r_task % MD.R_TASKS) // MD.R_PARTS
+            rq = r_task % MD.R_PARTS
+            MD.router_compute_pair(c, ri, rq, r_task // MD.R_TASKS, MD.router_loads(c, ri, rq))
+        # ---- seam B (CTAs 0 .. 31), route (0 .. 7)
+        if bid < OWNER_CTAS:
+            enter_stage("seam")
+            quarter_seam.stage_ar_owner_sum(c, bid)
+            if bid < s:
+                quarter_seam.stage_seam_token(c, bid)
+                enter_stage("route")
+                MD.stage_route(c, bid)
+        # ---- pooler task bid (every CTA)
+        enter_stage("pool")
+        pi = bid // MD.P_PARTS
+        pq = bid % MD.P_PARTS
+        MD.pool_compute(c, pi, pq, MD.pool_loads(c, pi, pq))
+        # ---- xq (CTAs 8 .. 15)
+        if (bid >= XQ0) & (bid < XQ0 + s):
+            enter_stage("xq")
+            X.stage_xq(c, bid - XQ0)
+        # ---- routed experts: UG (CTA tasks), down (wave tasks)
+        enter_stage("route_wait")
+        nu = X.load_route(c)
+        X.wait_xq(c)
+        enter_stage("ug")
+        n_ug = nu * UG_GROUPS
+        for i in range((X.MAX_U * UG_GROUPS + BLOCKS - 1) // BLOCKS):
+            u = bid + BLOCKS * i
+            if u < n_ug:
+                X.stage_ug(c, u // UG_GROUPS, u % UG_GROUPS)
+        enter_stage("down")
+        n_dn = nu * DOWN_TILES
+        v0 = bid * WAVES + c["wave"]
+        for i in range((X.MAX_U * DOWN_TILES + BLOCKS * WAVES - 1) // (BLOCKS * WAVES)):
+            v = v0 + BLOCKS * WAVES * i
+            if v < n_dn:
+                X.stage_down(c, v // DOWN_TILES, v % DOWN_TILES)
+        gpu.barrier()
+        # ---- finalize on the row owners (CTAs 192 .. 255); unpooler weights in flight first
+        up_live = (bid >= U0) & (bid < U0 + MD.UP_TASKS)
+        up_ops = MD.up_loads_masked(c, bid - U0, up_live)
+        if bid >= FIN0:
+            enter_stage("finalize")
+            f = bid - FIN0
+            X.stage_fin(c, f // X.FIN_SLICES, f % X.FIN_SLICES, 2)
+        # ---- unpooler (CTAs 0 .. 127), gather (128 .. 191)
+        if up_live:
+            enter_stage("up")
+            if const_expr(os.environ.get("K2_DEBUG_EPOCH") == "1"):
+                if tid == 0:
+                    bo.buffer_store(fx.Int32(memrealtime() & 0x7FFFFFFF), rsrc(health), (bid + 1) * 8 + 6, cache_modifier=CM_SYS)
+            MD.stage_up(c, bid - U0, up_ops)
+            if const_expr(os.environ.get("K2_DEBUG_EPOCH") == "1"):
+                if tid == 0:
+                    bo.buffer_store(fx.Int32(memrealtime() & 0x7FFFFFFF), rsrc(health), (bid + 1) * 8 + 4, cache_modifier=CM_SYS)
+        if (bid >= G0) & (bid < G0 + MD.GATHER_TASKS):
+            enter_stage("gather")
+            MD.stage_gather(c, bid - G0)
+        enter_stage("finish")
+        finish_consensus(c, done, health, alarm)
+
+    @flyc.jit
+    def launch(
+        core: Int64, stream_a: Int64, w_o: Int64, alpha_a: Int64, beta_a: Int64, w_fn: Int64, w_router: Int64,
+        expert_bias: Int64, w_pool: Int64, w_pre: Int64, w13: Int64, w13s: Int64, w2: Int64, w2s: Int64,
+        w_post: Int64, w_unpool: Int64, stream_out: Int64, branch_out: Int64, scratch: Int64, peers: Int64,
+        rank: Int32, epoch: Int64, layer: Int32, health: Int64, alarm: Int64, tl: Int64,
+        stream: fx.Stream = _STREAM,
+    ):  # fmt: skip
+        _ = keyed
+        k2(
+            core, stream_a, w_o, alpha_a, beta_a, w_fn, w_router, expert_bias, w_pool, w_pre, w13, w13s, w2, w2s,
+            w_post, w_unpool, stream_out, branch_out, scratch, peers, rank, epoch, layer, health, alarm, tl,
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)  # fmt: skip
+
+    ABI.check(k2, launch)
+    return launch
+
+
+def build(key: K2Build):
+    if key not in _BUILDS:
+        _BUILDS[key] = _make(key)
+    return _BUILDS[key]
+
+
+def k2_launch(key: K2Build, t: dict, rank: int, layer: int, epoch, peers, scratch, health, alarm, stream=None):
+    """Launch one layer's K2 on this rank. ``t``: the ABI tensors by name (``core`` .. ``branch_out``)."""
+    launch = build(key)
+    ptr = lambda x: x if isinstance(x, int) else x.data_ptr()  # noqa: E731
+    vals = [ptr(t[n]) for n in ABI.names[:18]]
+    st = fx.Stream(stream if stream is not None else 0)
+    launch(*vals, ptr(scratch), ptr(peers), rank, ptr(epoch), layer, ptr(health), ptr(alarm), 0, stream=st)
+
+
+if os.environ.get("K2G_PRINT_LAYOUT"):
+    print("peer", peer_layout(), "half", _half())
+    print("scratch", scratch_layout(), "bytes", scratch_bytes())

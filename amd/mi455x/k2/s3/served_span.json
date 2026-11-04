@@ -1,0 +1,165 @@
+{
+ "/data/muse455/prof/ctx128k/1793754221.9929965-TP-0-EP-0.trace.json.gz": {
+  "verify_steps": 5,
+  "step_us": [
+   80514.615,
+   80527.217,
+   80484.413,
+   80605.334,
+   80748.483
+  ],
+  "kernel_us_per_step": 79450.96579999998,
+  "kernels": [
+   [
+    "kernel_unified_attention_2d_num_query_heads_32_num_queries_per_kv_8_BLOCK_SIZE_16_TILE_SIZ",
+    65728.10179999997,
+    62.0
+   ],
+   [
+    "fused_moe_gemm_kernel.kd",
+    3104.5247999999997,
+    124.0
+   ],
+   [
+    "_gemm_a16w16_gfx1250_bandwidth_bound_kernel_BLOCK_M_32_BLOCK_N_64_BLOCK_K_64_NUM_BUFFERS_5",
+    2094.0351999999993,
+    124.0
+   ],
+   [
+    "void aiter::ar_ll_gfx1250<std::bfloat16_t, 4>(std::bfloat16_t* const*, std::bfloat16_t*, s",
+    2008.820000000001,
+    125.0
+   ],
+   [
+    "_align_small_kernel.kd",
+    1975.6791999999991,
+    62.0
+   ],
+   [
+    "Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT64x16x256_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGSU",
+    1162.468800000001,
+    62.0
+   ],
+   [
+    "_fused_norm_residual_triton_kernel.kd",
+    660.3590000000003,
+    124.0
+   ],
+   [
+    "_dense_partial.kd",
+    634.1319999999998,
+    62.0
+   ],
+   [
+    "Cijk_Alik_Bljk_BSS_BH_Bias_HA_S_SAV_UserArgs_MT256x128x64_MI16x16x1_SN_LDSB0_AFC1_AG0_AGGS",
+    425.79299999999995,
+    1.0
+   ],
+   [
+    "finalize_norm_weighted_sum_kernel.kd",
+    339.2442,
+    62.0
+   ],
+   [
+    "_joint_epilogue.kd",
+    321.7292000000001,
+    62.0
+   ],
+   [
+    "__amd_rocclr_copyBuffer.kd",
+    228.42840000000015,
+    129.0
+   ],
+   [
+    "reshape_and_cache_flash.kd",
+    185.44699999999995,
+    62.0
+   ],
+   [
+    "void rotary_embedding_kernel<c10::BFloat16, c10::BFloat16, false>(long const*, c10::BFloat",
+    151.9878,
+    46.0
+   ],
+   [
+    "_rms_norm_gate_fwd_kernel.kd",
+    133.97019999999983,
+    62.0
+   ],
+   [
+    "_qk_norm_kernel.kd",
+    133.09739999999977,
+    62.0
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<long>,",
+    105.36780000000002,
+    62.0
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16_copy_kernel_cuda(at",
+    12.788799999999998,
+    6.0
+   ],
+   [
+    "void at::native::(anonymous namespace)::vectorized_layer_norm_kernel<c10::BFloat16, float,",
+    6.761,
+    1.0
+   ],
+   [
+    "void at::native::(anonymous namespace)::CatArrayBatchedCopy_contig<at::native::(anonymous ",
+    6.1122,
+    1.0
+   ],
+   [
+    "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::MeanOps<flo",
+    5.335,
+    1.0
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::AUnaryFunctor<float, float, ",
+    5.0066,
+    1.0
+   ],
+   [
+    "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::gpu_kernel_impl_noca",
+    3.2118,
+    1.0
+   ],
+   [
+    "void at::native::elementwise_kernel_manual_unroll<128, 4, at::native::(anonymous namespace",
+    3.1398,
+    1.0
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::bfloat16tofloat32_copy_kerne",
+    2.1623999999999994,
+    1.0
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::(anonymous namespace)::pow_t",
+    2.1306000000000003,
+    1.0
+   ],
+   [
+    "_vocab_parallel_embedding_kernel.kd",
+    2.0338000000000003,
+    1.0
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::rsqrt_kernel_cuda(at::Tensor",
+    1.7456,
+    1.0
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctorOnSelf_add<float>",
+    1.7376,
+    1.0
+   ],
+   [
+    "void at::native::index_elementwise_kernel<128, 4, at::native::gpu_index_kernel<at::native:",
+    1.6181999999999999,
+    0.4
+   ]
+  ]
+ }
+}

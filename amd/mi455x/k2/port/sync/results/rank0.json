@@ -1,0 +1,165 @@
+{
+ "rank": 0,
+ "compile_s": 2.5,
+ "eager_full": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 20,
+  "alarm_words": [
+   0,
+   0,
+   0,
+   0
+  ],
+  "steps": 20,
+  "exchange_us_max_cta": 7.4,
+  "exchange_us_median_cta": 4.28,
+  "publish_us_median": 0.68,
+  "publish_wait_us_median": 0.66,
+  "cta_body_us_max": 256.48,
+  "terminal_us_cta0": 5.9,
+  "clock_spread_us": 13205.96,
+  "barrier_us_per_round": 2.25741935483871,
+  "pingpong_us_per_hop": 2.0659375000000004,
+  "pingpong_min": 2.014375,
+  "barrier_min": 2.2141935483870965,
+  "exchange_min": 6.88
+ },
+ "graph_lean": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 521,
+  "alarm_words": [
+   0,
+   0,
+   0,
+   0
+  ],
+  "replays": 500,
+  "epoch_advanced": 500,
+  "us_per_step": 32.606170654296875,
+  "last_step": {
+   "exchange_us_max_cta": 6.48,
+   "exchange_us_median_cta": 4.64,
+   "publish_us_median": 0.68,
+   "publish_wait_us_median": 0.72,
+   "cta_body_us_max": 23.24,
+   "terminal_us_cta0": 3.96,
+   "clock_spread_us": 13212.08
+  },
+  "epoch_bump_only_us": 6.262290000915527
+ },
+ "eager_lean": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 1041,
+  "alarm_words": [
+   0,
+   0,
+   0,
+   0
+  ],
+  "exchange_us_max_cta": 7.64,
+  "exchange_us_median_cta": 4.92,
+  "publish_us_median": 0.72,
+  "publish_wait_us_median": 0.7,
+  "cta_body_us_max": 16.62,
+  "terminal_us_cta0": 8.28,
+  "clock_spread_us": 13212.9
+ },
+ "eager_nofence": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 1061,
+  "alarm_words": [
+   0,
+   0,
+   0,
+   0
+  ],
+  "exchange_us_max_cta": 9.559999999999999,
+  "exchange_us_median_cta": 4.64,
+  "publish_us_median": 0.56,
+  "publish_wait_us_median": 0.68,
+  "cta_body_us_max": 21.42,
+  "terminal_us_cta0": 6.18,
+  "clock_spread_us": 13208.64
+ },
+ "failstop_dead_rank": {
+  "errors": 50432,
+  "failed": 1,
+  "epoch": 1062,
+  "alarm_words": [
+   1,
+   1,
+   1,
+   0
+  ],
+  "returned_after_s": 0.511,
+  "wait_budget_s": 0.25,
+  "check_raised": "MonoKernel step failed: TP ranks [0, 1, 2] gave up an in-kernel wait; the step's tokens are discarded",
+  "given_up": {
+   "ctas": 183,
+   "by_region": {
+    "go": 182,
+    "bar": 1
+   },
+   "cta0": "+35 us CTA 0: bar pair 3 waited for tag 271617, saw 271105"
+  }
+ },
+ "failstop_stall": {
+  "errors": 77664,
+  "failed": 1,
+  "epoch": 1063,
+  "alarm_words": [
+   1,
+   1,
+   1,
+   1
+  ],
+  "returned_after_s": 0.413,
+  "stall_s": 0.4,
+  "wait_budget_s": 0.25,
+  "check_raised": "MonoKernel step failed: TP ranks [0, 1, 2, 3] gave up an in-kernel wait; the step's tokens are discarded",
+  "given_up": {
+   "ctas": 75,
+   "by_region": {
+    "go": 75
+   },
+   "cta0": null
+  }
+ },
+ "after_reset": {
+  "errors": 0,
+  "failed": 0,
+  "epoch": 1064,
+  "alarm_words": [
+   0,
+   0,
+   0,
+   0
+  ]
+ },
+ "residency": [
+  {
+   "name": "k2sync_t4_w200000000_b32_p32_x32768_f1",
+   "block": 512,
+   "blocks_per_cu": 1,
+   "regs": 256,
+   "lds": 0,
+   "scratch": 52,
+   "fits_256": true,
+   "cus": 256
+  },
+  {
+   "name": "k2sync_t4_w200000000_b32_p32_x32768_f1",
+   "block": 512,
+   "blocks_per_cu": 1,
+   "regs": 256,
+   "lds": 0,
+   "scratch": 52,
+   "fits_256": true,
+   "cus": 256
+  }
+ ]
+}

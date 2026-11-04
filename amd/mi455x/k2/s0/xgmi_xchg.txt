@@ -1,0 +1,56 @@
+wall clock 100000 kHz, rounds 5000
+== 1. pair ping-pong, us per one-way hop (pairs 0-1, 0-2, 0-3, 1-2, 1-3, 2-3)
+  uncached     push sleep : 2.415 2.499 2.403 2.413 2.314 2.356  mean 2.400
+  uncached     push busy  : 2.400 2.487 2.396 2.354 2.314 2.365  mean 2.386
+  uncached     pull sleep : 3.609 3.504 3.648 3.633 3.369 3.587  mean 3.559
+  uncached     pull busy  : 3.674 3.580 3.632 3.619 3.344 3.540  mean 3.565
+  uncached     push relaxed: 2.021 2.109 2.034 1.996 1.950 1.986  mean 2.016
+  uncached     same-GPU two-CTA hop: 1.005 us
+  uncached     4-rank barrier (push, 1 CTA/rank): 3.608 us per barrier
+wall clock 100000 kHz, rounds 5000
+== 1. pair ping-pong, us per one-way hop (pairs 0-1, 0-2, 0-3, 1-2, 1-3, 2-3)
+== 3. tagged mailbox exchange (all-to-all incl. self), uncached, us per exchange (slowest rank)
+  P=     1 dwords/peer (    0.0 KB payload/peer) G=  1 intra_barrier=0:    3.382 us  (1999 rounds, bad=0)
+  P=    64 dwords/peer (    0.2 KB payload/peer) G=  1 intra_barrier=0:    3.488 us  (1979 rounds, bad=0)
+  P=    64 dwords/peer (    0.2 KB payload/peer) G= 16 intra_barrier=0:    3.692 us  (1979 rounds, bad=0)
+  P=    64 dwords/peer (    0.2 KB payload/peer) G= 64 intra_barrier=0:    5.496 us  (1979 rounds, bad=0)
+  P=  1024 dwords/peer (    4.0 KB payload/peer) G=  1 intra_barrier=0:    8.782 us  (1718 rounds, bad=0)
+  P=  1024 dwords/peer (    4.0 KB payload/peer) G= 16 intra_barrier=0:    3.469 us  (1718 rounds, bad=0)
+  P=  1024 dwords/peer (    4.0 KB payload/peer) G= 64 intra_barrier=0:    3.567 us  (1718 rounds, bad=0)
+  P=  1024 dwords/peer (    4.0 KB payload/peer) G=256 intra_barrier=0:    3.817 us  (1718 rounds, bad=0)
+  P=  8192 dwords/peer (   32.0 KB payload/peer) G=  1 intra_barrier=0:   67.699 us  (865 rounds, bad=0)
+  P=  8192 dwords/peer (   32.0 KB payload/peer) G= 16 intra_barrier=0:    5.188 us  (865 rounds, bad=0)
+  P=  8192 dwords/peer (   32.0 KB payload/peer) G= 64 intra_barrier=0:    3.588 us  (865 rounds, bad=0)
+  P=  8192 dwords/peer (   32.0 KB payload/peer) G=256 intra_barrier=0:    3.536 us  (865 rounds, bad=0)
+  P= 32768 dwords/peer (  128.0 KB payload/peer) G=  1 intra_barrier=0:  271.377 us  (320 rounds, bad=0)
+  P= 32768 dwords/peer (  128.0 KB payload/peer) G= 16 intra_barrier=0:   17.052 us  (320 rounds, bad=0)
+  P= 32768 dwords/peer (  128.0 KB payload/peer) G= 64 intra_barrier=0:    7.143 us  (320 rounds, bad=0)
+  P= 32768 dwords/peer (  128.0 KB payload/peer) G=256 intra_barrier=0:    3.906 us  (320 rounds, bad=0)
+  P=131072 dwords/peer (  512.0 KB payload/peer) G=  1 intra_barrier=0: 1083.926 us  (200 rounds, bad=0)
+  P=131072 dwords/peer (  512.0 KB payload/peer) G= 16 intra_barrier=0:   69.091 us  (200 rounds, bad=0)
+  P=131072 dwords/peer (  512.0 KB payload/peer) G= 64 intra_barrier=0:   19.974 us  (200 rounds, bad=0)
+  P=131072 dwords/peer (  512.0 KB payload/peer) G=256 intra_barrier=0:    0.000 us  (200 rounds, bad=2449817600)
+  !! STALE/BAD READS
+  P=     1 dwords/peer (    0.0 KB payload/peer) G=  1 intra_barrier=1:    4.294 us  (1999 rounds, bad=0)
+  P=     1 dwords/peer (    0.0 KB payload/peer) G= 16 intra_barrier=1:    4.553 us  (1999 rounds, bad=0)
+  P=     1 dwords/peer (    0.0 KB payload/peer) G= 64 intra_barrier=1:    4.714 us  (1999 rounds, bad=0)
+  P=     1 dwords/peer (    0.0 KB payload/peer) G=256 intra_barrier=1:    5.987 us  (1999 rounds, bad=0)
+  P=    64 dwords/peer (    0.2 KB payload/peer) G=  1 intra_barrier=1:    4.323 us  (1979 rounds, bad=0)
+  P=    64 dwords/peer (    0.2 KB payload/peer) G= 16 intra_barrier=1:    5.788 us  (1979 rounds, bad=0)
+  P=    64 dwords/peer (    0.2 KB payload/peer) G= 64 intra_barrier=1:    7.612 us  (1979 rounds, bad=0)
+  P=  1024 dwords/peer (    4.0 KB payload/peer) G=  1 intra_barrier=1:    9.470 us  (1718 rounds, bad=0)
+  P=  1024 dwords/peer (    4.0 KB payload/peer) G= 16 intra_barrier=1:    5.200 us  (1718 rounds, bad=0)
+  P=  1024 dwords/peer (    4.0 KB payload/peer) G= 64 intra_barrier=1:    5.501 us  (1718 rounds, bad=0)
+  P=  1024 dwords/peer (    4.0 KB payload/peer) G=256 intra_barrier=1:    7.633 us  (1718 rounds, bad=0)
+  P=  8192 dwords/peer (   32.0 KB payload/peer) G=  1 intra_barrier=1:   74.575 us  (865 rounds, bad=0)
+  P=  8192 dwords/peer (   32.0 KB payload/peer) G= 16 intra_barrier=1:    7.151 us  (865 rounds, bad=0)
+  P=  8192 dwords/peer (   32.0 KB payload/peer) G= 64 intra_barrier=1:    5.801 us  (865 rounds, bad=0)
+  P=  8192 dwords/peer (   32.0 KB payload/peer) G=256 intra_barrier=1:    7.234 us  (865 rounds, bad=0)
+  P= 32768 dwords/peer (  128.0 KB payload/peer) G=  1 intra_barrier=1:  291.773 us  (320 rounds, bad=0)
+  P= 32768 dwords/peer (  128.0 KB payload/peer) G= 16 intra_barrier=1:   22.576 us  (320 rounds, bad=0)
+  P= 32768 dwords/peer (  128.0 KB payload/peer) G= 64 intra_barrier=1:    9.481 us  (320 rounds, bad=0)
+  P= 32768 dwords/peer (  128.0 KB payload/peer) G=256 intra_barrier=1:    9.127 us  (320 rounds, bad=0)
+  P=131072 dwords/peer (  512.0 KB payload/peer) G=  1 intra_barrier=1: 1157.868 us  (200 rounds, bad=0)
+  P=131072 dwords/peer (  512.0 KB payload/peer) G= 16 intra_barrier=1:   76.556 us  (200 rounds, bad=0)
+  P=131072 dwords/peer (  512.0 KB payload/peer) G= 64 intra_barrier=1:   28.591 us  (200 rounds, bad=0)
+  P=131072 dwords/peer (  512.0 KB payload/peer) G=256 intra_barrier=1:   18.528 us  (200 rounds, bad=0)
