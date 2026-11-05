@@ -1,0 +1,1558 @@
+diff --git a/python/sglang/kernels/ops/attention/muse_attn_v2.py b/python/sglang/kernels/ops/attention/muse_attn_v2.py
+new file mode 100644
+index 0000000000..5f16c2b4bc
+--- /dev/null
++++ b/python/sglang/kernels/ops/attention/muse_attn_v2.py
+@@ -0,0 +1,228 @@
++"""Verify-attention split kernel for one short query (<= 8 rows a block) over a paged FP8 E4M3 KV cache, gfx1250.
++
++Specialized for the Muse Spark Open TP4 full-attention verify: 8 query rows x 8 q heads of one kv head packed as
++BLOCK_M 64, head_dim 64, page 16, unshuffled cache [pages, 16, kv heads, 64], no sinks / alibi / softcap.
++Writes the same fp32 partials (segm_output, segm_max, segm_expsum) and uses the same device-side segment
++split as AITER's kernel_unified_attention_3d, so AITER's reduce_segments combines them unchanged.
++
++Differences from the served loop:
++- 32-bit positions; the causal mask is applied only to tiles past the first query's horizon (ctx + 1),
++  so the steady-state loop has no compares / selects.
++- QSPLIT 2 / 3: QK^T on FP8 WMMA with K used as stored (no FP8 -> BF16 conversion). Q is split per row into
++  2 or 3 E4M3 terms after a power-of-two row scale (Q * 2^e = Qh + Ql / 16 [+ Qll / 256]); the terms are
++  accumulated in one fp32 accumulator, and 2^-e folds into the per-row softmax scale. 3 terms represent
++  every bf16 Q exactly; 2 terms keep ~8 significant bits.
++- Grid (segments, kv heads, query blocks) with no upper-bound query blocks for a single sequence.
++"""
++import triton
++import triton.language as tl
++
++RCP_LN2 = 1.4426950408889634
++
++
++@triton.jit
++def _cdiv(x, y):
++    return (x + y - 1) // y
++
++
++@triton.jit
++def _segment_range(seq_len, TILE: tl.constexpr, NSEG: tl.constexpr):
++    num_tiles = _cdiv(seq_len, TILE)
++    tps = tl.maximum(_cdiv(num_tiles, NSEG), 1)
++    return num_tiles, tps, _cdiv(num_tiles, tps)
++
++
++@triton.jit
++def _touch_tile(tp, k_ptr, v_ptr, bt_ptr, kv_off_k, kv_off_v, sk0, sk1, sv0, sv1, seq_len,
++                TILE: tl.constexpr, PAGE: tl.constexpr):
++    """Read one byte of each of tile tp's K / V rows (64 bytes per key and head) so the rows are in L2 when the
++    tile's async copy is issued; the caller carries the result and consumes it only after the loop."""
++    offs_p = tl.minimum(tp * TILE + tl.arange(0, TILE), seq_len - 1)
++    pg = tl.load(bt_ptr + offs_p // PAGE).to(tl.int64)
++    in_pg = offs_p % PAGE
++    kb = tl.load((k_ptr + (pg * sk0 + in_pg * sk1 + kv_off_k)).to(tl.pointer_type(tl.uint8), bitcast=True))
++    vb = tl.load((v_ptr + (pg * sv0 + in_pg * sv1 + kv_off_v)).to(tl.pointer_type(tl.uint8), bitcast=True))
++    return kb, vb
++
++
++@triton.jit
++def _split_q(Qf, QSPLIT: tl.constexpr):
++    """Q (fp32, exact bf16 values) -> E4M3 terms and the per-row 2^-e that undoes the row scale."""
++    amax = tl.max(tl.abs(Qf), axis=1)
++    e = tl.floor(tl.log2(448.0 / tl.maximum(amax, 1e-30)))
++    e = tl.minimum(e, 60.0)
++    s = tl.exp2(e)
++    Qs = Qf * s[:, None]
++    Qh = Qs.to(tl.float8e4nv)
++    R = (Qs - Qh.to(tl.float32)) * 16.0
++    Ql = R.to(tl.float8e4nv)
++    if QSPLIT == 3:
++        R2 = (R - Ql.to(tl.float32)) * 16.0
++        Qll = R2.to(tl.float8e4nv)
++    else:
++        Qll = Ql
++    return Qh, Ql, Qll, tl.exp2(-e)
++
++
++@triton.jit
++def _tile(
++    t, Q, Qh, Ql, Qll, qk_scale, row_scale, M, L, acc,
++    k_ptr, v_ptr, bt_ptr, kv_off_k, kv_off_v, sk0, sk1, sv0, sv1, ctx, seq_len, qrow, qmask,
++    TILE: tl.constexpr, PAGE: tl.constexpr, D: tl.constexpr, QSPLIT: tl.constexpr, MASK: tl.constexpr,
++    FOLD: tl.constexpr,
++):
++    offs_t = t * TILE + tl.arange(0, TILE)
++    offs_d = tl.arange(0, D)
++    if MASK:
++        kin = offs_t < seq_len
++        pg = tl.load(bt_ptr + offs_t // PAGE, mask=kin, other=0).to(tl.int64)
++    else:
++        pg = tl.load(bt_ptr + offs_t // PAGE).to(tl.int64)
++    in_pg = offs_t % PAGE
++    k_row = pg * sk0 + in_pg * sk1 + kv_off_k  # [TILE] int64
++    v_row = pg * sv0 + in_pg * sv1 + kv_off_v
++    if MASK:
++        K = tl.load(k_ptr + k_row[None, :] + offs_d[:, None], mask=kin[None, :], other=0.0)
++        V = tl.load(v_ptr + v_row[:, None] + offs_d[None, :], mask=kin[:, None], other=0.0)
++    else:
++        K = tl.load(k_ptr + k_row[None, :] + offs_d[:, None])  # [D, TILE] e4m3
++        V = tl.load(v_ptr + v_row[:, None] + offs_d[None, :])  # [TILE, D] e4m3
++
++    if QSPLIT == 0:
++        S = tl.dot(Q, K.to(tl.bfloat16))
++        if not FOLD:
++            S = S * qk_scale
++    else:
++        if QSPLIT == 3:
++            Sl = tl.dot(Ql, K, acc=tl.dot(Qll, K) * 0.0625)
++        else:
++            Sl = tl.dot(Ql, K)
++        S = tl.dot(Qh, K, acc=Sl * 0.0625) * row_scale[:, None]
++
++    if MASK:
++        vis = (offs_t[None, :] <= (ctx + qrow)[:, None]) & qmask[:, None]
++        S = tl.where(vis, S, float("-inf"))
++    if FOLD and QSPLIT == 0:
++        # the scale is positive, so max(S) * scale = max(S * scale); P = exp2(fma(S, scale, -m))
++        m_j = tl.maximum(M, tl.max(S, axis=1) * qk_scale)
++        if MASK:
++            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
++        P = tl.math.exp2(S * qk_scale - m_j[:, None])
++    else:
++        m_j = tl.maximum(M, tl.max(S, axis=1))
++        if MASK:
++            m_j = tl.where(m_j > float("-inf"), m_j, 0.0)
++        P = tl.math.exp2(S - m_j[:, None])
++    l_j = tl.sum(P, axis=1)
++    alpha = tl.math.exp2(M - m_j)
++    acc = acc * alpha[:, None]
++    L = L * alpha + l_j
++    acc = tl.dot(P.to(tl.bfloat16), V.to(tl.bfloat16), acc=acc)
++    return m_j, L, acc
++
++
++@triton.jit
++def attn_v2_split(
++    segm_out_ptr, segm_max_ptr, segm_sum_ptr,
++    q_ptr, k_ptr, v_ptr, bt_ptr, seq_lens_ptr, cu_q_ptr, k_descale_ptr, v_descale_ptr,
++    scale,
++    q_stride0, q_stride1,
++    sk0, sk1, sk2, sv0, sv1, sv2,
++    NQ: tl.constexpr, G: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
++    TILE: tl.constexpr, NSEG: tl.constexpr, BLOCK_M: tl.constexpr, QSPLIT: tl.constexpr,
++    FOLD: tl.constexpr = False, DUAL: tl.constexpr = False, PFD: tl.constexpr = 0, PF_SCOPE: tl.constexpr = 0,
++):
++    seg = tl.program_id(0)
++    kvh = tl.program_id(1)
++    qb = tl.program_id(2)
++    q_start = tl.load(cu_q_ptr)
++    qlen = tl.load(cu_q_ptr + 1) - q_start
++    seq_len = tl.load(seq_lens_ptr).to(tl.int32)
++    num_tiles, tps, live = _segment_range(seq_len, TILE, NSEG)
++    if seg >= live:
++        return
++    if qb * (BLOCK_M // G) >= qlen:
++        return
++    ctx = seq_len - qlen
++
++    offs_m = tl.arange(0, BLOCK_M)
++    offs_d = tl.arange(0, D)
++    qrow = qb * (BLOCK_M // G) + offs_m // G
++    head = kvh * G + offs_m % G
++    qmask = qrow < qlen
++    Q = tl.load(
++        q_ptr + (q_start + qrow)[:, None] * q_stride0 + head[:, None] * q_stride1 + offs_d[None, :],
++        mask=qmask[:, None], other=0.0,
++    )
++    qk_scale = scale * 1.4426950408889634 * tl.load(k_descale_ptr)
++    if QSPLIT == 0:
++        Qh = Q
++        Ql = Q
++        Qll = Q
++        row_scale = tl.full([BLOCK_M], 1.0, tl.float32) * qk_scale
++    else:
++        Qh, Ql, Qll, inv_s = _split_q(Q.to(tl.float32), QSPLIT)
++        row_scale = inv_s * qk_scale
++
++    M = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
++    L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
++    acc = tl.zeros([BLOCK_M, D], dtype=tl.float32)
++
++    kv_off_k = kvh * sk2
++    kv_off_v = kvh * sv2
++    bt = bt_ptr
++    t0 = seg * tps
++    t1 = tl.minimum(t0 + tps, num_tiles)
++    # keys < ctx + qb * BLOCK_Q + 1 are visible to every row of this block
++    t_full = tl.maximum(tl.minimum(t1, (ctx + qb * (BLOCK_M // G) + 1) // TILE), t0)
++    if DUAL:
++        # two independent online-softmax streams (even / odd tiles), merged after the loop
++        M2 = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
++        L2 = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
++        acc2 = tl.zeros([BLOCK_M, D], dtype=tl.float32)
++        n_pairs = (t_full - t0) // 2
++        for i in range(n_pairs):
++            t = t0 + 2 * i
++            M, L, acc = _tile(t, Q, Qh, Ql, Qll, qk_scale, row_scale, M, L, acc, k_ptr, v_ptr, bt, kv_off_k,
++                              kv_off_v, sk0, sk1, sv0, sv1, ctx, seq_len, qrow, qmask, TILE, PAGE, D, QSPLIT,
++                              False, FOLD)
++            M2, L2, acc2 = _tile(t + 1, Q, Qh, Ql, Qll, qk_scale, row_scale, M2, L2, acc2, k_ptr, v_ptr, bt,
++                                 kv_off_k, kv_off_v, sk0, sk1, sv0, sv1, ctx, seq_len, qrow, qmask, TILE, PAGE,
++                                 D, QSPLIT, False, FOLD)
++        t_rest = t0 + 2 * n_pairs
++    else:
++        touch = tl.zeros([TILE], dtype=tl.int32)
++        kb = tl.zeros([TILE], dtype=tl.uint8)
++        vb = tl.zeros([TILE], dtype=tl.uint8)
++        for t in range(t0, t_full):
++            if PFD > 0:
++                # consume the previous iteration's bytes, so their wait falls a tile after the loads
++                touch += kb.to(tl.int32) + vb.to(tl.int32)
++                kb, vb = _touch_tile(tl.minimum(t + PFD, t1 - 1), k_ptr, v_ptr, bt, kv_off_k, kv_off_v, sk0,
++                                     sk1, sv0, sv1, seq_len, TILE, PAGE)
++            M, L, acc = _tile(t, Q, Qh, Ql, Qll, qk_scale, row_scale, M, L, acc, k_ptr, v_ptr, bt, kv_off_k,
++                              kv_off_v, sk0, sk1, sv0, sv1, ctx, seq_len, qrow, qmask, TILE, PAGE, D, QSPLIT,
++                              False, FOLD)
++        if PFD > 0:
++            touch += kb.to(tl.int32) + vb.to(tl.int32)
++            # never true (seq_len > 0); keeps the touch loads alive without a dependency in the loop
++            L = tl.where(seq_len < 0, L + tl.sum(touch).to(tl.float32), L)
++        t_rest = t_full
++    for t in range(t_rest, t1):
++        M, L, acc = _tile(t, Q, Qh, Ql, Qll, qk_scale, row_scale, M, L, acc, k_ptr, v_ptr, bt, kv_off_k,
++                          kv_off_v, sk0, sk1, sv0, sv1, ctx, seq_len, qrow, qmask, TILE, PAGE, D, QSPLIT,
++                          True, FOLD)
++    if DUAL:
++        m = tl.maximum(M, M2)
++        m = tl.where(m > float("-inf"), m, 0.0)
++        a1 = tl.math.exp2(M - m)
++        a2 = tl.math.exp2(M2 - m)
++        acc = acc * a1[:, None] + acc2 * a2[:, None]
++        L = L * a1 + L2 * a2
++        M = tl.maximum(M, M2)
++
++    acc = acc * tl.load(v_descale_ptr)
++    so = (q_start + qrow) * (NQ * NSEG) + head * NSEG + seg
++    tl.store(segm_out_ptr + so[:, None].to(tl.int64) * D + offs_d[None, :], acc, mask=qmask[:, None])
++    tl.store(segm_max_ptr + so, M, mask=qmask)
++    tl.store(segm_sum_ptr + so, L, mask=qmask)
+diff --git a/python/sglang/kernels/ops/attention/qk_norm_rope_cache.py b/python/sglang/kernels/ops/attention/qk_norm_rope_cache.py
+index d77c12cf5c..10cd703f46 100644
+--- a/python/sglang/kernels/ops/attention/qk_norm_rope_cache.py
++++ b/python/sglang/kernels/ops/attention/qk_norm_rope_cache.py
+@@ -10,12 +10,32 @@ The BF16 round trips of the unfused sequence (norm output, query scaling, RoPE p
+ are explicit, so the results match the separate norm / RoPE / cache-write kernels.
+ """
+ 
++import logging
++import os
++
+ import torch
+ import triton
+ import triton.language as tl
+ 
+ from sglang.kernels.ops.gemm.bf16_splitk_gemm import _dense_partial
+ 
++logger = logging.getLogger(__name__)
++
++# TP4 projection at split-K 8 (<= 16 rows): FP32 partials from AITER's gfx1250 gluon TDM batched GEMM (falls back
++# to the Triton partials at num_stages 4 when the gluon kernel is unavailable). Same K slices, same bytes.
++QKV_TDM = os.environ.get("SGLANG_MUSE_QKV_TDM", "0") == "1"
++# Epilogue grid (m, hq + hk): K / V / cache rows get their own programs instead of riding on Q heads.
++QKV_SPLIT_EPI = os.environ.get("SGLANG_MUSE_QKV_SPLIT_EPI", "0") == "1"
++_TDM_CFG = (32, 128, 3, 2)  # block N, block K, buffers, warps
++_tdm_kernel = None  # (kernel, layouts) once built, False when the gluon kernel is unavailable
++_live = set()
++
++
++def _note_live(name: str) -> None:
++    if name not in _live:
++        _live.add(name)
++        logger.info("Muse QKV projection: %s live", name)
++
+ 
+ @triton.jit
+ def _norm_rope(
+@@ -169,6 +189,107 @@ def _qkv_epilogue(
+                 tl.store(VC + offset, v.to(tl.float32) / tl.load(VS))
+ 
+ 
++@triton.jit
++def _qkv_epilogue_split(
++    P,
++    POS,
++    COS,
++    LOC,
++    MAP,
++    KC,
++    VC,
++    QO,
++    KO,
++    VO,
++    GO,
++    KS,
++    VS,
++    M: tl.constexpr,
++    N: tl.constexpr,
++    SK: tl.constexpr,
++    HQ: tl.constexpr,
++    HK: tl.constexpr,
++    D: tl.constexpr,
++    EPS: tl.constexpr,
++    SCALE: tl.constexpr,
++    ROPE: tl.constexpr,
++    HAS_MAP: tl.constexpr,
++    COS_STRIDE: tl.constexpr,
++):
++    """``_qkv_epilogue`` on grid (M, HQ + HK), same per-element math: programs head < HQ do gate + Q, programs
++    HQ + kh do K, V and the cache write of KV head kh."""
++    token, head = tl.program_id(0), tl.program_id(1)
++    d = tl.arange(0, D)
++    if head < HQ:
++        gate = _project_slice(P, token, (HQ + 2 * HK) * D + head * D, M, N, SK, D)
++        tl.store(GO + token * HQ * D + head * D + d, gate)
++        q = _project_slice(P, token, head * D, M, N, SK, D)
++        q = _norm_rope(q, COS, POS, EPS, SCALE, D, ROPE, True, COS_STRIDE)
++        tl.store(QO + token * HQ * D + head * D + d, q)
++    else:
++        kh = head - HQ
++        k = _project_slice(P, token, HQ * D + kh * D, M, N, SK, D)
++        v = _project_slice(P, token, (HQ + HK) * D + kh * D, M, N, SK, D)
++        k = _norm_rope(k, COS, POS, EPS, 1.0, D, ROPE, False, COS_STRIDE)
++        tl.store(KO + token * HK * D + kh * D + d, k)
++        tl.store(VO + token * HK * D + kh * D + d, v)
++        slot = tl.load(LOC + token).to(tl.int64)
++        if slot >= 0:
++            if HAS_MAP:
++                slot = tl.load(MAP + slot).to(tl.int64)
++            if slot >= 0:
++                offset = slot * HK * D + kh * D + d
++                tl.store(KC + offset, k.to(tl.float32) / tl.load(KS))
++                tl.store(VC + offset, v.to(tl.float32) / tl.load(VS))
++
++
++def _gluon_tdm_kernel():
++    """AITER's gfx1250 gluon TDM batched GEMM and its layouts for ``_TDM_CFG``, or None if unavailable."""
++    global _tdm_kernel
++    if _tdm_kernel is None:
++        try:
++            from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
++                create_shared_layouts,
++                create_wmma_layouts,
++            )
++            from aiter.ops.triton._gluon_kernels.gfx1250.gemm.batched.batched_gemm_bf16 import (
++                _KERNEL_MAP,
++            )
++
++            block_n, block_k, _, warps = _TDM_CFG
++            _tdm_kernel = (
++                _KERNEL_MAP["bandwidth_bound"],
++                create_wmma_layouts(warps),
++                create_shared_layouts(16, block_n, block_k, "TN", 16),
++            )
++        except Exception as ex:  # noqa: BLE001
++            logger.warning("Muse QKV projection: gluon TDM GEMM unavailable (%s); Triton partials", ex)
++            _tdm_kernel = False
++    return _tdm_kernel or None
++
++
++def _tdm_partials(x, weight, partials, m, n, k, split_k) -> bool:
++    built = _gluon_tdm_kernel()
++    if built is None:
++        return False
++    kern, (wmma, opa, opb), (sha, shb) = built
++    block_n, block_k, buffers, warps = _TDM_CFG
++    xq, wq = x.view(1, m, k), weight.view(1, n, k).transpose(1, 2)
++    pv = partials.view(split_k, 1, m, n)
++    split = k // split_k
++    kern[(1, split_k * triton.cdiv(m, 16) * (n // block_n))](
++        xq, wq, pv, None, m, n, k,
++        xq.stride(0), xq.stride(1), xq.stride(2), wq.stride(0), wq.stride(1), wq.stride(2),
++        pv.stride(1), pv.stride(2), pv.stride(3), pv.stride(0), 0,
++        BLOCK_M=16, BLOCK_N=block_n, BLOCK_K=block_k, NUM_BUFFERS=min(buffers, split // block_k), LAYOUT="TN",
++        SHARED_LAYOUT_A=sha, SHARED_LAYOUT_B=shb, WMMA_LAYOUT=wmma, OPERAND_LAYOUT_A=opa,
++        OPERAND_LAYOUT_B=opb, ADD_BIAS=False, NUM_KSPLIT=split_k, SPLITK_BLOCK_SIZE=split, num_warps=warps,
++        waves_per_eu=0, cache_modifier=".cg",
++    )
++    _note_live("gluon TDM split-K partials (BN 32, BK 128, split-K 8, 3 buffers, 2 warps)")
++    return True
++
++
+ @triton.jit
+ def _tp4_rope_rows(
+     x,
+@@ -397,27 +518,36 @@ def qkv_proj_qk_norm_rope_cache(
+     assert cache_k.dtype == cache_v.dtype == torch.float8_e4m3fn
+     assert cache_k.is_contiguous() and cache_v.is_contiguous()
+     partials = torch.empty((split_k, m, n), device=x.device, dtype=torch.float32)
+-    _dense_partial[(n // block_n, triton.cdiv(m, block_m), split_k)](
+-        x,
+-        weight,
+-        partials,
+-        m,
+-        n,
+-        k,
+-        block_m,
+-        block_n,
+-        128,
+-        split_k,
+-        ".cg",
+-        num_warps=warps,
+-        num_stages=2,
+-        matrix_instr_nonkdim=16,
+-    )
++    tdm = QKV_TDM and hq == 32 and split_k == 8 and block_m == 16
++    if not (tdm and _tdm_partials(x, weight, partials, m, n, k, split_k)):
++        if tdm:
++            _note_live("Triton split-K partials at num_stages 4")
++        _dense_partial[(n // block_n, triton.cdiv(m, block_m), split_k)](
++            x,
++            weight,
++            partials,
++            m,
++            n,
++            k,
++            block_m,
++            block_n,
++            128,
++            split_k,
++            ".cg",
++            num_warps=warps,
++            num_stages=4 if tdm else 2,
++            matrix_instr_nonkdim=16,
++        )
+     qo = torch.empty((m, hq * 64), device=x.device, dtype=torch.bfloat16)
+     ko = torch.empty((m, hk * 64), device=x.device, dtype=torch.bfloat16)
+     vo = torch.empty_like(ko)
+     go = torch.empty_like(qo)
+-    _qkv_epilogue[(m, hq)](
++    if QKV_SPLIT_EPI:
++        _note_live("split epilogue (grid m x (hq + hk))")
++        epilogue, grid = _qkv_epilogue_split, (m, hq + hk)
++    else:
++        epilogue, grid = _qkv_epilogue, (m, hq)
++    epilogue[grid](
+         partials,
+         positions,
+         cos_sin,
+diff --git a/python/sglang/kernels/ops/speculative/dflash_candidate_topk.py b/python/sglang/kernels/ops/speculative/dflash_candidate_topk.py
+new file mode 100644
+index 0000000000..2827762e9f
+--- /dev/null
++++ b/python/sglang/kernels/ops/speculative/dflash_candidate_topk.py
+@@ -0,0 +1,98 @@
++"""DFlash candidate top-k over the vocab-sharded head in three launches (``SGLANG_MUSE_DFLASH_TRITON_TOPK``).
++
++``candidate_topk`` under TP takes the rank-local top-K of the [N, V/TP] logits, gathers values and global ids
++from every rank and keeps the global top-K. Served, that is torch's radix top-k (8 launches at N = 8, K = 16),
++an FP32 value gather, an int64 id gather on NCCL, a second top-k and a gather. Here:
++
++* ``local_topk_packed``: split top-K over column chunks, then a merge that writes one [N, 2K] FP32 row per token:
++  the K values and the K global ids bit-cast from int32, the payload of a single custom FP32 all-gather;
++* ``merge_gathered_topk``: the global top-K of the gathered [N, TP * 2K] rows, values and int64 ids.
++
++Order: value descending, the smaller vocabulary id first among equal values.
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++CHUNK = 2048
++
++
++@triton.jit
++def _take_topk(vals, idx, K: tl.constexpr, BIG: tl.constexpr):
++    # K rounds of (max value, smallest index holding it); returns them in order.
++    out_v = tl.zeros([K], dtype=tl.float32)
++    out_i = tl.zeros([K], dtype=tl.int32)
++    slot = tl.arange(0, K)
++    for r in tl.static_range(K):
++        m = tl.max(vals, 0)
++        i = tl.min(tl.where(vals == m, idx, BIG), 0)
++        out_v = tl.where(slot == r, m, out_v)
++        out_i = tl.where(slot == r, i, out_i)
++        vals = tl.where(idx == i, float("-inf"), vals)
++    return out_v, out_i
++
++
++@triton.jit
++def _split_topk_kernel(X, PV, PI, n_cols, x_row_stride, SPLITS: tl.constexpr, K: tl.constexpr,
++                       CHUNK: tl.constexpr):
++    row = tl.program_id(0)
++    s = tl.program_id(1)
++    c = s * CHUNK + tl.arange(0, CHUNK)
++    x = tl.load(X + row.to(tl.int64) * x_row_stride + c, mask=c < n_cols, other=float("-inf")).to(tl.float32)
++    v, i = _take_topk(x, c, K, 2147483647)
++    o = (row * SPLITS + s) * K + tl.arange(0, K)
++    tl.store(PV + o, v)
++    tl.store(PI + o, i)
++
++
++@triton.jit
++def _merge_splits_kernel(PV, PI, OUT, vocab_start, SPLITS: tl.constexpr, SPLITS_P2: tl.constexpr,
++                         K: tl.constexpr):
++    row = tl.program_id(0)
++    j = tl.arange(0, SPLITS_P2 * K)
++    m = j < SPLITS * K
++    v = tl.load(PV + row * SPLITS * K + j, mask=m, other=float("-inf"))
++    i = tl.load(PI + row * SPLITS * K + j, mask=m, other=2147483647)
++    tv, ti = _take_topk(v, i, K, 2147483647)
++    k = tl.arange(0, K)
++    tl.store(OUT + row * 2 * K + k, tv)
++    tl.store(OUT.to(tl.pointer_type(tl.int32)) + row * 2 * K + K + k, ti + vocab_start)
++
++
++def local_topk_packed(logits: torch.Tensor, k: int, vocab_start: int) -> torch.Tensor:
++    """Rank-local top-``k`` of ``logits`` [N, V] as packed [N, 2k] FP32: values, then global ids as int32 bits."""
++    n, v = logits.shape
++    splits = triton.cdiv(v, CHUNK)
++    pv = torch.empty((n, splits, k), dtype=torch.float32, device=logits.device)
++    pi = torch.empty((n, splits, k), dtype=torch.int32, device=logits.device)
++    _split_topk_kernel[(n, splits)](logits, pv, pi, v, logits.stride(0), splits, k, CHUNK, num_warps=4)
++    out = torch.empty((n, 2 * k), dtype=torch.float32, device=logits.device)
++    _merge_splits_kernel[(n,)](pv, pi, out, vocab_start, splits, triton.next_power_of_2(splits), k,
++                               num_warps=4)
++    return out
++
++
++@triton.jit
++def _merge_gathered_kernel(G, OUT_V, OUT_I, TP: tl.constexpr, K: tl.constexpr):
++    row = tl.program_id(0)
++    # Position j = rank * K + slot: among equal values, a smaller j is a smaller global id.
++    j = tl.arange(0, TP * K)
++    col = (j // K) * 2 * K + (j % K)
++    v = tl.load(G + row * TP * 2 * K + col)
++    tv, tj = _take_topk(v, j, K, 2147483647)
++    tid = tl.load(G.to(tl.pointer_type(tl.int32)) + row * TP * 2 * K + (tj // K) * 2 * K + (tj % K) + K)
++    k = tl.arange(0, K)
++    tl.store(OUT_V + row * K + k, tv)
++    tl.store(OUT_I + row * K + k, tid.to(tl.int64))
++
++
++def merge_gathered_topk(gathered: torch.Tensor, k: int):
++    """Global top-``k`` of the all-gathered packed rows [N, TP * 2k]: (ids int64 [N, k], values FP32 [N, k])."""
++    gathered = gathered.contiguous()
++    n = gathered.shape[0]
++    tp = gathered.shape[1] // (2 * k)
++    vals = torch.empty((n, k), dtype=torch.float32, device=gathered.device)
++    ids = torch.empty((n, k), dtype=torch.int64, device=gathered.device)
++    _merge_gathered_kernel[(n,)](gathered, vals, ids, tp, k, num_warps=1)
++    return ids, vals
+diff --git a/python/sglang/kernels/ops/speculative/dflash_conv_norm.py b/python/sglang/kernels/ops/speculative/dflash_conv_norm.py
+new file mode 100644
+index 0000000000..7bb7bab268
+--- /dev/null
++++ b/python/sglang/kernels/ops/speculative/dflash_conv_norm.py
+@@ -0,0 +1,90 @@
++"""DFlash grouped conv (output side) + residual add + RMSNorm in one launch (``SGLANG_MUSE_DFLASH_CONV_NORM_FUSE``).
++
++Each draft sublayer ends with ``DFlashGroupedConv.finish`` (an inductor-compiled pointwise kernel) and the next
++norm is aiter's Triton add-RMSNorm. This kernel computes the same: the conv in FP32 as inductor emits it,
++``(base0 + delta0) * y + (base1 + delta1) * y_prev``, rounded to BF16, then ``_fused_add_rmsnorm_kernel``'s
++non-blocked row (BF16 add, FP32 sum of squares over one 8192-wide block at 4 warps, rsqrt, weight).
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _conv_add_rmsnorm_kernel(
++    Y,
++    DELTA,
++    BASE,
++    RES_IN,
++    G,
++    OUT,
++    RES_OUT,
++    delta_row_stride,
++    n_cols,
++    epsilon,
++    GROUP_SIZE: tl.constexpr,
++    GROUPS: tl.constexpr,
++    BLOCK_TOKENS: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    t = tl.program_id(0)
++    c = tl.arange(0, BLOCK_SIZE)
++    g = c // GROUP_SIZE
++    y = tl.load(Y + t * BLOCK_SIZE + c).to(tl.float32)
++    d0 = tl.load(DELTA + t.to(tl.int64) * delta_row_stride + g).to(tl.float32)
++    d1 = tl.load(DELTA + t.to(tl.int64) * delta_row_stride + GROUPS + g).to(tl.float32)
++    b0 = tl.load(BASE + c).to(tl.float32)
++    b1 = tl.load(BASE + BLOCK_SIZE + c).to(tl.float32)
++    prev = tl.load(Y + t * BLOCK_SIZE - BLOCK_SIZE + c, mask=(t - 1 >= 0) & (c >= 0), other=0.0).to(tl.float32)
++    prev = tl.where((t & (BLOCK_TOKENS - 1)) >= 1, prev, 0.0)
++    conv = ((b0 + d0) * y + (b1 + d1) * prev).to(tl.bfloat16)
++
++    res_in = tl.load(RES_IN + t * BLOCK_SIZE + c, cache_modifier=".cg")
++    row = conv
++    row += res_in
++    tl.store(RES_OUT + t * BLOCK_SIZE + c, row)
++    row = row.to(tl.float32)
++    w = tl.load(G + c).to(tl.float32)
++    row_norm = row * row
++    row_norm = tl.sum(row_norm, axis=-1)
++    norm_factor = tl.math.rsqrt((row_norm / n_cols) + epsilon)
++    tl.store(OUT + t * BLOCK_SIZE + c, (row * norm_factor * w).to(OUT.dtype.element_ty))
++
++
++def conv_out_add_rmsnorm(
++    y: torch.Tensor,
++    delta: torch.Tensor,
++    base: torch.Tensor,
++    residual: torch.Tensor,
++    weight: torch.Tensor,
++    eps: float,
++    block_tokens: int,
++    group_size: int,
++):
++    """``RMSNorm(DFlashGroupedConv.finish(y, delta) + residual)``: (normed, new residual).
++
++    ``y`` [T, H] BF16 contiguous, ``delta`` the output-side coefficients view [T, taps=2, groups] of the kernel
++    projection, ``base`` the output-side base kernel [2, H].
++    """
++    t, h = y.shape
++    assert h == triton.next_power_of_2(h) and delta.stride(2) == 1 and delta.stride(1) == h // group_size
++    out = torch.empty_like(y)
++    res_out = torch.empty_like(y)
++    _conv_add_rmsnorm_kernel[(t,)](
++        y,
++        delta,
++        base,
++        residual,
++        weight,
++        out,
++        res_out,
++        delta.stride(0),
++        h,
++        eps,
++        GROUP_SIZE=group_size,
++        GROUPS=h // group_size,
++        BLOCK_TOKENS=block_tokens,
++        BLOCK_SIZE=h,
++    )
++    return out, res_out
+diff --git a/python/sglang/kernels/ops/speculative/dflash_kv_fp8.py b/python/sglang/kernels/ops/speculative/dflash_kv_fp8.py
+new file mode 100644
+index 0000000000..d5e6f4f805
+--- /dev/null
++++ b/python/sglang/kernels/ops/speculative/dflash_kv_fp8.py
+@@ -0,0 +1,212 @@
++"""FP8 draft-KV writes for the DFlash draft on ROCm (``SGLANG_MUSE_DFLASH_KV_FP8_FUSE``).
++
++The served draft writes its FP8 KV cache with torch casts: per layer and step, ``k.to(fp8)`` and ``v.to(fp8)``
++(~5 us each on gfx1250, they run on a handful of rows) and the store kernel; per committed context, the clamp,
++cast and prefix-valid store once per draft layer. Here:
++
++* ``table_qk_norm_rope_kv_`` is ``table_qk_norm_rope_`` that also writes K/V to the FP8 cache rows, so the
++  backend's store is skipped (one launch instead of four per draft layer).
++* ``commit_ctx_kv_fp8_prefix_valid`` writes the stacked K/V of the context commit for all draft layers in one
++  launch (one launch instead of five per draft layer).
++
++The FP8 bytes equal the eager path's: a clamp to +-448, then c10's float -> float8_e4m3fn conversion (round to
++nearest even). The clamp also matches the unclamped ``.to(float8_e4m3fn)`` of this ROCm torch, which saturates.
++"""
++
++from typing import List, Optional
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _e4m3fn_bits(x, SATURATE: tl.constexpr):
++    # c10::detail::fp8e4m3fn_from_fp32_value on an FP32 tensor; returns the byte as int32.
++    if SATURATE:
++        # saturate_to_fp8_range: clamp at the finite max, NaN passes through.
++        x = tl.where(x > 448.0, 448.0, tl.where(x < -448.0, -448.0, x))
++    b = x.to(tl.int32, bitcast=True)
++    neg = b < 0
++    a = b & 0x7FFFFFFF
++    # Below 2**-6: add 2**14 so the FP32 adder rounds the mantissa to the denormal grid.
++    d = (a.to(tl.float32, bitcast=True) + 16384.0).to(tl.int32, bitcast=True) - (141 << 23)
++    n = (a - (120 << 23) + 0x7FFFF + ((a >> 20) & 1)) >> 20
++    r = tl.where(a < (121 << 23), d, n)
++    r = tl.where(a >= (1087 << 20), 0x7F, r & 0xFF)
++    return tl.where(neg, r | 0x80, r)
++
++
++@triton.jit
++def _table_qk_norm_rope_kv_kernel(
++    qkv_ptr,
++    q_weight_ptr,
++    k_weight_ptr,
++    cos_sin_ptr,
++    pos_ptr,
++    loc_ptr,
++    k_cache_ptr,
++    v_cache_ptr,
++    row_stride,
++    cache_row_stride,
++    NHQ: tl.constexpr,
++    NHK: tl.constexpr,
++    D: tl.constexpr,
++    EPS: tl.constexpr,
++):
++    t = tl.program_id(0).to(tl.int64)
++    h = tl.program_id(1)
++    HALF: tl.constexpr = D // 2
++    half_ar = tl.arange(0, HALF)
++    d_ar = tl.arange(0, D)
++    slot = tl.load(loc_ptr + t).to(tl.int64)
++    if h < NHQ + NHK:
++        # _table_qk_norm_rope_kernel, unchanged.
++        pos = tl.load(pos_ptr + t).to(tl.int64)
++        cos = tl.load(cos_sin_ptr + pos * D + half_ar).to(tl.float32)
++        sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar).to(tl.float32)
++        is_q = h < NHQ
++        col0 = (h * D).to(tl.int64)
++        w_ptr = tl.where(is_q, q_weight_ptr.to(tl.int64), k_weight_ptr.to(tl.int64)).to(
++            tl.pointer_type(tl.bfloat16)
++        )
++        row = qkv_ptr + t * row_stride + col0
++        x = tl.load(row + d_ar).to(tl.float32)
++        ms = tl.sum(x * x, 0) / D
++        inv = 1.0 / tl.sqrt(ms + EPS)
++        w1 = tl.load(w_ptr + half_ar).to(tl.float32)
++        w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
++        x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
++        x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
++        x1 = x1.to(tl.bfloat16).to(tl.float32)
++        x2 = x2.to(tl.bfloat16).to(tl.float32)
++        o1 = (x1 * cos - x2 * sin).to(tl.bfloat16)
++        o2 = (x2 * cos + x1 * sin).to(tl.bfloat16)
++        tl.store(row + half_ar, o1)
++        tl.store(row + HALF + half_ar, o2)
++        if h >= NHQ:
++            k_row = k_cache_ptr + slot * cache_row_stride + (h - NHQ) * D
++            tl.store(k_row + half_ar, _e4m3fn_bits(o1.to(tl.float32), True).to(tl.uint8))
++            tl.store(k_row + HALF + half_ar, _e4m3fn_bits(o2.to(tl.float32), True).to(tl.uint8))
++    else:
++        hv = h - NHQ - NHK
++        v = tl.load(qkv_ptr + t * row_stride + (NHQ + NHK + hv) * D + d_ar).to(tl.float32)
++        tl.store(
++            v_cache_ptr + slot * cache_row_stride + hv * D + d_ar,
++            _e4m3fn_bits(v, True).to(tl.uint8),
++        )
++
++
++def table_qk_norm_rope_kv_(
++    qkv: torch.Tensor,
++    positions: torch.Tensor,
++    q_weight: torch.Tensor,
++    k_weight: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    loc: torch.Tensor,
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    num_q_heads: int,
++    num_k_heads: int,
++    head_dim: int,
++    eps: float,
++) -> None:
++    """``table_qk_norm_rope_`` on ``qkv`` [T, (NHQ + 2 NHK) D], plus K and V into the FP8 cache rows ``loc``.
++
++    ``k_cache`` / ``v_cache`` are one layer's [slots, NHK, D] FP8 (or uint8) buffers; the bytes equal
++    ``set_kv_buffer``'s BF16 -> float8_e4m3fn cast of the same K and V.
++    """
++    T = qkv.shape[0]
++    if T == 0:
++        return
++    _table_qk_norm_rope_kv_kernel[(T, num_q_heads + 2 * num_k_heads)](
++        qkv,
++        q_weight,
++        k_weight,
++        cos_sin_cache,
++        positions,
++        loc,
++        k_cache.view(torch.uint8),
++        v_cache.view(torch.uint8),
++        qkv.stride(0),
++        k_cache.stride(0),
++        NHQ=num_q_heads,
++        NHK=num_k_heads,
++        D=head_dim,
++        EPS=eps,
++    )
++
++
++@triton.jit
++def _commit_ctx_kv_fp8_kernel(
++    k_ptr,
++    v_ptr,
++    k_cache_ptrs,
++    v_cache_ptrs,
++    loc_ptr,
++    commit_lens_ptr,
++    src_layer_stride,
++    src_row_stride,
++    cache_row_stride,
++    BLOCK: tl.constexpr,
++    ROW: tl.constexpr,
++):
++    r = tl.program_id(0)
++    layer = tl.program_id(1)
++    b = r // BLOCK
++    j = r - b * BLOCK
++    if j >= tl.load(commit_lens_ptr + b):
++        return
++    slot = tl.load(loc_ptr + r).to(tl.int64)
++    c = tl.arange(0, ROW)
++    src = layer.to(tl.int64) * src_layer_stride + r.to(tl.int64) * src_row_stride + c
++    k_base = tl.load(k_cache_ptrs + layer).to(tl.pointer_type(tl.uint8))
++    v_base = tl.load(v_cache_ptrs + layer).to(tl.pointer_type(tl.uint8))
++    k = tl.load(k_ptr + src).to(tl.float32)
++    v = tl.load(v_ptr + src).to(tl.float32)
++    tl.store(k_base + slot * cache_row_stride + c, _e4m3fn_bits(k, True).to(tl.uint8))
++    tl.store(v_base + slot * cache_row_stride + c, _e4m3fn_bits(v, True).to(tl.uint8))
++
++
++class CtxKVCommitFP8:
++    """One-launch prefix-valid FP8 commit of the stacked context K/V into every draft layer's cache."""
++
++    def __init__(self, k_caches: List[torch.Tensor], v_caches: List[torch.Tensor]):
++        device = k_caches[0].device
++        self.n_layers = len(k_caches)
++        self.row = k_caches[0].shape[1] * k_caches[0].shape[2]
++        self.cache_row_stride = k_caches[0].stride(0)
++        for c in list(k_caches) + list(v_caches):
++            if c.stride(0) != self.cache_row_stride or c[0].numel() != self.row or not c[0].is_contiguous():
++                raise ValueError("draft KV buffers must share one contiguous row layout")
++        self.k_ptrs = torch.tensor([c.data_ptr() for c in k_caches], dtype=torch.int64, device=device)
++        self.v_ptrs = torch.tensor([c.data_ptr() for c in v_caches], dtype=torch.int64, device=device)
++
++    def __call__(
++        self,
++        k: torch.Tensor,
++        v: torch.Tensor,
++        loc_2d: torch.Tensor,
++        commit_lens: torch.Tensor,
++    ) -> None:
++        """``k`` / ``v``: [n_layers, rows, NHK, D] BF16 (rows = loc_2d.numel(), row-major over loc_2d)."""
++        bs, block = loc_2d.shape
++        rows = bs * block
++        if rows == 0:
++            return
++        assert k.shape[0] == self.n_layers and k.shape[1] >= rows and k.stride() == v.stride()
++        assert k.stride(2) * k.shape[2] == k.stride(1) and k.stride(3) == 1
++        _commit_ctx_kv_fp8_kernel[(rows, self.n_layers)](
++            k,
++            v,
++            self.k_ptrs,
++            self.v_ptrs,
++            loc_2d,
++            commit_lens,
++            k.stride(0),
++            k.stride(1),
++            self.cache_row_stride,
++            BLOCK=block,
++            ROW=self.row,
++            num_warps=1,
++        )
+diff --git a/python/sglang/kernels/ops/speculative/fused_kv_materialize.py b/python/sglang/kernels/ops/speculative/fused_kv_materialize.py
+index 0b8f5284f3..79952c59c7 100644
+--- a/python/sglang/kernels/ops/speculative/fused_kv_materialize.py
++++ b/python/sglang/kernels/ops/speculative/fused_kv_materialize.py
+@@ -391,8 +391,13 @@ class FusedKVMaterializeHelper:
+         ctx_hidden: torch.Tensor,
+         positions: torch.Tensor,
+         write_layer_kv: Callable[[int, torch.Tensor, torch.Tensor], None],
++        write_all_kv: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
+     ) -> None:
+-        """Materialize KV cache for all layers using batched projection."""
++        """Materialize KV cache for all layers using batched projection.
++
++        ``write_all_kv``, when given, takes the stacked [n_layers, total_ctx, H, D] K/V in one call instead of
++        ``write_layer_kv`` once per layer.
++        """
+         total_ctx = ctx_hidden.shape[0]
+         if total_ctx == 0:
+             return
+@@ -453,5 +458,8 @@ class FusedKVMaterializeHelper:
+             k_out=tmp_k,
+             v_out=tmp_v,
+         )
++        if write_all_kv is not None:
++            write_all_kv(cache_k, cache_v)
++            return
+         for layer_idx in range(self.n_layers):
+             write_layer_kv(layer_idx, cache_k[layer_idx], cache_v[layer_idx])
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 67d114281d..9b76ebaa27 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -2011,6 +2011,26 @@ class Envs:
+     )
+     # DFlash draft block attention to its sliding window on the split-KV kernel.
+     SGLANG_MUSE_DFLASH_SPLITKV = EnvBool(False)
++    # DFlash draft FP8 KV writes in one kernel: QK-norm/RoPE + K/V store per draft
++    # layer, and the context commit of all draft layers (bitwise equal bytes).
++    SGLANG_MUSE_DFLASH_KV_FP8_FUSE = EnvBool(False)
++    # DFlash candidate top-k merge: values and ids in one custom FP32 all-gather
++    # (the int64 id gather otherwise goes to NCCL).
++    SGLANG_MUSE_DFLASH_PACKED_CANDIDATE_GATHER = EnvBool(False)
++    # DFlash candidate top-k (TP > 1) as split top-k + packed gather + merge in
++    # three Triton launches instead of torch's radix top-k and two gathers.
++    SGLANG_MUSE_DFLASH_TRITON_TOPK = EnvBool(False)
++    # DFlash output-side grouped conv + residual add + RMSNorm in one kernel.
++    SGLANG_MUSE_DFLASH_CONV_NORM_FUSE = EnvBool(False)
++    # TP4 fused QKV projection (<= 16 rows): split-K partials from AITER's gfx1250
++    # gluon TDM batched GEMM (Triton num_stages 4 if unavailable); same bytes.
++    SGLANG_MUSE_QKV_TDM = EnvBool(False)
++    # Fused QKV epilogue on grid (m, hq + hk): K / V / cache in their own programs.
++    SGLANG_MUSE_QKV_SPLIT_EPI = EnvBool(False)
++    # gfx1250 full-attention verify split on attn_v2_split (one sequence, <= 8 rows).
++    SGLANG_MUSE_ATTN_V2 = EnvBool(False)
++    # gfx1250 sliding-window verify kv split: 4 segments per CU, 32-token tiles.
++    SGLANG_MUSE_SWA_CFG = EnvBool(False)
+     # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
+     # registers (O projection, MoE pooler, DFlash draft MLP).
+     SGLANG_MUSE_DENSE_TILED = EnvBool(True)
+diff --git a/python/sglang/srt/layers/attention/aiter_backend.py b/python/sglang/srt/layers/attention/aiter_backend.py
+index 0b942a92ba..6afc825b16 100755
+--- a/python/sglang/srt/layers/attention/aiter_backend.py
++++ b/python/sglang/srt/layers/attention/aiter_backend.py
+@@ -60,6 +60,12 @@ try:
+     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
+     from aiter.ops.triton.attention.unified_attention import unified_attention
+ 
++    from sglang.srt.rocm_muse_spark.verify_attention import (
++        install as install_muse_verify_attention,
++    )
++
++    install_muse_verify_attention()
++
+     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
+         asm_verify_attn_enabled,
+         reset_verify_attn_plan_cache,
+diff --git a/python/sglang/srt/models/dflash.py b/python/sglang/srt/models/dflash.py
+index 53a052802b..17f1182b90 100644
+--- a/python/sglang/srt/models/dflash.py
++++ b/python/sglang/srt/models/dflash.py
+@@ -4,6 +4,7 @@
+ 
+ from __future__ import annotations
+ 
++import functools
+ import logging
+ from typing import Iterable, Optional, Tuple
+ 
+@@ -16,6 +17,7 @@ from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+ from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
+ from sglang.srt.configs.laguna import normalize_gating
+ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
++from sglang.srt.environ import envs
+ from sglang.srt.layers.activation import SiluAndMul
+ from sglang.srt.layers.layernorm import RMSNorm
+ from sglang.srt.layers.linear import (
+@@ -48,10 +50,14 @@ from sglang.srt.speculative.dflash_utils import (
+     parse_dflash_draft_config,
+ )
+ from sglang.srt.utils import is_npu, set_weight_attrs
+-from sglang.srt.utils.common import get_compiler_backend
++from sglang.srt.utils.common import get_compiler_backend, print_info_once
+ from sglang.srt.utils.hf_transformers_utils import get_rope_config
+ 
+ _is_npu = is_npu()
++_DFLASH_KV_FP8_FUSE = envs.SGLANG_MUSE_DFLASH_KV_FP8_FUSE.get()
++_DFLASH_PACKED_CANDIDATE_GATHER = envs.SGLANG_MUSE_DFLASH_PACKED_CANDIDATE_GATHER.get()
++_DFLASH_TRITON_TOPK = envs.SGLANG_MUSE_DFLASH_TRITON_TOPK.get()
++_DFLASH_CONV_NORM_FUSE = envs.SGLANG_MUSE_DFLASH_CONV_NORM_FUSE.get()
+ if _is_npu:
+     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+ logger = logging.getLogger(__name__)
+@@ -147,10 +153,27 @@ def candidate_topk(
+     lse = None
+     if with_partition:
+         vals, ids, lse = lilicorr_topk_lse(logits, k)
+-    else:
++    elif not (_DFLASH_TRITON_TOPK and not tp and logits.is_cuda):
+         vals, ids = _radix_topk(logits, k)
+     if tp:
+         return ids.long(), vals, lse
++    if _DFLASH_TRITON_TOPK and not with_partition and logits.is_cuda:
++        from sglang.kernels.ops.speculative.dflash_candidate_topk import (
++            local_topk_packed,
++            merge_gathered_topk,
++        )
++
++        packed = local_topk_packed(
++            logits, k, int(lm_head.shard_indices.org_vocab_start_index)
++        )
++        ids, vals = merge_gathered_topk(
++            tensor_model_parallel_all_gather(packed, dim=-1), k
++        )
++        return ids, vals, None
++    if _DFLASH_PACKED_CANDIDATE_GATHER and lse is None:
++        return _packed_candidate_gather(
++            vals, ids, int(lm_head.shard_indices.org_vocab_start_index), k
++        )
+     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
+     gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+     gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+@@ -162,6 +185,24 @@ def candidate_topk(
+     return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
+ 
+ 
++def _packed_candidate_gather(
++    vals: torch.Tensor, ids: torch.Tensor, vocab_start: int, k: int
++) -> Tuple[torch.Tensor, torch.Tensor, None]:
++    """candidate_topk's cross-rank merge with one all-gather: the FP32 values and the
++    int32 global ids (bit-cast to FP32) travel in one [N, 2K] row, so the ids take the
++    custom FP32 gather instead of an int64 NCCL one. Same ids and values."""
++    n = vals.shape[0]
++    packed = torch.cat(
++        (vals.float(), (ids.to(torch.int32) + vocab_start).view(torch.float32)), dim=-1
++    )
++    gathered = tensor_model_parallel_all_gather(packed, dim=-1)
++    tp = gathered.shape[-1] // (2 * k)
++    gathered_vals = gathered.view(n, tp, 2, k)[:, :, 0].reshape(n, tp * k)
++    gathered_ids = gathered.view(torch.int32).view(n, tp, 2, k)[:, :, 1].reshape(n, tp * k)
++    top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
++    return torch.gather(gathered_ids, -1, sel).long(), top_vals, None
++
++
+ def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
+     """Honor explicit causality while preserving legacy layer defaults."""
+     text_config = config.get_text_config()
+@@ -376,24 +417,45 @@ class DFlashAttention(nn.Module):
+         forward_batch: ForwardBatch,
+     ) -> torch.Tensor:
+         qkv, _ = self.qkv_proj(hidden_states)
++        save_kv_cache = True
+         if _is_npu:
+             q, k, v = self.forward_prepare_npu(positions, hidden_states)
+         elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
+-            from sglang.kernels.ops.attention.table_qk_norm_rope import (
+-                table_qk_norm_rope_,
+-            )
++            kv_dest = self._fp8_kv_dest(forward_batch, qkv)
++            if kv_dest is not None:
++                from sglang.kernels.ops.speculative.dflash_kv_fp8 import (
++                    table_qk_norm_rope_kv_,
++                )
+ 
+-            table_qk_norm_rope_(
+-                qkv,
+-                positions,
+-                self.q_norm.weight,
+-                self.k_norm.weight,
+-                self.rotary_emb.cos_sin_cache,
+-                self.num_heads,
+-                self.num_kv_heads,
+-                self.head_dim,
+-                self.q_norm.variance_epsilon,
+-            )
++                table_qk_norm_rope_kv_(
++                    qkv,
++                    positions,
++                    self.q_norm.weight,
++                    self.k_norm.weight,
++                    self.rotary_emb.cos_sin_cache,
++                    *kv_dest,
++                    self.num_heads,
++                    self.num_kv_heads,
++                    self.head_dim,
++                    self.q_norm.variance_epsilon,
++                )
++                save_kv_cache = False
++            else:
++                from sglang.kernels.ops.attention.table_qk_norm_rope import (
++                    table_qk_norm_rope_,
++                )
++
++                table_qk_norm_rope_(
++                    qkv,
++                    positions,
++                    self.q_norm.weight,
++                    self.k_norm.weight,
++                    self.rotary_emb.cos_sin_cache,
++                    self.num_heads,
++                    self.num_kv_heads,
++                    self.head_dim,
++                    self.q_norm.variance_epsilon,
++                )
+             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         else:
+             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+@@ -402,15 +464,69 @@ class DFlashAttention(nn.Module):
+         if self.v_scale is not None:
+             v = v * self.v_scale
+         if self.attention_sink_bias is None:
+-            attn_output = self.attn(q, k, v, forward_batch)
++            attn_output = self.attn(
++                q, k, v, forward_batch, save_kv_cache=save_kv_cache
++            )
+         else:
+             attn_output = self.attn(
+-                q, k, v, forward_batch, sinks=self.attention_sink_bias
++                q,
++                k,
++                v,
++                forward_batch,
++                save_kv_cache=save_kv_cache,
++                sinks=self.attention_sink_bias,
+             )
+         attn_output = self.apply_attention_output(attn_output, hidden_states)
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
++    def _fp8_kv_dest(self, forward_batch: ForwardBatch, qkv: torch.Tensor):
++        """(loc, k_cache, v_cache) when the backend's K/V store is a plain FP8 row write
++        that ``table_qk_norm_rope_kv_`` reproduces byte for byte; else None."""
++        if not _DFLASH_KV_FP8_FUSE or self.v_scale is not None:
++            return None
++        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
++        from sglang.srt.mem_cache.memory_pool import (
++            KVWriteLoc,
++            MHATokenToKVPool,
++            unwrap_write_loc,
++        )
++        from sglang.srt.model_executor.forward_context import (
++            get_attn_backend,
++            get_token_to_kv_pool,
++        )
++
++        backend = get_attn_backend()
++        pool = get_token_to_kv_pool()
++        attn = self.attn
++        if (
++            not isinstance(backend, TritonAttnBackend)
++            or type(backend)._set_kv_buffer is not TritonAttnBackend._set_kv_buffer
++            or backend.dcp_size > 1
++            or type(pool) is not MHATokenToKVPool
++            or pool.dtype != torch.float8_e4m3fn
++            or pool.is_quantized_kv_cache
++            or pool.use_hnd
++            or pool.kv_cache_layout == "vectorized_5d"
++            or attn.k_scale is not None
++            or attn.v_scale is not None
++            or not forward_batch.forward_mode.is_target_verify()
++            or qkv.stride(1) != 1
++        ):
++            return None
++        loc_info = KVWriteLoc.for_batch(
++            forward_batch, swa_loc=backend.forward_metadata.swa_out_cache_loc
++        )
++        pool._check_physical_write_loc(loc_info, "DFlash fused FP8 K/V write")
++        loc = unwrap_write_loc(loc_info)[0]
++        if loc is None or loc.numel() != qkv.shape[0]:
++            return None
++        if attn.layer_id == 0:
++            print_info_once("DFlash draft: fused FP8 K/V write in QK-norm/RoPE")
++        return loc, pool.get_key_buffer(attn.layer_id), pool.get_value_buffer(
++            attn.layer_id
++        )
++
+     def apply_attention_output(
+         self, attn_output: torch.Tensor, hidden_states: torch.Tensor
+     ) -> torch.Tensor:
+@@ -569,6 +685,53 @@ class DFlashGroupedConv(nn.Module):
+         return self._convolve(hidden_states, coefficients, side=1)
+ 
+ 
++def conv_then_add_norm(pending_conv, x, residual, norm: RMSNorm):
++    """``norm(conv.finish(x, coefficients) + residual)`` (conv skipped for None) as
++    (normed, new residual); one kernel where it reproduces the served pair."""
++    if pending_conv is None:
++        return norm(x, residual)
++    conv, coefficients = pending_conv
++    if (
++        _DFLASH_CONV_NORM_FUSE
++        and conv.taps == 2
++        and x.dim() == 2
++        and x.dtype == torch.bfloat16
++        and x.is_contiguous()
++        and residual.is_contiguous()
++        and residual.dtype == torch.bfloat16
++        and norm.weight.dtype == torch.bfloat16
++        and x.shape[-1] == 8192
++        and coefficients.stride(-1) == 1
++        and getattr(norm, "_forward_method", None) == norm.forward_aiter
++        and getattr(norm, "_fused_pad_kernel", None) is None
++        and _aiter_triton_rmsnorm()
++    ):
++        from sglang.kernels.ops.speculative.dflash_conv_norm import (
++            conv_out_add_rmsnorm,
++        )
++
++        return conv_out_add_rmsnorm(
++            x,
++            coefficients,
++            conv.base_kernel[1],
++            residual,
++            norm.weight.data,
++            norm.variance_epsilon,
++            conv.block_size,
++            conv.group_size,
++        )
++    return norm(conv.finish(x, coefficients), residual)
++
++
++@functools.cache
++def _aiter_triton_rmsnorm() -> bool:
++    # The fused kernel mirrors aiter's Triton add-RMSNorm, the gfx1250 pick of layernorm.py.
++    from sglang.srt.layers import layernorm
++
++    fn = getattr(layernorm, "fused_add_rms_norm", None)
++    return getattr(fn, "__module__", "").startswith("aiter.ops.triton")
++
++
+ class DFlashDecoderLayer(nn.Module):
+     attention_cls = DFlashAttention
+ 
+@@ -608,19 +771,32 @@ class DFlashDecoderLayer(nn.Module):
+         hidden_states: torch.Tensor,
+         forward_batch: ForwardBatch,
+         residual: Optional[torch.Tensor],
+-    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        pending_conv=None,
++        defer_mlp_conv: bool = False,
++    ):
++        """``pending_conv`` is the previous layer's deferred output-side conv
++        (conv, coefficients), applied with this layer's input norm. With
++        ``defer_mlp_conv`` the layer returns (hidden, residual, pending_conv),
++        leaving its own MLP-side conv to the next norm."""
+         if hidden_states.numel() == 0:
+             # Keep return types consistent for upstream callers.
+             if residual is None:
+                 residual = hidden_states
+-            return hidden_states, residual
++            if pending_conv is not None:
++                hidden_states = pending_conv[0].finish(hidden_states, pending_conv[1])
++            return (hidden_states, residual, None) if defer_mlp_conv else (
++                hidden_states,
++                residual,
++            )
+ 
+         # Pre-norm attention with fused residual+norm when possible (Qwen3-style).
+         if residual is None:
+             residual = hidden_states
+             hidden_states = self.input_layernorm(hidden_states)
+         else:
+-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
++            hidden_states, residual = conv_then_add_norm(
++                pending_conv, hidden_states, residual, self.input_layernorm
++            )
+ 
+         attention_kernel = None
+         if self.attention_conv is not None:
+@@ -631,15 +807,23 @@ class DFlashDecoderLayer(nn.Module):
+             hidden_states=hidden_states,
+             forward_batch=forward_batch,
+         )
+-        if attention_kernel is not None:
+-            attn_out = self.attention_conv.finish(attn_out, attention_kernel)
+-
+-        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
++        hidden_states, residual = conv_then_add_norm(
++            None if attention_kernel is None else (self.attention_conv, attention_kernel),
++            attn_out,
++            residual,
++            self.post_attention_layernorm,
++        )
+ 
+         mlp_kernel = None
+         if self.mlp_conv is not None:
+             hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
+         hidden_states = self.mlp(hidden_states)
++        if defer_mlp_conv:
++            return (
++                hidden_states,
++                residual,
++                None if mlp_kernel is None else (self.mlp_conv, mlp_kernel),
++            )
+         if mlp_kernel is not None:
+             hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
+         return hidden_states, residual
+@@ -838,16 +1022,33 @@ class DFlashDraftModel(nn.Module):
+         hidden_states = input_embeds
+         residual: Optional[torch.Tensor] = None
+ 
++        pending_conv = None
+         for layer in self.layers:
+-            hidden_states, residual = layer(
+-                positions, hidden_states, forward_batch, residual
+-            )
++            if _DFLASH_CONV_NORM_FUSE:
++                hidden_states, residual, pending_conv = layer(
++                    positions,
++                    hidden_states,
++                    forward_batch,
++                    residual,
++                    pending_conv=pending_conv,
++                    defer_mlp_conv=True,
++                )
++            else:
++                hidden_states, residual = layer(
++                    positions, hidden_states, forward_batch, residual
++                )
+ 
+         if hidden_states.numel() != 0:
+             if residual is None:
++                if pending_conv is not None:
++                    hidden_states = pending_conv[0].finish(
++                        hidden_states, pending_conv[1]
++                    )
+                 hidden_states = self.norm(hidden_states)
+             else:
+-                hidden_states, _ = self.norm(hidden_states, residual)
++                hidden_states, _ = conv_then_add_norm(
++                    pending_conv, hidden_states, residual, self.norm
++                )
+ 
+         return LogitsProcessorOutput(
+             next_token_logits=None,
+diff --git a/python/sglang/srt/rocm_muse_spark/verify_attention.py b/python/sglang/srt/rocm_muse_spark/verify_attention.py
+new file mode 100644
+index 0000000000..d8b106892a
+--- /dev/null
++++ b/python/sglang/srt/rocm_muse_spark/verify_attention.py
+@@ -0,0 +1,179 @@
++"""gfx1250 verify-attention overrides of AITER's Triton ``unified_attention`` (Muse Spark C1 verify), from SGLang.
++
++AITER's wrapper looks up its config / 3D split / reduce helpers as module globals on every call, so they are
++wrapped here instead of patching AITER; each override falls through to the served helper when it does not apply.
++
++* ``SGLANG_MUSE_ATTN_V2=1``: full-attention layers' Triton 3D split runs ``attn_v2_split``
++  (``sglang.kernels.ops.attention.muse_attn_v2``): same fp32 partials and device-side segment split as
++  ``kernel_unified_attention_3d``, combined by the served ``reduce_segments`` on its single-tile path. Only for an
++  unshuffled FP8 cache, BF16 Q, head_dim 64, GQA 8, no sinks / alibi / qq_bias / softcap / output scale, one
++  sequence of <= 8 query rows, tile 128 (the C1 verify).
++* ``SGLANG_MUSE_SWA_CFG=1``: sliding-window layers' Triton 3D kv split at 4 segments per CU over 32-token tiles
++  (64 segments x 32 at C1 verify) instead of 1 per CU over 64-token tiles.
++"""
++
++import logging
++import os
++
++import torch
++import triton
++
++logger = logging.getLogger(__name__)
++
++ATTN_V2 = os.environ.get("SGLANG_MUSE_ATTN_V2", "0") == "1"
++SWA_CFG = os.environ.get("SGLANG_MUSE_SWA_CFG", "0") == "1"
++
++# kv_split["D_LEQ_64.SW.DT_any_fp8"] of vagm's DEFAULT.proposed.json (served: SEGMENTS_PER_CU 1, tiles 64).
++SWA_KV_SPLIT = {
++    "MIN_SEGMENTS": 1,
++    "SEGMENTS_PER_CU": 4,
++    "SEGMENT_TILE_MIN": 32,
++    "TILE_SIZE_MIN": 32,
++    "TILE_SIZE_MAX": 32,
++}
++V2_TILE = 128
++V2_ROWS = 8  # query rows per block: BLOCK_M 64 = 8 rows x 8 GQA heads
++
++_installed = False
++_live = set()
++
++
++def _note_live(name: str) -> None:
++    if name not in _live:
++        _live.add(name)
++        logger.info("Muse verify attention: %s live", name)
++
++
++def _swa_split_applies(op, params, backend) -> bool:
++    return (
++        SWA_CFG
++        and op == "kv_split"
++        and backend == "triton"
++        and params.sliding_window > 0
++        and max(params.head_size, params.head_size_v) <= 64
++        and not params.shuffled_kv_cache
++        and params.kv_cache_dtype == torch.float8_e4m3fn
++    )
++
++
++def _v2_applies(params, num_segments, tile_size, window_split) -> bool:
++    q, k, v = params.q, params.k, params.v
++    return (
++        ATTN_V2
++        and num_segments > 1
++        and tile_size == V2_TILE
++        and not window_split
++        and not params.skip_reduce
++        and params.sliding_window == 0
++        and not params.shuffled_kv_cache
++        and params.kv_cache_dtype == torch.float8_e4m3fn
++        and params.q_dtype == torch.bfloat16
++        and params.head_size == 64
++        and params.head_size_v == 64
++        and params.num_queries_per_kv == 8
++        and params.sinks is None
++        and not params.use_alibi_slopes
++        and not params.use_qq_bias
++        and not params.softcap
++        and params.output_scale is None
++        and params.num_seqs == 1
++        and params.num_tokens <= V2_ROWS
++        and int(params.max_seqlen_q) <= V2_ROWS
++        and isinstance(params.k_descale, torch.Tensor)
++        and isinstance(params.v_descale, torch.Tensor)
++        and q.stride(2) == 1
++        and k.stride(3) == 1
++        and v.stride(3) == 1
++    )
++
++
++def install() -> None:
++    """Wrap the AITER wrapper's helpers once (no-op unless a flag is on)."""
++    global _installed
++    if _installed or not (ATTN_V2 or SWA_CFG):
++        return
++    import aiter.ops.triton.attention.unified_attention as uaw
++    from aiter.ops.triton.utils.unified_attention_utils import (
++        compute_segment_params,
++        compute_tile_params,
++    )
++
++    from sglang.kernels.ops.attention.muse_attn_v2 import attn_v2_split
++
++    get_config = uaw.get_unified_attention_config
++    split_3d = uaw._unified_attention_3d_triton
++    reduce_triton = uaw._reduce_segments_triton
++
++    def get_unified_attention_config(op, params, backend="triton", arch=None):
++        if arch is None and _swa_split_applies(op, params, backend):
++            _note_live("sliding-window kv split (4 segments per CU, 32-token tiles)")
++            config = compute_tile_params(dict(SWA_KV_SPLIT), params.block_size)
++            return compute_segment_params(config, params)
++        return get_config(op, params, backend=backend, arch=arch)
++
++    def _unified_attention_3d_triton(
++        params, segm_output, segm_max, segm_expsum, NUM_SEGMENTS, TILE_SIZE, window_split=False,
++        segment_grid_first=False,
++    ):
++        if not _v2_applies(params, NUM_SEGMENTS, TILE_SIZE, window_split):
++            return split_3d(
++                params, segm_output, segm_max, segm_expsum, NUM_SEGMENTS, TILE_SIZE,
++                window_split=window_split, segment_grid_first=segment_grid_first,
++            )
++        _note_live(f"attn_v2_split for full-attention layers (tile {TILE_SIZE}, {NUM_SEGMENTS} segments)")
++        q, k, v = params.q, params.k, params.v
++        attn_v2_split[(NUM_SEGMENTS, params.num_kv_heads, triton.cdiv(params.num_tokens, V2_ROWS))](
++            segm_output, segm_max, segm_expsum,
++            q, k, v, params.block_table, params.seqused_k, params.cu_seqlens_q,
++            params.k_descale, params.v_descale, params.softmax_scale,
++            q.stride(0), q.stride(1),
++            k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1), v.stride(2),
++            NQ=params.num_query_heads, G=params.num_queries_per_kv, D=64, PAGE=params.block_size,
++            TILE=TILE_SIZE, NSEG=NUM_SEGMENTS, BLOCK_M=64, QSPLIT=0, FOLD=True, DUAL=False, PFD=0,
++            PF_SCOPE=0, num_warps=4, num_stages=2, waves_per_eu=0,
++        )
++
++    def _reduce_segments_triton(
++        params, segm_output, segm_max, segm_expsum, NUM_SEGMENTS, TILE_SIZE, window_split=False
++    ):
++        if not _v2_applies(params, NUM_SEGMENTS, TILE_SIZE, window_split):
++            return reduce_triton(
++                params, segm_output, segm_max, segm_expsum, NUM_SEGMENTS, TILE_SIZE, window_split=window_split
++            )
++        # the served reduce kernel and config, on its single-tile path (all segments in one step)
++        config = get_config("reduce", params, backend="triton")
++        config["SEGMENT_BLOCK"] = max(config.get("SEGMENT_BLOCK") or 0, NUM_SEGMENTS)
++        d = triton.next_power_of_2(params.head_size_v)
++        uaw.reduce_segments[(params.num_tokens, params.num_query_heads, triton.cdiv(d, config.get("BLOCK_D") or d))](
++            output_ptr=params.out,
++            segm_output_ptr=segm_output,
++            segm_max_ptr=segm_max,
++            segm_expsum_ptr=segm_expsum,
++            seq_lens_ptr=params.seqused_k,
++            num_seqs=params.num_seqs,
++            num_query_heads=params.num_query_heads,
++            out_scale_ptr=params.output_scale,
++            output_stride_0=params.out.stride(0),
++            output_stride_1=params.out.stride(1),
++            block_table_stride=params.block_table.stride(0),
++            HEAD_SIZE=params.head_size,
++            HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size),
++            V_HEAD_SIZE=params.head_size_v,
++            V_HEAD_SIZE_PADDED=d,
++            query_start_len_ptr=params.cu_seqlens_q,
++            NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
++            TILE_SIZE=TILE_SIZE,
++            BLOCK_Q=None,
++            SLIDING_WINDOW=params.sliding_window,
++            WINDOW_SPLIT=window_split,
++            **config,
++            enable_fp_fusion=True,
++        )
++
++    uaw.get_unified_attention_config = get_unified_attention_config
++    uaw._unified_attention_3d_triton = _unified_attention_3d_triton
++    uaw._reduce_segments_triton = _reduce_segments_triton
++    _installed = True
++    logger.info(
++        "Muse verify attention overrides installed: attn_v2 %s, sliding-window config %s", ATTN_V2, SWA_CFG
++    )
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 3b3b0c4dba..f9bccce082 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -580,6 +580,7 @@ class DFlashWorkerV2(BaseSpecWorker):
+         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
+         self._draft_greedy_index_cap: int = 0
+         self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
++        self._ctx_kv_commit_fp8_op = False
+         self._fused_kv_helper: Optional[object] = None
+         if self._use_fused_kv_materialize:
+             self._init_fused_kv_helper()
+@@ -2064,11 +2065,54 @@ class DFlashWorkerV2(BaseSpecWorker):
+                     attn.v_scale,
+                 )
+ 
++        write_all_kv = None
++        if ctx_cache_loc_2d is not None and commit_lens is not None:
++            commit = self._ctx_kv_commit_fp8()
++            if commit is not None:
++
++                def write_all_kv(cache_k: torch.Tensor, cache_v: torch.Tensor) -> None:
++                    commit(cache_k, cache_v, ctx_cache_loc_2d, commit_lens)
++
+         self._fused_kv_helper.materialize(
+             ctx_hidden=ctx_hidden,
+             positions=ctx_positions,
+             write_layer_kv=_write_layer_kv,
+-        )
++            write_all_kv=write_all_kv,
++        )
++
++    def _ctx_kv_commit_fp8(self):
++        """The one-launch FP8 prefix-valid commit over all draft layers, or None where
++        ``set_kv_buffer_prefix_valid``'s eager cast + tiled store is not what it reproduces."""
++        commit = getattr(self, "_ctx_kv_commit_fp8_op", False)
++        if commit is not False:
++            return commit
++        commit = None
++        if envs.SGLANG_MUSE_DFLASH_KV_FP8_FUSE.get():
++            from sglang.kernels.ops.speculative.dflash_kv_fp8 import CtxKVCommitFP8
++            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
++
++            pool = self.draft_model_runner.token_to_kv_pool
++            attns = [layer.self_attn.attn for layer in self.draft_model.layers]
++            if (
++                (is_cuda() or is_hip())
++                and type(pool) is MHATokenToKVPool
++                and pool.dtype == torch.float8_e4m3fn
++                and not pool.is_quantized_kv_cache
++                and not pool.use_hnd
++                and pool.kv_cache_layout != "vectorized_5d"
++                and pool.v_row_dim == pool.row_dim
++                and all(a.k_scale is None and a.v_scale is None for a in attns)
++            ):
++                try:
++                    commit = CtxKVCommitFP8(
++                        [pool.get_key_buffer(a.layer_id) for a in attns],
++                        [pool.get_value_buffer(a.layer_id) for a in attns],
++                    )
++                    logger.info("DFlash draft: one-launch FP8 context KV commit")
++                except ValueError as e:
++                    logger.warning("DFlash FP8 context KV commit off: %s", e)
++        self._ctx_kv_commit_fp8_op = commit
++        return commit
+ 
+     def _update_target_mamba_state_after_verify(
+         self,

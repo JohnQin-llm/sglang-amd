@@ -1,0 +1,1372 @@
+diff --git a/aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py b/aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py
+index de9389969..f6d8974d1 100644
+--- a/aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py
++++ b/aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py
+@@ -4,7 +4,7 @@
+ 
+ from __future__ import annotations
+ 
+-from functools import lru_cache
++from functools import cache
+ from typing import NamedTuple
+ 
+ import flydsl.compiler as flyc
+@@ -826,7 +826,7 @@ def build_pa_mqa_logits_fp4_prefill_module(
+ # ============================================================================
+ 
+ 
+-@lru_cache(maxsize=32)
++@cache
+ def compile_pa_mqa_logits_fp4_prefill(
+     *,
+     block_k: int = 256,
+diff --git a/aiter/ops/triton/_gluon_kernels/gfx1250/attention/unified_attention_3d.py b/aiter/ops/triton/_gluon_kernels/gfx1250/attention/unified_attention_3d.py
+index a6d0e2c1e..98a482704 100644
+--- a/aiter/ops/triton/_gluon_kernels/gfx1250/attention/unified_attention_3d.py
++++ b/aiter/ops/triton/_gluon_kernels/gfx1250/attention/unified_attention_3d.py
+@@ -1456,9 +1456,11 @@ class AttentionProgram:
+     @gluon.jit
+     def softmax_part0(self, S, M):
+         m_ij = gl.maximum(M, gl.max(S, axis=1))
+-        # m_ij = gl.where(m_ij > float("-inf"), m_ij, 0.0)
+-        p = gl.exp2(S - m_ij[:, None])
+-        alpha = gl.exp2(M - m_ij)
++        # A row can see no key in this segment when q_len > 1 (a segment past
++        # its causal horizon); shift it by 0 so p and alpha are 0, not NaN.
++        m_shift = gl.where(m_ij > float("-inf"), m_ij, 0.0)
++        p = gl.exp2(S - m_shift[:, None])
++        alpha = gl.exp2(M - m_shift)
+         return p, alpha, m_ij
+ 
+     # @gluon.jit
+@@ -2324,6 +2326,23 @@ def _unified_attention_gluon_kernel_3d(
+         S = S * qk_factor
+ 
+         S = pgm.apply_softcap(S)
++        if not cfg.ALL_DECODE:
++            # With q_len > 1 the rows of a query block have different causal
++            # horizons, so a tile before the last can hold keys past an early
++            # row's horizon. Decode has one query per block and skips this.
++            tile_offset = (
++                j * cfg.TILE_SIZE
++                + gl.arange(
++                    0,
++                    cfg.TILE_SIZE,
++                    layout=gl.SliceLayout(0, cfg.QK_WMMA_UNPACKED_LAYOUT),
++                )[None, :]
++            )
++            S = gl.where(
++                tile_offset < pgm.context_len + pgm.query_pos_qk + 1,
++                S,
++                float("-inf"),
++            )
+         if need_addtional_mask:
+             seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
+             S = pgm.apply_addtional_mask_qk(
+@@ -2378,7 +2397,9 @@ def _unified_attention_gluon_kernel_3d(
+     S = S * qk_factor
+ 
+     S = pgm.apply_softcap(S)
+-    seq_mask = seq_offset < pgm.context_len + pgm.query_pos_qk + 1
++    seq_mask = (seq_offset < pgm.context_len + pgm.query_pos_qk + 1) & (
++        pgm.tile_end > pgm.tile_start
++    )
+     S = gl.where(seq_mask, S, float("-inf"))
+     if need_addtional_mask:
+         S = pgm.apply_addtional_mask_qk(S, seq_offset, alibi_slope, qq_bias_row_ptrs)
+diff --git a/aiter/ops/triton/_gluon_kernels/gfx950/attention/unified_attention.py b/aiter/ops/triton/_gluon_kernels/gfx950/attention/unified_attention.py
+index 4abebc0ae..1b71c7171 100644
+--- a/aiter/ops/triton/_gluon_kernels/gfx950/attention/unified_attention.py
++++ b/aiter/ops/triton/_gluon_kernels/gfx950/attention/unified_attention.py
+@@ -1202,14 +1202,15 @@ class AttentionProgram:
+             )[:, None]
+             query_mask_qk = gl.convert_layout(query_mask, cfg.qk_layout)
+ 
+-        # Split-KV: carve [tile_start, tile_end) into NUM_SPLITS contiguous
+-        # split_idx==0 / NUM_SPLITS==1 is a no-op
++        # Split-KV: carve the sequence as reduce_segments does, so every query
++        # block of a sequence agrees on the split boundaries
+         if NUM_SPLITS > 1:
+-            active_tiles = tile_end - tile_start
+-            tiles_per_split = (active_tiles + NUM_SPLITS - 1) // NUM_SPLITS
+-            split_start = tile_start + split_idx * tiles_per_split
++            split_len = NUM_SPLITS * cfg.TILE_SIZE
++            seq_len = context_len + cur_batch_query_len
++            tiles_per_split = (seq_len + split_len - 1) // split_len
++            split_start = split_idx * tiles_per_split
+             tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
+-            tile_start = split_start
++            tile_start = gl.maximum(split_start, tile_start)
+ 
+         safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
+         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
+@@ -1432,6 +1433,8 @@ class AttentionProgram:
+         # row-max, so it needs whatever scale the softmax used.
+         if not cfg.USE_SINKS:
+             M = M * self.SM_scale
++        # no visible key in this split: keep the guarded 0 out of the reduce max
++        M = gl.where(L > 0.0, M, float("-inf"))
+         layout: gl.constexpr = cfg.pv_layout
+         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, layout))
+         offs_d = gl.arange(0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, layout))
+@@ -1904,8 +1907,26 @@ def _unified_attention_gluon_kernel(
+         NUM_SPLITS,
+     )
+ 
+-    # This split owns no tiles
+     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
++        # past this block's causal edge, but reduce_segments still reads it
++        if pgm.tile_start * TILE_SIZE < seq_len:
++            empty = gl.zeros(
++                [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
++            )
++            pgm.store_partial(
++                empty,
++                empty,
++                gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout),
++                partial_m_ptr,
++                partial_l_ptr,
++                partial_acc_ptr,
++                split_idx,
++                q_block_local_idx,
++                cur_batch_in_all_start_index,
++                kv_head_idx,
++                cur_batch_query_len,
++                NUM_SPLITS,
++            )
+         return
+ 
+     # TILE_SIZE == BLOCK_SIZE: one page per tile (fast path). Otherwise gather
+diff --git a/aiter/ops/triton/_triton_kernels/attention/unified_attention.py b/aiter/ops/triton/_triton_kernels/attention/unified_attention.py
+index d7be39046..281ef6a89 100644
+--- a/aiter/ops/triton/_triton_kernels/attention/unified_attention.py
++++ b/aiter/ops/triton/_triton_kernels/attention/unified_attention.py
+@@ -21,6 +21,34 @@ def cdiv_fn(x, y):
+     return (x + y - 1) // y
+ 
+ 
++@triton.jit
++def segment_range(
++    seq_len,
++    query_len,
++    TILE_SIZE: tl.constexpr,
++    NUM_SEGMENTS: tl.constexpr,
++    SLIDING_WINDOW: tl.constexpr,
++    WINDOW_SPLIT: tl.constexpr,
++):
++    """Return (first tile, tiles per segment, segments holding work) for one
++    sequence's KV split; the split kernel and the reduce must agree on it.
++
++    It is derived from seq_len on device, so it follows the request's length,
++    not the launch's max_seqlen_k. WINDOW_SPLIT starts the range at the first
++    key the sequence's first query can see, so a sliding window splits only
++    the window instead of the whole context.
++    """
++    num_tiles = cdiv_fn(seq_len, TILE_SIZE)
++    first_tile = 0
++    if WINDOW_SPLIT and SLIDING_WINDOW > 0:
++        first_tile = (
++            tl.maximum(seq_len - query_len - SLIDING_WINDOW + 1, 0) // TILE_SIZE
++        )
++    span = num_tiles - first_tile
++    tiles_per_segment = tl.maximum(cdiv_fn(span, NUM_SEGMENTS), 1)
++    return first_tile, tiles_per_segment, cdiv_fn(span, tiles_per_segment)
++
++
+ @triton.jit
+ def apply_softcap(S, x):
+     Sdiv = S / x
+@@ -570,6 +598,9 @@ kernel_unified_attention_3d_repr = make_kernel_repr(
+         "SHUFFLED_KV_CACHE",
+         "IS_Q_FP8",
+         "IS_KV_FP8",
++        "BLOCK_M",
++        "WINDOW_SPLIT",
++        "SEGMENT_GRID_FIRST",
+     ],
+ )
+ 
+@@ -632,10 +663,20 @@ def kernel_unified_attention_3d(
+     K_WIDTH: tl.constexpr = 0,  # int
+     IS_Q_FP8: tl.constexpr = False,  # bool
+     IS_KV_FP8: tl.constexpr = False,  # bool
++    WINDOW_SPLIT: tl.constexpr = False,  # bool, split only the sliding window
++    SEGMENT_GRID_FIRST: tl.constexpr = False,  # bool, grid (segm, kv head, q block)
+ ):
+-    q_block_global_idx = tl.program_id(0)
+-    kv_head_idx = tl.program_id(1)
+-    segm_idx = tl.program_id(2)
++    if SEGMENT_GRID_FIRST:
++        # Consecutive workgroups walk the segments, so the empty query blocks of
++        # the upper-bound grid come last instead of alternating with live ones,
++        # which leaves half the GPU idle.
++        segm_idx = tl.program_id(0)
++        kv_head_idx = tl.program_id(1)
++        q_block_global_idx = tl.program_id(2)
++    else:
++        q_block_global_idx = tl.program_id(0)
++        kv_head_idx = tl.program_id(1)
++        segm_idx = tl.program_id(2)
+ 
+     # needed to use exp2 (exp2 -> exp conversion)
+     RCP_LN2 = 1.4426950408889634
+@@ -666,12 +707,17 @@ def kernel_unified_attention_3d(
+     # sequence len for this particular sequence
+     seq_len = tl.load(seq_lens_ptr + seq_idx)
+ 
+-    # number of segments for this particular sequence
+-    num_segments = NUM_SEGMENTS_PER_SEQ
+-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+-
+-    if segm_idx * tiles_per_segment * TILE_SIZE >= seq_len:
++    first_tile, tiles_per_segment, num_live_segments = segment_range(
++        seq_len,
++        cur_batch_query_len,
++        TILE_SIZE,
++        NUM_SEGMENTS_PER_SEQ,
++        SLIDING_WINDOW,
++        WINDOW_SPLIT,
++    )
++    if segm_idx >= num_live_segments:
+         return
++    segm_first_tile = first_tile + segm_idx * tiles_per_segment
+ 
+     offs_m = tl.arange(0, BLOCK_M)
+     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+@@ -786,8 +832,8 @@ def kernel_unified_attention_3d(
+ 
+     # iterate through tiles within current segment
+     for j in range(
+-        segm_idx * tiles_per_segment,
+-        min((segm_idx + 1) * tiles_per_segment, num_tiles),
++        segm_first_tile,
++        min(segm_first_tile + tiles_per_segment, num_tiles),
+     ):
+         seq_offset = j * TILE_SIZE + offs_t
+         if TILE_SIZE == BLOCK_SIZE:
+@@ -977,6 +1023,8 @@ _reduce_segments_repr = make_kernel_repr(
+         "HEAD_SIZE",
+         "V_HEAD_SIZE",
+         "NUM_SEGMENTS_PER_SEQ",
++        "SEGMENT_BLOCK",
++        "BLOCK_D",
+     ],
+ )
+ 
+@@ -1005,6 +1053,10 @@ def reduce_segments(
+     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
+     FP8_MIN: tl.constexpr = float8_info.min,
+     FP8_MAX: tl.constexpr = float8_info.max,
++    SEGMENT_BLOCK: tl.constexpr = 0,  # segments per merge step, 0 = all at once
++    BLOCK_D: tl.constexpr = 0,  # head-dim slice per program (grid axis 2), 0 = all
++    SLIDING_WINDOW: tl.constexpr = 0,  # int, as passed to the split kernel
++    WINDOW_SPLIT: tl.constexpr = False,  # bool, as passed to the split kernel
+ ):
+     query_token_idx = tl.program_id(0)
+     query_head_idx = tl.program_id(1)
+@@ -1020,51 +1072,119 @@ def reduce_segments(
+     # sequence len for this particular sequence
+     seq_len = tl.load(seq_lens_ptr + seq_idx)
+ 
+-    # number of segments for this particular sequence
+-    num_segments = NUM_SEGMENTS_PER_SEQ
+-    tiles_per_segment = cdiv_fn(seq_len, num_segments * TILE_SIZE)
+-
+-    # create masks for subsequent loads
+-    act_num_segments = cdiv_fn(seq_len, tiles_per_segment * TILE_SIZE)
+-    segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
+-        [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
++    query_len = 1
++    if WINDOW_SPLIT and SLIDING_WINDOW > 0:
++        query_len = tl.load(query_start_len_ptr + seq_idx + 1) - tl.load(
++            query_start_len_ptr + seq_idx
++        )
++    # segments the split kernel wrote; create masks for subsequent loads
++    _, _, act_num_segments = segment_range(
++        seq_len,
++        query_len,
++        TILE_SIZE,
++        NUM_SEGMENTS_PER_SEQ,
++        SLIDING_WINDOW,
++        WINDOW_SPLIT,
++    )
++    single_tile: tl.constexpr = (
++        SEGMENT_BLOCK == 0 or SEGMENT_BLOCK >= NUM_SEGMENTS_PER_SEQ
+     )
++    if single_tile:
++        segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
++            [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32
++        )
+ 
+-    offs_vd = tl.arange(0, V_HEAD_SIZE_PADDED)
++    # BLOCK_D splits the head dim across grid axis 2, so a small batch still
++    # launches enough programs to keep the reduce bandwidth- not latency-bound.
++    if BLOCK_D == 0:
++        D_TILE: tl.constexpr = V_HEAD_SIZE_PADDED
++        offs_vd = tl.arange(0, V_HEAD_SIZE_PADDED)
++    else:
++        D_TILE: tl.constexpr = BLOCK_D
++        offs_vd = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
+     if V_HEAD_SIZE_PADDED != V_HEAD_SIZE:
+         v_dim_mask = offs_vd < V_HEAD_SIZE
+     else:
+         v_dim_mask = tl.full((1,), 1, dtype=tl.int1)
+ 
+-    # load segment maxima
+-    segm_offset = (
+-        query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+-        + query_head_idx * NUM_SEGMENTS_PER_SEQ
+-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+-    )
+-    segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
+-    overall_max = tl.max(segm_max)
+-
+-    # load and rescale segment exp sums
+-    segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
+-    segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
+-    overall_expsum = tl.sum(segm_expsum)
++    if single_tile:
++        # load segment maxima
++        segm_offset = (
++            query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
++            + query_head_idx * NUM_SEGMENTS_PER_SEQ
++            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
++        )
++        segm_max = tl.load(
++            segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf")
++        )
++        overall_max = tl.max(segm_max)
++
++        # load and rescale segment exp sums
++        segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
++        segm_expsum = segm_expsum * tl.math.exp2(segm_max - overall_max)
++        overall_expsum = tl.sum(segm_expsum)
++
++        # load, rescale, and add segment attention outputs
++        segm_output_offset = (
++            query_token_idx.to(tl.int64)
++            * (num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
++            + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
++            + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * V_HEAD_SIZE_PADDED
++            + offs_vd[None, :]
++        )
++        segm_output = tl.load(
++            segm_output_ptr + segm_output_offset,
++            mask=segm_mask[:, None] & v_dim_mask[None, :],
++            other=0.0,
++        )
++        segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
++        acc_sum = tl.sum(segm_output, axis=0)
++    else:
++        segm_base = (
++            query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
++            + query_head_idx * NUM_SEGMENTS_PER_SEQ
++        )
++        segm_output_base = query_token_idx.to(tl.int64) * (
++            num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED
++        ) + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
++        # Pass 1: the global max and exp-sum from the [S] statistics. Pass 2 then
++        # weights each output tile by a fixed factor, so its loads carry no
++        # loop-carried rescale and can be issued back to back.
++        offs_all = tl.arange(0, NUM_SEGMENTS_PER_SEQ)
++        all_mask = offs_all < act_num_segments
++        segm_max_all = tl.load(
++            segm_max_ptr + segm_base + offs_all, mask=all_mask, other=float("-inf")
++        )
++        overall_max = tl.max(segm_max_all)
++        segm_expsum_all = tl.load(
++            segm_expsum_ptr + segm_base + offs_all, mask=all_mask, other=0.0
++        )
++        overall_expsum = tl.sum(
++            segm_expsum_all * tl.math.exp2(segm_max_all - overall_max)
++        )
+ 
+-    # load, rescale, and add segment attention outputs
+-    segm_output_offset = (
+-        query_token_idx.to(tl.int64)
+-        * (num_query_heads * NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+-        + query_head_idx * (NUM_SEGMENTS_PER_SEQ * V_HEAD_SIZE_PADDED)
+-        + tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * V_HEAD_SIZE_PADDED
+-        + offs_vd[None, :]
+-    )
+-    segm_output = tl.load(
+-        segm_output_ptr + segm_output_offset,
+-        mask=segm_mask[:, None] & v_dim_mask[None, :],
+-        other=0.0,
+-    )
+-    segm_output *= tl.math.exp2(segm_max - overall_max)[:, None]
+-    acc_sum = tl.sum(segm_output, axis=0)
++        offs_s = tl.arange(0, SEGMENT_BLOCK)
++        acc_sum = tl.zeros([D_TILE], dtype=tl.float32)
++        for s0 in range(0, act_num_segments, SEGMENT_BLOCK):
++            segs = s0 + offs_s
++            segm_mask = segs < act_num_segments
++            weight = tl.math.exp2(
++                tl.load(
++                    segm_max_ptr + segm_base + segs,
++                    mask=segm_mask,
++                    other=float("-inf"),
++                )
++                - overall_max
++            )
++            segm_output = tl.load(
++                segm_output_ptr
++                + segm_output_base
++                + segs[:, None] * V_HEAD_SIZE_PADDED
++                + offs_vd[None, :],
++                mask=segm_mask[:, None] & v_dim_mask[None, :],
++                other=0.0,
++            )
++            acc_sum += tl.sum(segm_output * weight[:, None], axis=0)
+     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
+     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+ 
+diff --git a/aiter/ops/triton/attention/unified_attention.py b/aiter/ops/triton/attention/unified_attention.py
+index eb3349473..0569df402 100644
+--- a/aiter/ops/triton/attention/unified_attention.py
++++ b/aiter/ops/triton/attention/unified_attention.py
+@@ -12,6 +12,7 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
+ )
+ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+ from aiter.ops.triton.utils._triton import arch_info
++from aiter.ops.triton.utils.common_utils import max_addressable_bytes
+ from aiter.ops.triton.utils.device_info import get_num_sms
+ from aiter.ops.triton.utils.types import e4m3_dtype
+ from aiter.ops.triton.utils.unified_attention_utils import (
+@@ -49,6 +50,11 @@ except:  # noqa: E722
+ 
+ # Max NUM_SEGMENTS the gluon reduce holds in-thread; larger split counts fall back to the Triton reduce_segments.
+ _GLUON_REDUCE_MAX_SEGMENTS = 8
++# gfx1250, short queries (speculative-decode verify, q_len = 1 + num_spec): the 3D
++# split-KV kernel beats the 2D one while the batch has at most this many query rows
++# (tokens * query heads) per CU; past that the 2D grid fills the GPU.
++_GFX12_3D_MAX_SEQLEN_Q = 16
++_GFX12_3D_MAX_QUERY_ROWS_PER_CU = 8
+ 
+ DEVICE_ARCH = arch_info.get_arch()
+ IS_DEVICE_ARCH_GFX12 = DEVICE_ARCH in ("gfx1250",)
+@@ -64,6 +70,14 @@ def _is_gluon_available():
+     return any(supported in DEVICE_ARCH for supported in _GLUON_SUPPORTED_ARCHS)
+ 
+ 
++def _split_launch_config(config):
++    # NUM_SEGMENTS inherits the caller's max_seqlen_k type when the context
++    # length bounds the split, so a numpy max_seqlen_k makes it a numpy scalar.
++    # Gluon constexpr arguments must be native Python scalars; numpy ones fail
++    # during TTIR lowering once a runtime shape selects the 3D path.
++    return int(config["NUM_SEGMENTS"]), int(config["TILE_SIZE"])
++
++
+ class _UAParams(NamedTuple):
+     # tensors
+     q: torch.Tensor
+@@ -147,16 +161,59 @@ def _gfx950_gluon_supported(params: _UAParams):
+     )
+ 
+ 
++def _gfx950_split_params(params: _UAParams):
++    """Size the split by the gluon grid when a sequence spans several query blocks."""
++    if params.all_decode or params.max_seqlen_q * params.num_queries_per_kv <= 128:
++        return params
++    config = get_unified_attention_config("attn_3d", params, backend="gluon")
++    block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
++    block_q = block_m // params.num_queries_per_kv
++    num_q_blocks = params.num_tokens // block_q + params.num_seqs
++    return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
++
++
++def _gfx950_split_grid(params: _UAParams):
++    """Decode, and batches too small to fill the GPU, take the split grid."""
++    if params.all_decode:
++        return True
++    if params.sliding_window > 0:
++        return False
++    # unsplit, the 2d grid is faster
++    config = get_unified_attention_config(
++        "kv_split", _gfx950_split_params(params), backend="gluon"
++    )
++    return config["NUM_SEGMENTS"] > 1
++
++
++def _gfx12_short_query(params: _UAParams):
++    return (
++        params.max_seqlen_q <= _GFX12_3D_MAX_SEQLEN_Q
++        and params.num_tokens * params.num_query_heads
++        <= _GFX12_3D_MAX_QUERY_ROWS_PER_CU * params.num_sms
++    )
++
++
+ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
+-    # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
++    # if IS_DEVICE_ARCH_GFX12, use 3D for decode, and for short (spec-decode verify)
++    # queries while their rows are too few to fill the 2D grid; 2D otherwise.
++    # Short sliding-window queries take the Triton 3D kernel too, which splits
++    # just the window (WINDOW_SPLIT); the gluon 3D kernel has no window split.
+     if IS_DEVICE_ARCH_GFX12:
+-        return (params.sliding_window > 0) or (not params.all_decode)
++        if params.sliding_window > 0 and (
++            params.all_decode
++            or params.skip_reduce
++            or is_3d_gluon_available(params, backend)
++        ):
++            return True
++        if params.all_decode:
++            return False
++        return not _gfx12_short_query(params)
+ 
+     # The gfx950 Gluon kernel is one kernel with a decode and a prefill grid,
+-    # and it owns its KV split, so decode always takes the 3d path (a single
+-    # segment simply drops the split axis) and everything else the 2d one.
++    # and it owns its KV split, so decode and split batches take the 3d path
++    # (a single segment simply drops the split axis) and the rest the 2d one.
+     if backend == "gluon" and _gfx950_gluon_supported(params):
+-        return not params.all_decode
++        return not _gfx950_split_grid(params)
+ 
+     if params.head_size >= 512 and not get_arch().is_rdna and not params.all_decode:
+         return True
+@@ -368,17 +425,38 @@ def unified_attention(
+             _unified_attention_2d_triton(params)
+     else:
+         use_gluon_3d = is_3d_gluon_available(params, backend)
++        split_params = params
++        if use_gluon_3d and DEVICE_ARCH == "gfx950":
++            split_params = _gfx950_split_params(params)
++        # The Triton split starts a sliding window's segments at the window, so
++        # it is sized by the KV the queries can reach rather than the table.
++        # skip_reduce callers merge the partials with the plain segment layout.
++        window_split = (
++            not use_gluon_3d
++            and not ALL_DECODE
++            and not skip_reduce
++            and SLIDING_WINDOW > 0
++        )
++        if window_split:
++            split_params = split_params._replace(
++                max_seqlen_k=min(max_seqlen_k, SLIDING_WINDOW + max_seqlen_q)
++            )
+         config = get_unified_attention_config(
+-            "kv_split", params, backend="gluon" if use_gluon_3d else "triton"
++            "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
++        )
++        segment_grid_first = (
++            bool(config.pop("SEGMENT_GRID_FIRST", False))
++            and not use_gluon_3d
++            and not ALL_DECODE
+         )
+-        NUM_SEGMENTS = config["NUM_SEGMENTS"]
++        NUM_SEGMENTS, CONFIG_TILE_SIZE = _split_launch_config(config)
+         # The triton kernels read a shuffled tile as one contiguous page, so
+         # there the tile is the page. The gfx950 gluon loader gathers per token
+         # and keeps its tuned tile.
+         if shuffled_kv_cache and not use_gluon_3d:
+             TILE_SIZE = block_size
+         else:
+-            TILE_SIZE = config["TILE_SIZE"]
++            TILE_SIZE = CONFIG_TILE_SIZE
+ 
+         if NUM_SEGMENTS > 1:
+             segm_output = torch.empty(
+@@ -437,6 +515,8 @@ def unified_attention(
+                 segm_expsum,
+                 NUM_SEGMENTS,
+                 TILE_SIZE,
++                window_split=window_split,
++                segment_grid_first=segment_grid_first,
+             )
+ 
+         if NUM_SEGMENTS == 1:
+@@ -469,6 +549,7 @@ def unified_attention(
+                 segm_expsum,
+                 NUM_SEGMENTS,
+                 TILE_SIZE,
++                window_split=window_split,
+             )
+     return out
+ 
+@@ -541,6 +622,9 @@ def _unified_attention_2d_triton(params: _UAParams):
+         ), "For A8W8 Unified Attention with pre-shuffled KV cache, only block_size >= 32 is supported"
+ 
+     config = get_unified_attention_config("attn_2d", params, backend="triton")
++    if params.shuffled_kv_cache or params.sliding_window > 0:
++        # the unmasked-prefix loop handles neither (the kernel asserts)
++        config.pop("SPLIT_UNMASKED_LOOP", None)
+     config["BLOCK_M"] = max(
+         config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv)
+     )
+@@ -617,6 +701,8 @@ def _unified_attention_3d_triton(
+     segm_expsum,
+     NUM_SEGMENTS,
+     TILE_SIZE,
++    window_split=False,
++    segment_grid_first=False,
+ ):
+     config = get_unified_attention_config("attn_3d", params, backend="triton")
+     config["BLOCK_M"] = max(
+@@ -630,9 +716,14 @@ def _unified_attention_3d_triton(
+     else:
+         total_num_q_blocks = params.num_tokens // config["BLOCK_Q"] + params.num_seqs
+ 
+-    kernel_unified_attention_3d[
+-        (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
+-    ](
++    # grid axes 1 and 2 are capped at 65535
++    segment_grid_first = segment_grid_first and total_num_q_blocks <= 65535
++    if segment_grid_first:
++        grid = (NUM_SEGMENTS, params.num_kv_heads, total_num_q_blocks)
++    else:
++        grid = (total_num_q_blocks, params.num_kv_heads, NUM_SEGMENTS)
++
++    kernel_unified_attention_3d[grid](
+         segm_output_ptr=segm_output,
+         segm_max_ptr=segm_max,
+         segm_expsum_ptr=segm_expsum,
+@@ -687,6 +778,8 @@ def _unified_attention_3d_triton(
+         IS_KV_FP8=(params.kv_cache_dtype == e4m3_dtype),
+         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
+         TILE_SIZE=TILE_SIZE,
++        WINDOW_SPLIT=window_split,
++        SEGMENT_GRID_FIRST=segment_grid_first,
+         **config,
+         enable_fp_fusion=True,
+     )
+@@ -699,11 +792,16 @@ def _reduce_segments_triton(
+     segm_expsum,
+     NUM_SEGMENTS,
+     TILE_SIZE,
++    window_split=False,
+ ):
+     head_size_padded = triton.next_power_of_2(params.head_size)
+     config = get_unified_attention_config("reduce", params, backend="triton")
++    v_head_size_padded = triton.next_power_of_2(params.head_size_v)
++    num_d_blocks = triton.cdiv(
++        v_head_size_padded, config.get("BLOCK_D") or v_head_size_padded
++    )
+ 
+-    reduce_segments[(params.num_tokens, params.num_query_heads)](
++    reduce_segments[(params.num_tokens, params.num_query_heads, num_d_blocks)](
+         output_ptr=params.out,
+         segm_output_ptr=segm_output,
+         segm_max_ptr=segm_max,
+@@ -723,6 +821,8 @@ def _reduce_segments_triton(
+         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
+         TILE_SIZE=TILE_SIZE,
+         BLOCK_Q=None,
++        SLIDING_WINDOW=params.sliding_window,
++        WINDOW_SPLIT=window_split,
+         **config,
+         enable_fp_fusion=True,
+     )
+@@ -773,7 +873,15 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
+     NUM_SEQS = params.num_seqs
+     TILE_SIZE = config["TILE_SIZE"]
+     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
++    num_warps = config["num_warps"]
+     loop_variant = config["LOOP_VARIANT"]
++    # Short queries (speculative-decode verify): size the block to the query rows
++    # instead of padding them to the prefill BLOCK_M, one 16-row WMMA tile per warp.
++    q_rows = triton.next_power_of_2(params.max_seqlen_q * params.num_queries_per_kv)
++    if q_rows < BLOCK_M:
++        BLOCK_M = max(q_rows, 16)
++        num_warps = BLOCK_M // 16
++        loop_variant = 0
+ 
+     # Non-shuffled KV can't use TDM gather (KV layout), so a tile is one page
+     if not params.shuffled_kv_cache or TILE_SIZE < params.block_size:
+@@ -841,7 +949,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
+         waves_per_eu=config["waves_per_eu"],
+         USE_LOAD_BUFFER_OP=False,
+         USE_STORE_BUFFER_OP=USE_STORE_BUFFER_OP,
+-        num_warps=config["num_warps"],
++        num_warps=num_warps,
+         ALL_DECODE=params.all_decode,
+         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
+         CAUSAL=params.causal,
+@@ -1033,9 +1141,13 @@ def _unified_attention_gfx950(
+     if 4 * TILE_SIZE * params.head_size * params.k.element_size() > _GFX950_LDS_BUDGET:
+         NUM_BUFFERS = 1
+ 
+-    # buffer ops need the tensor to fit a 32-bit offset
++    # buffer ops need the tensor to fit a 32-bit offset. k and v can be strided
++    # views of one packed cache, so use the span of the view, not its size.
+     MAX_INT32 = 2**31 - 1
+-    USE_LOAD_BUFFER_OP = params.k.nelement() * params.k.element_size() <= MAX_INT32
++    USE_LOAD_BUFFER_OP = (
++        max(max_addressable_bytes(params.k), max_addressable_bytes(params.v))
++        <= MAX_INT32
++    )
+     USE_STORE_BUFFER_OP = params.out.nelement() * params.out.element_size() <= MAX_INT32
+ 
+     _unified_attention_kernel_gfx950[grid](
+@@ -1121,7 +1233,7 @@ def _unified_attention_3d_gfx950(
+     NUM_SEGMENTS,
+     TILE_SIZE,
+ ):
+-    """Decode: one program per (query block, kv head[, KV split]).
++    """Decode and split batches: one program per (query block, kv head[, KV split]).
+ 
+     num_warps is not tuned directly here; BLOCK_M rows are split MFMA_DIM to a
+     warp, so the warp count follows the query group the launch has to cover.
+@@ -1130,6 +1242,10 @@ def _unified_attention_3d_gfx950(
+     config = get_unified_attention_config("attn_3d", params, backend="gluon")
+     MFMA_DIM = config["MFMA_DIM"]
+     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
++    q_rows = triton.next_power_of_2(params.max_seqlen_q * params.num_queries_per_kv)
++    if not params.all_decode and q_rows <= 128:
++        # short queries: one block covers the sequence
++        BLOCK_M = max(BLOCK_M, q_rows)
+     # An unsplit launch that already leaves CUs idle can afford a wider query
+     # block, which buys back the warps the missing split axis would have used.
+     if NUM_SEGMENTS == 1 and params.num_2d_prgms <= 2 * params.num_sms:
+diff --git a/aiter/ops/triton/configs/gfx1250/triton/attention/unified_attention/DEFAULT.json b/aiter/ops/triton/configs/gfx1250/triton/attention/unified_attention/DEFAULT.json
+index 6dd69f4fb..63a70ef26 100644
+--- a/aiter/ops/triton/configs/gfx1250/triton/attention/unified_attention/DEFAULT.json
++++ b/aiter/ops/triton/configs/gfx1250/triton/attention/unified_attention/DEFAULT.json
+@@ -3,6 +3,7 @@
+     "attn_2d": [
+       "D",
+       "Q",
++      "SW",
+       "DT"
+     ],
+     "attn_3d": [
+@@ -20,11 +21,29 @@
+     "kv_split": [
+       "D",
+       "SHUF",
++      "SW",
+       "DT",
+       "BS"
+     ]
+   },
+   "attn_2d": {
++    "D_LEQ_128.Q_GEQ_256.SW.DT_any_fp8": {
++      "BLOCK_M": 128,
++      "num_warps": 4,
++      "num_stages": 2,
++      "waves_per_eu": 2,
++      "TILE_SIZE_MIN": 32,
++      "TILE_SIZE_MAX": 32
++    },
++    "D_LEQ_128.Q_GEQ_256.DT_any_fp8": {
++      "BLOCK_M": 128,
++      "num_warps": 4,
++      "num_stages": 3,
++      "waves_per_eu": 2,
++      "TILE_SIZE_MIN": 128,
++      "TILE_SIZE_MAX": 128,
++      "SPLIT_UNMASKED_LOOP": true
++    },
+     "D_GEQ_256.Q_LEQ_1.DT_fp8_fp8": {
+       "BLOCK_M": 16,
+       "num_warps": 2,
+@@ -131,6 +150,12 @@
+     }
+   },
+   "attn_3d": {
++    "D_LEQ_64.DT_any_fp8": {
++      "BLOCK_M": 64,
++      "num_warps": 4,
++      "num_stages": 2,
++      "waves_per_eu": 0
++    },
+     "D_LEQ_64.SHUF.DT_any_fp8.BS_GEQ_256": {
+       "BLOCK_M": 16,
+       "num_warps": 1,
+@@ -215,13 +240,29 @@
+     "any": {
+       "num_stages": 1,
+       "waves_per_eu": 2,
+-      "num_warps": 2,
++      "num_warps": 1,
+       "SMALL_SPLIT_MAX": 0,
+       "MIN_SEGMENTS": 1,
+-      "SEGMENTS_PER_CU": 4
++      "SEGMENTS_PER_CU": 4,
++      "SEGMENT_BLOCK": 64,
++      "BLOCK_D": 64
+     }
+   },
+   "kv_split": {
++    "D_LEQ_64.SW.DT_any_fp8": {
++      "MIN_SEGMENTS": 1,
++      "SEGMENTS_PER_CU": 1,
++      "SEGMENT_TILE_MIN": 64,
++      "TILE_SIZE_MIN": 64,
++      "TILE_SIZE_MAX": 64
++    },
++    "D_LEQ_64.DT_any_fp8": {
++      "MIN_SEGMENTS": 1,
++      "SEGMENTS_PER_CU": 8,
++      "TILE_SIZE_MIN": 128,
++      "TILE_SIZE_MAX": 128,
++      "SEGMENT_GRID_FIRST": 1
++    },
+     "D_LEQ_64.SHUF.DT_any_fp8.BS_GEQ_256": {
+       "MIN_SEGMENTS": 1,
+       "SEGMENTS_PER_CU": 4,
+diff --git a/aiter/ops/triton/configs/gfx942/triton/attention/unified_attention/DEFAULT.json b/aiter/ops/triton/configs/gfx942/triton/attention/unified_attention/DEFAULT.json
+index 07b10cfd6..bb4ff26a2 100644
+--- a/aiter/ops/triton/configs/gfx942/triton/attention/unified_attention/DEFAULT.json
++++ b/aiter/ops/triton/configs/gfx942/triton/attention/unified_attention/DEFAULT.json
+@@ -145,7 +145,19 @@
+       "MIN_SEGMENTS": 16,
+       "SEGMENTS_PER_CU": 8,
+       "MAX_SEGMENTS": 128,
+-      "SEGMENT_TILE_MAX": 64
++      "SEGMENT_TILE_MAX": 64,
++      "SEGMENT_BLOCK": 32
++    },
++    "D_GEQ_256": {
++      "num_stages": 1,
++      "waves_per_eu": 2,
++      "num_warps": 2,
++      "SMALL_SPLIT_MAX": 8,
++      "MIN_SEGMENTS": 8,
++      "SEGMENTS_PER_CU": 16,
++      "MAX_SEGMENTS": 128,
++      "SEGMENT_TILE_MAX": 64,
++      "SEGMENT_BLOCK": 32
+     },
+     "any": {
+       "num_stages": 1,
+diff --git a/aiter/ops/triton/configs/gfx950/gluon/attention/unified_attention/DEFAULT.json b/aiter/ops/triton/configs/gfx950/gluon/attention/unified_attention/DEFAULT.json
+index ab0d133cc..5d2afcf46 100644
+--- a/aiter/ops/triton/configs/gfx950/gluon/attention/unified_attention/DEFAULT.json
++++ b/aiter/ops/triton/configs/gfx950/gluon/attention/unified_attention/DEFAULT.json
+@@ -9,10 +9,13 @@
+     "attn_3d": [
+       "D",
+       "SW",
++      "Q",
+       "DT"
+     ],
+     "kv_split": [
+       "SW",
++      "D",
++      "Q",
+       "DT"
+     ]
+   },
+@@ -40,16 +43,7 @@
+       "num_warps": 4,
+       "MFMA_DIM": 32,
+       "NUM_BUFFERS": 2,
+-      "waves_per_eu": 3,
+-      "TILE_SIZE_MIN": 64,
+-      "TILE_SIZE_MAX": 64
+-    },
+-    "D_GEQ_256.SKLT.DT_fp8_fp8": {
+-      "BLOCK_M": 128,
+-      "num_warps": 4,
+-      "MFMA_DIM": 32,
+-      "NUM_BUFFERS": 1,
+-      "waves_per_eu": 1,
++      "waves_per_eu": 0,
+       "TILE_SIZE_MIN": 64,
+       "TILE_SIZE_MAX": 64
+     },
+@@ -57,8 +51,8 @@
+       "BLOCK_M": 128,
+       "num_warps": 4,
+       "MFMA_DIM": 32,
+-      "NUM_BUFFERS": 1,
+-      "waves_per_eu": 2,
++      "NUM_BUFFERS": 2,
++      "waves_per_eu": 0,
+       "TILE_SIZE_MIN": 64,
+       "TILE_SIZE_MAX": 64
+     },
+@@ -76,12 +70,24 @@
+       "num_warps": 4,
+       "MFMA_DIM": 32,
+       "NUM_BUFFERS": 2,
+-      "waves_per_eu": 2,
++      "waves_per_eu": 0,
+       "TILE_SIZE_MIN": 64,
+       "TILE_SIZE_MAX": 64
+     }
+   },
+   "attn_3d": {
++    "D_LEQ_64.Q_GEQ_64.DT_fp8_fp8": {
++      "BLOCK_M": 128,
++      "MFMA_DIM": 32,
++      "NUM_BUFFERS": 2,
++      "waves_per_eu": 0
++    },
++    "D_LEQ_64.Q_GEQ_64": {
++      "BLOCK_M": 128,
++      "MFMA_DIM": 32,
++      "NUM_BUFFERS": 2,
++      "waves_per_eu": 0
++    },
+     "D_LEQ_64.DT_fp8_fp8": {
+       "BLOCK_M": 32,
+       "MFMA_DIM": 32,
+@@ -108,26 +114,62 @@
+       "waves_per_eu": 1,
+       "WIDE_BLOCK_M_MULT": 2
+     },
++    "D_GEQ_256.Q_GEQ_64.DT_fp8_fp8": {
++      "BLOCK_M": 64,
++      "MFMA_DIM": 32,
++      "NUM_BUFFERS": 2,
++      "waves_per_eu": 0
++    },
++    "D_GEQ_256.Q_GEQ_64": {
++      "BLOCK_M": 128,
++      "MFMA_DIM": 32,
++      "NUM_BUFFERS": 2,
++      "waves_per_eu": 0
++    },
+     "D_GEQ_256.DT_fp8_fp8": {
+       "BLOCK_M": 32,
+       "MFMA_DIM": 32,
+-      "NUM_BUFFERS": 1,
++      "NUM_BUFFERS": 2,
+       "waves_per_eu": 1,
+       "WIDE_BLOCK_M_MULT": 2
+     },
+     "D_GEQ_256": {
+       "BLOCK_M": 16,
+       "MFMA_DIM": 16,
+-      "NUM_BUFFERS": 1,
++      "NUM_BUFFERS": 2,
+       "waves_per_eu": 1,
+       "WIDE_BLOCK_M_MULT": 2
+     },
++    "Q_GEQ_64.DT_fp8_fp8": {
++      "BLOCK_M": 64,
++      "MFMA_DIM": 32,
++      "NUM_BUFFERS": 2,
++      "waves_per_eu": 0
++    },
++    "Q_GEQ_64": {
++      "BLOCK_M": 128,
++      "MFMA_DIM": 32,
++      "NUM_BUFFERS": 2,
++      "waves_per_eu": 0
++    },
++    "Q_GEQ_2.DT_fp8_fp8": {
++      "BLOCK_M": 32,
++      "MFMA_DIM": 32,
++      "NUM_BUFFERS": 2,
++      "waves_per_eu": 1
++    },
+     "DT_fp8_fp8": {
+       "BLOCK_M": 32,
+       "MFMA_DIM": 32,
+       "NUM_BUFFERS": 2,
+       "waves_per_eu": 2
+     },
++    "Q_GEQ_2": {
++      "BLOCK_M": 32,
++      "MFMA_DIM": 32,
++      "NUM_BUFFERS": 2,
++      "waves_per_eu": 1
++    },
+     "any": {
+       "BLOCK_M": 16,
+       "MFMA_DIM": 16,
+@@ -145,27 +187,149 @@
+       "TILE_SIZE_MIN": 64,
+       "TILE_SIZE_MAX": 64
+     },
++    "Q_LEQ_1.DT_fp8_fp8": {
++      "SEGMENTS_PER_CU": 4,
++      "MFMA_DIM": 32,
++      "MIN_SEGMENTS": 1,
++      "SPLIT_MIN_TILES": 4,
++      "SPLIT_MIN_SHARE": 3,
++      "SEGMENT_TILE_MIN": 64,
++      "SEGMENT_TILE_MAX": 64,
++      "TILE_SIZE_MIN": 64,
++      "TILE_SIZE_MAX": 64,
++      "MAX_SEGMENTS": 128
++    },
++    "D_LEQ_64.Q_GEQ_64.DT_fp8_fp8": {
++      "SEGMENTS_PER_CU": 4,
++      "MFMA_DIM": 32,
++      "MIN_SEGMENTS": 1,
++      "SPLIT_MIN_TILES": 127,
++      "SPLIT_MIN_SHARE": 2,
++      "SEGMENT_TILE_MIN": 64,
++      "SEGMENT_TILE_MAX": 64,
++      "TILE_SIZE_MIN": 64,
++      "TILE_SIZE_MAX": 64,
++      "MAX_SEGMENTS": 128
++    },
++    "D_LEQ_128.Q_GEQ_64.DT_fp8_fp8": {
++      "SEGMENTS_PER_CU": 4,
++      "MFMA_DIM": 32,
++      "MIN_SEGMENTS": 1,
++      "SPLIT_MIN_TILES": 63,
++      "SPLIT_MIN_SHARE": 2,
++      "SEGMENT_TILE_MIN": 64,
++      "SEGMENT_TILE_MAX": 64,
++      "TILE_SIZE_MIN": 64,
++      "TILE_SIZE_MAX": 64,
++      "MAX_SEGMENTS": 128
++    },
++    "D_LEQ_128.Q_GEQ_2.DT_fp8_fp8": {
++      "SEGMENTS_PER_CU": 4,
++      "MFMA_DIM": 32,
++      "MIN_SEGMENTS": 1,
++      "SPLIT_MIN_TILES": 4,
++      "SPLIT_MIN_SHARE": 2,
++      "SEGMENT_TILE_MIN": 64,
++      "SEGMENT_TILE_MAX": 64,
++      "TILE_SIZE_MIN": 64,
++      "TILE_SIZE_MAX": 64,
++      "MAX_SEGMENTS": 128
++    },
++    "Q_GEQ_64.DT_fp8_fp8": {
++      "SEGMENTS_PER_CU": 4,
++      "MFMA_DIM": 32,
++      "MIN_SEGMENTS": 1,
++      "SPLIT_MIN_TILES": 127,
++      "SPLIT_MIN_SHARE": 4,
++      "SEGMENT_TILE_MIN": 64,
++      "SEGMENT_TILE_MAX": 64,
++      "TILE_SIZE_MIN": 64,
++      "TILE_SIZE_MAX": 64,
++      "MAX_SEGMENTS": 128
++    },
+     "DT_fp8_fp8": {
+       "SEGMENTS_PER_CU": 4,
+       "MFMA_DIM": 32,
+       "MIN_SEGMENTS": 1,
+-      "SPLIT_MIN_TILES": 16,
++      "SPLIT_MIN_TILES": 4,
++      "SPLIT_MIN_SHARE": 2,
++      "SEGMENT_TILE_MIN": 64,
++      "SEGMENT_TILE_MAX": 64,
++      "TILE_SIZE_MIN": 64,
++      "TILE_SIZE_MAX": 64,
++      "MAX_SEGMENTS": 64
++    },
++    "Q_LEQ_1": {
++      "SEGMENTS_PER_CU": 2,
++      "MFMA_DIM": 16,
++      "MIN_SEGMENTS": 1,
++      "SPLIT_MIN_TILES": 4,
+       "SPLIT_MIN_SHARE": 3,
+       "SEGMENT_TILE_MIN": 64,
+       "SEGMENT_TILE_MAX": 64,
+       "TILE_SIZE_MIN": 64,
+-      "TILE_SIZE_MAX": 64
++      "TILE_SIZE_MAX": 64,
++      "MAX_SEGMENTS": 128
++    },
++    "D_LEQ_64.Q_GEQ_64": {
++      "SEGMENTS_PER_CU": 2,
++      "MFMA_DIM": 16,
++      "MIN_SEGMENTS": 1,
++      "SPLIT_MIN_TILES": 127,
++      "SPLIT_MIN_SHARE": 2,
++      "SEGMENT_TILE_MIN": 64,
++      "SEGMENT_TILE_MAX": 64,
++      "TILE_SIZE_MIN": 64,
++      "TILE_SIZE_MAX": 64,
++      "MAX_SEGMENTS": 128
++    },
++    "D_LEQ_128.Q_GEQ_64": {
++      "SEGMENTS_PER_CU": 2,
++      "MFMA_DIM": 16,
++      "MIN_SEGMENTS": 1,
++      "SPLIT_MIN_TILES": 63,
++      "SPLIT_MIN_SHARE": 2,
++      "SEGMENT_TILE_MIN": 64,
++      "SEGMENT_TILE_MAX": 64,
++      "TILE_SIZE_MIN": 64,
++      "TILE_SIZE_MAX": 64,
++      "MAX_SEGMENTS": 128
++    },
++    "D_LEQ_128.Q_GEQ_2": {
++      "SEGMENTS_PER_CU": 2,
++      "MFMA_DIM": 16,
++      "MIN_SEGMENTS": 1,
++      "SPLIT_MIN_TILES": 4,
++      "SPLIT_MIN_SHARE": 2,
++      "SEGMENT_TILE_MIN": 64,
++      "SEGMENT_TILE_MAX": 64,
++      "TILE_SIZE_MIN": 64,
++      "TILE_SIZE_MAX": 64,
++      "MAX_SEGMENTS": 128
++    },
++    "Q_GEQ_64": {
++      "SEGMENTS_PER_CU": 2,
++      "MFMA_DIM": 16,
++      "MIN_SEGMENTS": 1,
++      "SPLIT_MIN_TILES": 127,
++      "SPLIT_MIN_SHARE": 4,
++      "SEGMENT_TILE_MIN": 64,
++      "SEGMENT_TILE_MAX": 64,
++      "TILE_SIZE_MIN": 64,
++      "TILE_SIZE_MAX": 64,
++      "MAX_SEGMENTS": 128
+     },
+     "any": {
+       "SEGMENTS_PER_CU": 2,
+       "MFMA_DIM": 16,
+       "MIN_SEGMENTS": 1,
+-      "SPLIT_MIN_TILES": 16,
+-      "SPLIT_MIN_SHARE": 3,
++      "SPLIT_MIN_TILES": 4,
++      "SPLIT_MIN_SHARE": 2,
+       "SEGMENT_TILE_MIN": 64,
+       "SEGMENT_TILE_MAX": 64,
+       "TILE_SIZE_MIN": 64,
+-      "TILE_SIZE_MAX": 64
++      "TILE_SIZE_MAX": 64,
++      "MAX_SEGMENTS": 64
+     }
+   }
+ }
+diff --git a/aiter/ops/triton/configs/gfx950/triton/attention/unified_attention/DEFAULT.json b/aiter/ops/triton/configs/gfx950/triton/attention/unified_attention/DEFAULT.json
+index 348c826d5..95c5069fe 100644
+--- a/aiter/ops/triton/configs/gfx950/triton/attention/unified_attention/DEFAULT.json
++++ b/aiter/ops/triton/configs/gfx950/triton/attention/unified_attention/DEFAULT.json
+@@ -246,7 +246,8 @@
+       "MIN_SEGMENTS": 16,
+       "SEGMENTS_PER_CU": 8,
+       "MAX_SEGMENTS": 128,
+-      "SEGMENT_TILE_MAX": 64
++      "SEGMENT_TILE_MAX": 64,
++      "SEGMENT_BLOCK": 32
+     },
+     "D_LEQ_128": {
+       "num_stages": 1,
+@@ -267,7 +268,8 @@
+       "MIN_SEGMENTS": 8,
+       "SEGMENTS_PER_CU": 16,
+       "MAX_SEGMENTS": 128,
+-      "SEGMENT_TILE_MAX": 64
++      "SEGMENT_TILE_MAX": 64,
++      "SEGMENT_BLOCK": 32
+     }
+   },
+   "kv_split": {
+diff --git a/csrc/cpp_itfs/torch_utils.py b/csrc/cpp_itfs/torch_utils.py
+index 39b485fb1..489ca6467 100644
+--- a/csrc/cpp_itfs/torch_utils.py
++++ b/csrc/cpp_itfs/torch_utils.py
+@@ -54,8 +54,15 @@ def torch_to_c_types(*args):
+             c_args.append(ctypes.POINTER(ctypes.c_int)())
+         elif isinstance(arg, torch.Tensor):
+             c_args.append(ctypes.cast(arg.data_ptr(), ctypes.c_void_p))
+-        elif isinstance(arg, torch.cuda.Stream):
+-            c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
++        elif isinstance(arg, torch.Stream):
++            handle = getattr(arg, "cuda_stream", None)
++            if handle is None:
++                handle = torch.cuda.Stream(
++                    stream_id=arg.stream_id,
++                    device_index=arg.device_index,
++                    device_type=arg.device_type,
++                ).cuda_stream
++            c_args.append(ctypes.cast(handle, ctypes.c_void_p))
+         else:
+             if type(arg) not in ctypes_map:
+                 raise ValueError(f"Unsupported type: {type(arg)}")
+diff --git a/hsa/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co b/hsa/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co
+index 88d5a4d0d..410af4a1e 100755
+Binary files a/hsa/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co and b/hsa/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co differ
+diff --git a/op_tests/triton_tests/attention/test_unified_attention.py b/op_tests/triton_tests/attention/test_unified_attention.py
+index ca14159e2..a424474fa 100644
+--- a/op_tests/triton_tests/attention/test_unified_attention.py
++++ b/op_tests/triton_tests/attention/test_unified_attention.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ 
++import random
++import sys
+ from types import SimpleNamespace
+ 
+ import pytest
+@@ -934,3 +936,184 @@ def test_triton_unified_attn_asym_head_guards(case: str) -> None:
+             shuffled_kv_cache=shuffled,
+             backend="triton",
+         )
++
++
++@pytest.mark.parametrize("backend", ["triton", "gluon"])
++@torch.inference_mode()
++def test_triton_unified_attn_packed_kv_over_2gib(backend: str) -> None:
++    # vLLM passes k and v as strided views of one cache that packs k and v in
++    # the last dim. Each view has fewer than 2 GiB of elements, but the view
++    # spans more than 2 GiB, so blocks at the end need 64-bit offsets.
++    if backend == "gluon" and not _is_gluon_available():
++        pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
++    torch.manual_seed(0)
++    num_blocks, block_size, num_kv_heads, head_size = 40000, 16, 8, 128
++    num_query_heads = 64
++    dtype = torch.bfloat16
++    kv_cache = torch.empty(
++        num_blocks, num_kv_heads, block_size, 2 * head_size, dtype=dtype, device="cuda"
++    )
++    kv_cache.uniform_(-1, 1)
++    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_size, dim=-1)
++    assert key_cache.nelement() * key_cache.element_size() < 2**31
++    assert key_cache[-1].data_ptr() - kv_cache.data_ptr() >= 2**31
++
++    seq_lens = [(1, 1328), (4, 2011), (1, 37), (16, 523)]
++    query_lens = [x[0] for x in seq_lens]
++    kv_lens_list = [x[1] for x in seq_lens]
++    max_blocks = max((kv + block_size - 1) // block_size for kv in kv_lens_list)
++    # The blocks past 2 GiB, at the end of the cache.
++    block_tables = torch.arange(
++        num_blocks - len(seq_lens) * max_blocks,
++        num_blocks,
++        dtype=torch.int32,
++        device="cuda",
++    ).view(len(seq_lens), max_blocks)
++
++    query = torch.randn(
++        sum(query_lens), num_query_heads, head_size, dtype=dtype, device="cuda"
++    )
++    output = torch.empty_like(query)
++    cu_query_lens = torch.tensor(
++        [0] + query_lens, dtype=torch.int32, device="cuda"
++    ).cumsum(dim=0, dtype=torch.int32)
++    kv_lens = torch.tensor(kv_lens_list, dtype=torch.int32, device="cuda")
++    scale = head_size**-0.5
++    unified_attention(
++        q=query,
++        k=key_cache,
++        v=value_cache,
++        out=output,
++        cu_seqlens_q=cu_query_lens,
++        seqused_k=kv_lens,
++        max_seqlen_q=max(query_lens),
++        max_seqlen_k=max(kv_lens_list),
++        softmax_scale=scale,
++        causal=True,
++        window_size=(-1, -1),
++        block_table=block_tables,
++        softcap=0,
++        q_descale=None,
++        k_descale=None,
++        v_descale=None,
++        backend=backend,
++    )
++
++    # Give the reference only the blocks in use.
++    used = block_tables.flatten().long()
++    ref_output = ref_paged_attn(
++        query=query,
++        key_cache=key_cache[used].contiguous(),
++        value_cache=value_cache[used].contiguous(),
++        query_lens=query_lens,
++        kv_lens=kv_lens_list,
++        block_tables=torch.arange(used.numel()).view(block_tables.shape),
++        scale=scale,
++        out_dtype=dtype,
++    )
++    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
++
++
++def _spec_verify_seq_lens(batch: int, max_query_len: int, seed: int):
++    """Verify-step batch: mixed query lengths up to 1 + num_spec, mixed contexts."""
++    rng = random.Random(seed)
++    return [
++        (rng.randint(1, max_query_len), rng.randint(max_query_len + 1, 3000))
++        for _ in range(batch)
++    ]
++
++
++@pytest.mark.parametrize(
++    "path, sliding_window", [("3d", None), ("2d", None), ("2d", 256), ("auto", None)]
++)
++@pytest.mark.parametrize("batch, seed", [(7, 0), (31, 1), (61, 2), (128, 3)])
++@pytest.mark.parametrize("max_query_len", [4, 8])
++@pytest.mark.parametrize("num_heads", [(16, 2), (16, 4), (16, 8), (16, 16)])
++@pytest.mark.parametrize("head_size", [128, 256])
++@torch.inference_mode()
++def test_unified_attn_spec_verify_gfx1250(
++    path: str,
++    sliding_window: int | None,
++    batch: int,
++    seed: int,
++    max_query_len: int,
++    num_heads: tuple[int, int],
++    head_size: int,
++    monkeypatch,
++) -> None:
++    """Short multi-token queries (speculative-decode verify) on gfx1250: the 3D
++    split-KV kernel, where query rows of one block have different causal horizons
++    so a split segment can be partly or wholly past a row's horizon, and the 2D
++    kernel with a BLOCK_M sized to the query rows."""
++    if DEVICE_ARCH != "gfx1250":
++        pytest.skip("gfx1250 Gluon kernels")
++    if path != "auto":
++        monkeypatch.setattr(
++            sys.modules[unified_attention.__module__],
++            "use_2d_kernel",
++            lambda params, backend="triton": path == "2d",
++        )
++    torch.manual_seed(seed)
++    seq_lens = _spec_verify_seq_lens(batch, max_query_len, seed)
++    block_size = 16
++    (
++        query,
++        key_cache,
++        value_cache,
++        shuffled_key_cache,
++        shuffled_value_cache,
++        _sinks,
++        output,
++        cu_query_lens,
++        kv_lens,
++        max_seqlen_q,
++        max_kv_len,
++        scale,
++        window_size,
++        block_tables,
++        *_,
++    ) = generate_data(
++        seq_lens=seq_lens,
++        num_blocks=batch * (3000 // block_size + 1) + 64,
++        block_size=block_size,
++        head_size=head_size,
++        num_heads=num_heads,
++        sliding_window=sliding_window,
++        shuffled_kv_cache=True,
++        device="cuda",
++    )
++    unified_attention(
++        q=query,
++        k=shuffled_key_cache,
++        v=shuffled_value_cache,
++        out=output,
++        cu_seqlens_q=cu_query_lens,
++        seqused_k=kv_lens,
++        max_seqlen_q=max_seqlen_q,
++        max_seqlen_k=max_kv_len,
++        softmax_scale=scale,
++        causal=True,
++        window_size=window_size,
++        block_table=block_tables,
++        softcap=0,
++        q_descale=None,
++        k_descale=None,
++        v_descale=None,
++        sinks=None,
++        shuffled_kv_cache=True,
++    )
++    ref_output = ref_paged_attn(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=[q for q, _ in seq_lens],
++        kv_lens=kv_lens,
++        block_tables=block_tables,
++        scale=scale,
++        out_dtype=torch.bfloat16,
++        sliding_window=sliding_window,
++        soft_cap=None,
++        sinks=None,
++    )
++    assert not output.isnan().any()
++    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
