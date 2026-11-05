@@ -337,18 +337,6 @@ _DRAFT_TRITON_A16W16_GEMMS = ((24, 7168, 8192), (24, 8192, 3584))
 # Unpooler GEMM fused with the next FFN boundary's norms at decode / verify widths.
 _FUSED_UNPOOL_BOUNDARY = envs.SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY.get()
 _dense_tuned_logged: set = set()
-# MUSE_DENSE_DISPATCH_LOG=1 logs, once per (backend, N, K, M), which backend each replicated
-# pre-expert / post-expert projection GEMM takes. Graph capture runs this Python once per
-# captured width, so the server log lists the backend at every served decode and verify width.
-_DENSE_DISPATCH_LOG = os.environ.get("MUSE_DENSE_DISPATCH_LOG", "0") == "1"
-_dense_dispatch_logged: set = set()
-
-
-def _log_dense_dispatch(backend: str, x: torch.Tensor, linear: nn.Linear) -> None:
-    key = (backend, *linear.weight.shape, x.shape[0] if x.dim() == 2 else tuple(x.shape))
-    if key not in _dense_dispatch_logged:
-        _dense_dispatch_logged.add(key)
-        logger.info("Muse dense dispatch: backend=%s N=%s K=%s M=%s", *key)
 
 
 def _log_dense_tuned(kind: str, key) -> None:
@@ -406,12 +394,10 @@ def _aiter_tuned_moe_projections() -> frozenset:
     return frozenset(shapes)
 
 
-def _dense_linear_impl(
-    x: torch.Tensor, linear: nn.Linear, max_m: int
-) -> tuple[torch.Tensor, str]:
+def _dense_linear(x: torch.Tensor, linear: nn.Linear, max_m: int) -> torch.Tensor:
     tiled = getattr(linear, "small_m_tiled_weight", None)
     if tiled is not None and linear.bias is None and tiled_gemm_applies(x, tiled):
-        return tiled_gemm(x, tiled, *linear.weight.shape), "triton_tiled"
+        return tiled_gemm(x, tiled, *linear.weight.shape)
     if (
         _DENSE_TUNED
         and linear.bias is None
@@ -424,7 +410,7 @@ def _dense_linear_impl(
         and _get_tgemm()
     ):
         _log_dense_tuned("gemm", (*linear.weight.shape, x.shape[0]))
-        return _tgemm.mm(x, linear.weight, None, otype=torch.bfloat16), "aiter_tuned"
+        return _tgemm.mm(x, linear.weight, None, otype=torch.bfloat16)
     if (
         _USE_AITER_DENSE
         and linear.bias is None
@@ -433,15 +419,8 @@ def _dense_linear_impl(
         and 0 < x.shape[0] <= max_m
         and _get_tgemm()
     ):
-        return _tgemm.mm(x, linear.weight, None, otype=torch.bfloat16), "aiter_tgemm"
-    return linear(x), "hipblaslt_linear"
-
-
-def _dense_linear(x: torch.Tensor, linear: nn.Linear, max_m: int) -> torch.Tensor:
-    out, backend = _dense_linear_impl(x, linear, max_m)
-    if _DENSE_DISPATCH_LOG:
-        _log_dense_dispatch(backend, x, linear)
-    return out
+        return _tgemm.mm(x, linear.weight, None, otype=torch.bfloat16)
+    return linear(x)
 
 
 class MuseSpark1xRouter(nn.Module):
