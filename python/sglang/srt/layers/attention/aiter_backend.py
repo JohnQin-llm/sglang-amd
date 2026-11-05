@@ -101,6 +101,37 @@ from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
+# MUSE_PREFILL_ATTN_LOG=1 logs, once per (path, sliding window, prefix) key,
+# which kernel serves a prefill/extend attention call. Off by default; it only
+# reads Python state and never touches the tensors.
+_PREFILL_ATTN_LOG = os.environ.get("MUSE_PREFILL_ATTN_LOG", "0") == "1"
+_PREFILL_ATTN_SEEN: set = set()
+
+
+def _log_prefill_attn_path(path, layer, forward_batch, q):
+    if not _PREFILL_ATTN_LOG:
+        return
+    try:
+        if forward_batch.forward_mode.is_target_verify():
+            return
+        prefix = forward_batch.extend_prefix_lens_cpu
+        has_prefix = bool(prefix is not None and any(prefix))
+        swa = getattr(layer, "sliding_window_size", -1)
+        swa = swa is not None and swa > -1
+        key = (path, swa, has_prefix)
+        if key in _PREFILL_ATTN_SEEN:
+            return
+        _PREFILL_ATTN_SEEN.add(key)
+        logger.info(
+            "[PREFILL_ATTN] path=%s layer=%d sliding_window=%s has_prefix=%s "
+            "q_rows=%d q_heads=%d kv_heads=%d head_dim=%d mode=%s",
+            path, layer.layer_id, swa, has_prefix, q.shape[0],
+            layer.tp_q_head_num, layer.tp_k_head_num, layer.qk_head_dim,
+            forward_batch.forward_mode.name,
+        )
+    except Exception:  # instrumentation must never fail a forward
+        pass
+
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
@@ -3704,6 +3735,7 @@ class AiterAttnBackend(AttentionBackend):
         self.logits_soft_cap = layer.logit_cap
 
         if forward_batch.attn_attend_prefix_cache:
+            _log_prefill_attn_path("prefix_chunk", layer, forward_batch, q)
             return self._forward_extend_prefix_chunk(q, k, v, layer, forward_batch)
 
         cache_loc = (
@@ -4559,6 +4591,7 @@ class AiterAttnBackend(AttentionBackend):
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             if self.kv_cache_is_vectorized_5d:
+                _log_prefill_attn_path("vectorized_5d", layer, forward_batch, q)
                 return forward_extend_vectorized_5d(
                     self,
                     q,
@@ -4575,6 +4608,7 @@ class AiterAttnBackend(AttentionBackend):
                 # unified_attention has no head_dim cap; route extend through it
                 # so Gemma-4's 512-wide full-attention layers don't hit the CK
                 # `head dimension at most 256` assert.
+                _log_prefill_attn_path("triton_unified", layer, forward_batch, q)
                 return self._forward_extend_unified(
                     q,
                     layer,
@@ -4632,6 +4666,7 @@ class AiterAttnBackend(AttentionBackend):
                 v_cache = v_cache.view(-1, self.page_size, *v_cache.shape[-2:])
                 extra_kwargs["kv_last_page_lens"] = last_page_len[: bs0 - 1]
 
+            _log_prefill_attn_path("ck_mha_batch_prefill", layer, forward_batch, q)
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
