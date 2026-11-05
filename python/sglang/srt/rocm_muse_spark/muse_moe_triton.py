@@ -584,6 +584,17 @@ _LARGE_M_FP4 = dict(
 _LARGE_M_FP4_GFX1250 = dict(
     BLOCK_M=64, BLOCK_N=256, BLOCK_K=128, GROUP_M=8, num_warps=4, num_stages=2
 )
+# gfx1250 mid widths (concurrency-16 verify, 49..511 tokens), bit-identical to the mid tile:
+# two warps per 16x64 tile, M=80 0.278->0.257 ms, M=128 0.287->0.279, M=384 0.348->0.328
+# (probes/moe_mid/sweep2.json, CUDA-graph replay).
+_MID_M_FP4_GFX1250 = dict(
+    BLOCK_M=16, BLOCK_N=64, BLOCK_K=256, GROUP_M=1, num_warps=2, num_stages=2
+)
+# gfx1250 512..1024 tokens, bit-identical: M=640 0.529->0.421 ms, M=768 0.587->0.446,
+# M=1024 0.681 (large) ->0.576 (probes/moe_mid/sweep.json, sweep2.json).
+_MIDLARGE_M_FP4_GFX1250 = dict(
+    BLOCK_M=32, BLOCK_N=64, BLOCK_K=256, GROUP_M=4, num_warps=4, num_stages=2
+)
 CONFIG_TABLE_FP4 = {"small": _SMALL_M_FP4, "mid": _MID_M_FP4, "large": _LARGE_M_FP4}
 
 _GFX1250 = None
@@ -609,10 +620,16 @@ def _pick_config(M: int, topk: int, num_local: int, mxfp4: bool = False):
         return table["small"]
     # mid/large crossover measured on MI355X (32 local experts, K=I=4096, graph replay):
     # MXFP4 mid wins up to M=768 (rows 6144), BF16 mid only up to M=256 (rows 2048).
+    if mxfp4 and _is_gfx1250():
+        if rows <= 384:
+            return table["mid"]
+        if rows < 4096:
+            return _MID_M_FP4_GFX1250
+        if rows <= 8192:
+            return _MIDLARGE_M_FP4_GFX1250
+        return _LARGE_M_FP4_GFX1250
     if rows <= (6144 if mxfp4 else 2048):
         return table["mid"]
-    if mxfp4 and _is_gfx1250():
-        return _LARGE_M_FP4_GFX1250
     return table["large"]
 
 
