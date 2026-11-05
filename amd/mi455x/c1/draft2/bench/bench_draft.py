@@ -234,7 +234,12 @@ def bench_meta(args, res):
     mapping = torch.randint(-1, POOL, (POOL,), device=dev, dtype=torch.int64)
 
     def bufs(bs):
-        z = lambda n, dt: torch.full((n,), -7, device=dev, dtype=dt)
+        # poison everything but indptr[0], which the backend allocates zeroed and never rewrites
+        def z(n, dt):
+            t = torch.full((n,), -7, device=dev, dtype=dt)
+            t[0] = 0
+            return t
+
         return dict(qo=z(65, torch.int64), kv=z(65, torch.int32), kvi=z(64 * 400000, torch.int64),
                     wkv=z(65, torch.int32), wkvi=z(64 * W, torch.int64), woff=z(64, torch.int64),
                     mask=z(65, torch.int64))

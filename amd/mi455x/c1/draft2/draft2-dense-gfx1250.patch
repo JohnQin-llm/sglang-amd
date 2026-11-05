@@ -188,23 +188,217 @@ index 0000000000..c1c27f526d
 +        mask=v_dim_mask,
 +    )
 diff --git a/python/sglang/kernels/ops/gemm/gfx1250_decode_gemm.py b/python/sglang/kernels/ops/gemm/gfx1250_decode_gemm.py
-index d7bd6419e5..9cc5bf9d99 100644
+index d7bd6419e5..19e189ad11 100644
 --- a/python/sglang/kernels/ops/gemm/gfx1250_decode_gemm.py
 +++ b/python/sglang/kernels/ops/gemm/gfx1250_decode_gemm.py
-@@ -72,6 +72,8 @@ _TABLE = {
+@@ -72,6 +72,13 @@ _TABLE = {
      (2048, 8192, _BF16): _flydsl(32, 256, 2, 3, 16),  # conv kernel_projection: 5.2 vs 11.7 (hipBLASLt)
      (256, 8192, _BF16): _flydsl(16, 256, 1, 3, 16),  # selector hidden_projection: 3.5 vs 8.2 (hipBLASLt)
      (8192, 40960, _BF16): _gluon(16, 512, 1),  # fc over 5 target layers, M ~ 4: 42.7 vs 55.7 (hipBLASLt)
 +    # fc sharded by output rows (SGLANG_MUSE_DFLASH_FC_TP_SHARD): the replicated fc's kernel, same per-element sum
-+    (2048, 40960, _BF16): _gluon(16, 512, 1),
++    # (27.3 us cold); SGLANG_MUSE_DFLASH_FC_SHARD_SPLITK=1: split-K 16, 14.5 us cold, summation order differs
++    (2048, 40960, _BF16): (
++        _flydsl(32, 256, 2, 3, 16)
++        if os.environ.get("SGLANG_MUSE_DFLASH_FC_SHARD_SPLITK", "0") == "1"
++        else _gluon(16, 512, 1)
++    ),
  }
  
  
+diff --git a/python/sglang/kernels/ops/speculative/dflash_verify_meta.py b/python/sglang/kernels/ops/speculative/dflash_verify_meta.py
+new file mode 100644
+index 0000000000..5915af6bdf
+--- /dev/null
++++ b/python/sglang/kernels/ops/speculative/dflash_verify_meta.py
+@@ -0,0 +1,138 @@
++"""Target-verify attention metadata of the Triton backend (the DFlash draft runner) in one launch.
++
++``TritonAttnBackend._update_target_verify_buffers`` fills qo_indptr (arange), kv_indptr (cumsum) + the full kv_indices
++gather, the sliding-window lengths / indptr / start offsets + the window gather, and mask_indptr (cumsum) in ~15
++launches. This kernel writes the same integers: grid (bs, token blocks), every program recomputes the prefix sums it
++needs from the (few) sequence lengths, and the gathers are ``create_flashinfer_kv_indices_triton``'s loads.
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _gather_rows(
++    ids_ptr, row, row_stride, start, n, out_ptr, out_off, blk, num_blk, mapping_ptr,
++    ENTRY_PAGE_SIZE: tl.constexpr, HAS_MAPPING: tl.constexpr,
++):
++    BLOCK: tl.constexpr = 512
++    start = (start + n * 0).to(tl.int32)  # start may be a literal 0
++    n = n.to(tl.int32)
++    num_loop = tl.cdiv(n, BLOCK)
++    for i in range(blk, num_loop, num_blk):
++        offset = tl.arange(0, BLOCK).to(tl.int64) + i * BLOCK
++        mask = offset < n
++        if ENTRY_PAGE_SIZE == 1:
++            data = tl.load(ids_ptr + row * row_stride + start + offset, mask=mask)
++        else:
++            pos = start + offset
++            entry = tl.load(ids_ptr + row * row_stride + pos // ENTRY_PAGE_SIZE, mask=mask)
++            data = entry.to(tl.int64) * ENTRY_PAGE_SIZE + pos % ENTRY_PAGE_SIZE
++        if HAS_MAPPING:
++            data = tl.load(mapping_ptr + data, mask=mask & (data >= 0), other=-1)
++        tl.store(out_ptr + out_off + offset, data, mask=mask)
++
++
++@triton.jit
++def _dflash_verify_meta_kernel(
++    seq_lens_ptr,
++    bs,
++    tokens_per_req,
++    window,
++    full_ids_ptr,
++    full_rows_ptr,
++    full_row_stride,
++    win_ids_ptr,
++    win_rows_ptr,
++    win_row_stride,
++    win_mapping_ptr,
++    qo_indptr_ptr,
++    kv_indptr_ptr,
++    kv_indices_ptr,
++    win_indptr_ptr,
++    win_indices_ptr,
++    win_offsets_ptr,
++    mask_indptr_ptr,
++    BS_PAD: tl.constexpr,
++    FULL_PAGE: tl.constexpr,
++    WIN_PAGE: tl.constexpr,
++    HAS_MAPPING: tl.constexpr,
++    GATHER_FULL: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    blk = tl.program_id(1)
++    num_blk = tl.num_programs(1)
++    j = tl.arange(0, BS_PAD)
++    s_all = tl.load(seq_lens_ptr + j, mask=j < bs, other=0).to(tl.int64)
++    w_all = tl.minimum(s_all, window)
++    before = j < pid
++    upto = j <= pid
++    full_off = tl.sum(tl.where(before, s_all, 0), axis=0)
++    win_off = tl.sum(tl.where(before, w_all, 0), axis=0)
++    s = tl.load(seq_lens_ptr + pid).to(tl.int64)
++    wl = tl.minimum(s, window)
++    if blk == 0:
++        T = tokens_per_req.to(tl.int64)
++        tl.store(qo_indptr_ptr + pid, pid * T)
++        if pid == bs - 1:
++            tl.store(qo_indptr_ptr + bs, bs * T)
++        tl.store(kv_indptr_ptr + pid + 1, full_off + s)
++        tl.store(win_indptr_ptr + pid + 1, win_off + wl)
++        tl.store(win_offsets_ptr + pid, s - wl)
++        tl.store(mask_indptr_ptr + pid + 1, tl.sum(tl.where(upto, T * (s_all + T), 0), axis=0))
++    if GATHER_FULL:
++        row = tl.load(full_rows_ptr + pid).to(tl.int64)
++        _gather_rows(full_ids_ptr, row, full_row_stride, 0, s, kv_indices_ptr, full_off, blk, num_blk,
++                     win_mapping_ptr, FULL_PAGE, False)
++    row = tl.load(win_rows_ptr + pid).to(tl.int64)
++    _gather_rows(win_ids_ptr, row, win_row_stride, s - wl, wl, win_indices_ptr, win_off, blk, num_blk,
++                 win_mapping_ptr, WIN_PAGE, HAS_MAPPING)
++
++
++def dflash_verify_meta_(
++    *,
++    seq_lens: torch.Tensor,
++    tokens_per_req: int,
++    window: int,
++    full_src,
++    win_src,
++    win_mapping,
++    qo_indptr: torch.Tensor,
++    kv_indptr: torch.Tensor,
++    kv_indices: torch.Tensor,
++    win_indptr: torch.Tensor,
++    win_indices: torch.Tensor,
++    win_offsets: torch.Tensor,
++    mask_indptr: torch.Tensor,
++    gather_full: bool = True,
++    token_blocks: int = 16,
++) -> None:
++    """``full_src`` / ``win_src``: ``KVIndexTable``-like (ids, row_ids, row_stride, entry_page_size)."""
++    bs = int(seq_lens.numel())
++    _dflash_verify_meta_kernel[(bs, token_blocks)](
++        seq_lens,
++        bs,
++        tokens_per_req,
++        window,
++        full_src.ids,
++        full_src.row_ids,
++        full_src.row_stride,
++        win_src.ids,
++        win_src.row_ids,
++        win_src.row_stride,
++        win_mapping if win_mapping is not None else seq_lens,
++        qo_indptr,
++        kv_indptr,
++        kv_indices,
++        win_indptr,
++        win_indices,
++        win_offsets,
++        mask_indptr,
++        BS_PAD=max(16, triton.next_power_of_2(bs)),
++        FULL_PAGE=full_src.entry_page_size,
++        WIN_PAGE=win_src.entry_page_size,
++        HAS_MAPPING=win_mapping is not None,
++        GATHER_FULL=gather_full,
++        num_warps=4,
++    )
+diff --git a/python/sglang/srt/distributed/parallel_state.py b/python/sglang/srt/distributed/parallel_state.py
+index 2656bfc2e3..e5f50add4d 100644
+--- a/python/sglang/srt/distributed/parallel_state.py
++++ b/python/sglang/srt/distributed/parallel_state.py
+@@ -89,6 +89,23 @@ _is_musa = is_musa()
+ # the registered path makes peers read stale data over IPC on replay (garbage
+ # rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
+ _AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
++# gfx1250: all-reduces that take aiter's LL lane skip the copy into the registered pool.
++_AR_LL_DIRECT = os.environ.get("SGLANG_MUSE_AR_LL_DIRECT", "0") == "1"
++_AITER_LL_MAX_BYTES = 4 * 1024 * 1024  # kLLArMaxBytes in custom_all_reduce_gfx1250.cuh
++
++
++def _aiter_ll_route(ca_comm, input_: torch.Tensor) -> bool:
++    """True when aiter's gfx1250 all-reduce will run this input on its LL kernel, which never
++    dereferences peer input pointers (the same routing test as CustomAllreduce::allreduce)."""
++    nbytes = input_.numel() * input_.element_size()
++    return (
++        getattr(ca_comm, "_is_gfx1250", False)
++        and os.environ.get("AITER_CUSTOM_AR_DISABLE_LL", "") in ("", "0")
++        and getattr(ca_comm, "world_size", 0) in (2, 4)
++        and 0 < nbytes <= _AITER_LL_MAX_BYTES
++        and nbytes % 16 == 0
++        and input_.is_contiguous()
++    )
+ 
+ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+ 
+@@ -1040,7 +1057,15 @@ class GroupCoordinator:
+         assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
+         if outplace_all_reduce_method == "ca":
+             assert not ca_comm.disabled
+-            out = ca_comm.custom_all_reduce(input_)
++            if _AR_LL_DIRECT and _aiter_ll_route(ca_comm, input_):
++                # gfx1250 LL lane: the kernel reads the input on this rank only and pushes it
++                # to the peers' scratch, so the copy into the registered pool is not needed.
++                if ca_comm._IS_CAPTURING and not torch.cuda.is_current_stream_capturing():
++                    out = torch.zeros_like(input_)
++                else:
++                    out = ca_comm.all_reduce(input_, registered_input=True)
++            else:
++                out = ca_comm.custom_all_reduce(input_)
+         elif outplace_all_reduce_method == "qr":
+             assert not qr_comm.disabled
+             out = qr_comm.quick_all_reduce(input_)
 diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
-index 9b76ebaa27..cb6b986fce 100644
+index 9b76ebaa27..50331d1975 100644
 --- a/python/sglang/srt/environ.py
 +++ b/python/sglang/srt/environ.py
-@@ -2031,6 +2031,17 @@ class Envs:
+@@ -2031,6 +2031,24 @@ class Envs:
      SGLANG_MUSE_ATTN_V2 = EnvBool(False)
      # gfx1250 sliding-window verify kv split: 4 segments per CU, 32-token tiles.
      SGLANG_MUSE_SWA_CFG = EnvBool(False)
@@ -219,6 +413,13 @@ index 9b76ebaa27..cb6b986fce 100644
 +    # DFlash draft fc projection sharded by output rows across TP + all-gather
 +    # (replicated fc otherwise); same per-element GEMM, 3/4 of the weight freed.
 +    SGLANG_MUSE_DFLASH_FC_TP_SHARD = EnvBool(False)
++    # ... with a split-K kernel for the shard (faster, not bitwise vs the replicated fc).
++    SGLANG_MUSE_DFLASH_FC_SHARD_SPLITK = EnvBool(False)
++    # DFlash draft target-verify attention metadata (qo/kv/window/mask indptrs and the
++    # index gathers) in one kernel instead of ~15 launches; same integers.
++    SGLANG_MUSE_DFLASH_META_FUSE = EnvBool(False)
++    # ... and skip the full-attention kv_indices gather when every draft layer is sliding.
++    SGLANG_MUSE_DFLASH_META_SKIP_FULL = EnvBool(False)
      # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
      # registers (O projection, MoE pooler, DFlash draft MLP).
      SGLANG_MUSE_DENSE_TILED = EnvBool(True)
@@ -274,8 +475,114 @@ index 6afc825b16..d0a88d166d 100755
                          max_seqlen_q=self.forward_metadata.max_q_len,
                          max_seqlen_k=max_kv_len,
                          softmax_scale=layer.scaling,
+diff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py
+index 0e67b59e10..a213bc4210 100644
+--- a/python/sglang/srt/layers/attention/triton_backend.py
++++ b/python/sglang/srt/layers/attention/triton_backend.py
+@@ -423,6 +423,19 @@ class TritonAttnBackend(AttentionBackend):
+             and _is_hip
+             and envs.SGLANG_MUSE_DFLASH_SPLITKV.get()
+         )
++        self._dflash_meta_fuse = (
++            model_runner.is_draft_worker
++            and model_runner.spec_algorithm.is_dflash()
++            and envs.SGLANG_MUSE_DFLASH_META_FUSE.get()
++        )
++        # Every draft layer reads the window rail only: the full kv_indices gather is unused.
++        layer_types = getattr(model_runner.model_config.hf_config, "layer_types", None)
++        self._dflash_meta_skip_full = (
++            self._dflash_meta_fuse
++            and envs.SGLANG_MUSE_DFLASH_META_SKIP_FULL.get()
++            and bool(layer_types)
++            and all(t == "sliding_attention" for t in layer_types)
++        )
+ 
+         # Auto-detect BLOCK_M that extend_attention kernel will use for this model.
+         # This is used by the scheduler's tile-budget admission logic to match
+@@ -603,6 +616,69 @@ class TritonAttnBackend(AttentionBackend):
+             return self.target_verify_num_tokens_per_req
+         return spec_info.num_tokens_per_req
+ 
++    def _fused_target_verify_buffers(
++        self, plan, bs, seq_lens, spec_info, req_pool_indices, num_tokens_per_req
++    ):
++        """``_update_target_verify_buffers``'s integers from one kernel (the DFlash draft
++        runner, SGLANG_MUSE_DFLASH_META_FUSE); None when a precondition fails."""
++        if not (
++            self._dflash_meta_fuse
++            and self.dcp_size == 1
++            and self.sliding_window_size is not None
++            and self.sliding_window_size > 0
++            and 0 < bs <= 64
++            and (spec_info is None or spec_info.custom_mask is None)
++            and self.qo_indptr.dtype == torch.int64
++        ):
++            return None
++        tr = self.kv_index_translator
++        sources = []
++        for kind in (IdSpaceKind.FULL, tr.window_kv_kind):
++            if tr._reads_translated(kind) and not plan.has_read_table(kind, reader=tr):
++                return None
++            src = tr.read_source(plan, req_pool_indices=req_pool_indices, bs=bs, kind=kind)
++            if src.v2p is not None:
++                return None
++            sources.append(src)
++        full_src, win_src = sources
++        pool = self.token_to_kv_pool
++        mapping = pool.full_to_swa_index_mapping if isinstance(pool, SWAKVPool) else None
++        if mapping is not None and win_src.is_translated:
++            return None
++        if not (win_src.is_translated or mapping is not None) and isinstance(
++            pool, BaseSWAKVPool
++        ):
++            return None
++        from sglang.kernels.ops.speculative.dflash_verify_meta import dflash_verify_meta_
++
++        offsets = self.cuda_graph_window_kv_offsets
++        dflash_verify_meta_(
++            seq_lens=seq_lens[:bs],
++            tokens_per_req=num_tokens_per_req,
++            window=self.sliding_window_size,
++            full_src=full_src,
++            win_src=win_src,
++            win_mapping=mapping,
++            qo_indptr=self.qo_indptr,
++            kv_indptr=self.kv_indptr,
++            kv_indices=self.cuda_graph_kv_indices,
++            win_indptr=self.window_kv_indptr,
++            win_indices=self.cuda_graph_window_kv_indices,
++            win_offsets=offsets,
++            mask_indptr=self.mask_indptr,
++            gather_full=not self._dflash_meta_skip_full,
++        )
++        return (
++            self.qo_indptr[: bs + 1],
++            self.kv_indptr[: bs + 1],
++            None,
++            self.mask_indptr[: bs + 1],
++            self.window_kv_indptr[: bs + 1],
++            self.cuda_graph_window_kv_indices,
++            self.cuda_graph_window_num_kv_splits,
++            offsets,
++        )
++
+     def _update_target_verify_buffers(
+         self,
+         plan: KVLocPlan,
+@@ -613,6 +689,11 @@ class TritonAttnBackend(AttentionBackend):
+     ):
+         """Fill all cuda-graph buffers for target_verify mode."""
+         num_tokens_per_req = self._target_verify_num_tokens_per_req(spec_info)
++        fused = self._fused_target_verify_buffers(
++            plan, bs, seq_lens, spec_info, req_pool_indices, num_tokens_per_req
++        )
++        if fused is not None:
++            return fused
+         qo_indptr = self.qo_indptr[: bs + 1]
+         qo_indptr[: bs + 1] = torch.arange(
+             0,
 diff --git a/python/sglang/srt/models/dflash.py b/python/sglang/srt/models/dflash.py
-index 17f1182b90..5c9a69ecf5 100644
+index 17f1182b90..b892b0e650 100644
 --- a/python/sglang/srt/models/dflash.py
 +++ b/python/sglang/srt/models/dflash.py
 @@ -58,6 +58,7 @@ _DFLASH_KV_FP8_FUSE = envs.SGLANG_MUSE_DFLASH_KV_FP8_FUSE.get()
@@ -286,7 +593,7 @@ index 17f1182b90..5c9a69ecf5 100644
  if _is_npu:
      from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
  logger = logging.getLogger(__name__)
-@@ -995,10 +996,45 @@ class DFlashDraftModel(nn.Module):
+@@ -995,10 +996,46 @@ class DFlashDraftModel(nn.Module):
              )
          if self.quantizable:
              projected = self.fc(target_hidden)[0]
@@ -301,7 +608,8 @@ index 17f1182b90..5c9a69ecf5 100644
 +    def shard_fc_by_rows(self) -> bool:
 +        """Keep this TP rank's 1/tp of ``fc``'s output rows; project_target_hidden then
 +        all-gathers the column blocks. Each output element is the same GEMM as the
-+        replicated weight's; 3/4 of the weight is freed at TP4."""
++        replicated weight's (unless SGLANG_MUSE_DFLASH_FC_SHARD_SPLITK picks the split-K
++        kernel for the shard); 3/4 of the weight is freed at TP4."""
 +        from sglang.srt.distributed import (
 +            get_tensor_model_parallel_rank,
 +            get_tensor_model_parallel_world_size,
@@ -332,7 +640,7 @@ index 17f1182b90..5c9a69ecf5 100644
      @torch.no_grad()
      def forward(
          self,
-@@ -1156,6 +1192,9 @@ class DFlashDraftModel(nn.Module):
+@@ -1156,6 +1193,9 @@ class DFlashDraftModel(nn.Module):
                  weight_loader(param, loaded_weight)
                  loaded_params.add(resolved_name)
  
