@@ -526,6 +526,13 @@ class GroupCoordinator:
                     group=self.cpu_group,
                     device=self.device,
                 )
+                if _AITER_AR_GRAPH_ONLY and type(self.ca_comm).__module__.startswith(
+                    "aiter"
+                ):
+                    logger.info(
+                        "[AR] AITER graph-only gate on: aiter collectives run only "
+                        "inside CUDA graphs; eager calls go to RCCL"
+                    )
             except Exception as e:
                 logger.warning(
                     f"Setup Custom allreduce failed with {e}. To silence this "
