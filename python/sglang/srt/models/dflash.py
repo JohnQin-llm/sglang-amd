@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -16,6 +17,7 @@ from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -48,10 +50,14 @@ from sglang.srt.speculative.dflash_utils import (
     parse_dflash_draft_config,
 )
 from sglang.srt.utils import is_npu, set_weight_attrs
-from sglang.srt.utils.common import get_compiler_backend
+from sglang.srt.utils.common import get_compiler_backend, print_info_once
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
+_DFLASH_KV_FP8_FUSE = envs.SGLANG_MUSE_DFLASH_KV_FP8_FUSE.get()
+_DFLASH_PACKED_CANDIDATE_GATHER = envs.SGLANG_MUSE_DFLASH_PACKED_CANDIDATE_GATHER.get()
+_DFLASH_TRITON_TOPK = envs.SGLANG_MUSE_DFLASH_TRITON_TOPK.get()
+_DFLASH_CONV_NORM_FUSE = envs.SGLANG_MUSE_DFLASH_CONV_NORM_FUSE.get()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
@@ -147,10 +153,27 @@ def candidate_topk(
     lse = None
     if with_partition:
         vals, ids, lse = lilicorr_topk_lse(logits, k)
-    else:
+    elif not (_DFLASH_TRITON_TOPK and not tp and logits.is_cuda):
         vals, ids = _radix_topk(logits, k)
     if tp:
         return ids.long(), vals, lse
+    if _DFLASH_TRITON_TOPK and not with_partition and logits.is_cuda:
+        from sglang.kernels.ops.speculative.dflash_candidate_topk import (
+            local_topk_packed,
+            merge_gathered_topk,
+        )
+
+        packed = local_topk_packed(
+            logits, k, int(lm_head.shard_indices.org_vocab_start_index)
+        )
+        ids, vals = merge_gathered_topk(
+            tensor_model_parallel_all_gather(packed, dim=-1), k
+        )
+        return ids, vals, None
+    if _DFLASH_PACKED_CANDIDATE_GATHER and lse is None:
+        return _packed_candidate_gather(
+            vals, ids, int(lm_head.shard_indices.org_vocab_start_index), k
+        )
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
     gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
     gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
@@ -160,6 +183,24 @@ def candidate_topk(
             tensor_model_parallel_all_gather(lse.unsqueeze(-1), dim=-1), dim=-1
         )
     return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
+
+
+def _packed_candidate_gather(
+    vals: torch.Tensor, ids: torch.Tensor, vocab_start: int, k: int
+) -> Tuple[torch.Tensor, torch.Tensor, None]:
+    """candidate_topk's cross-rank merge with one all-gather: the FP32 values and the
+    int32 global ids (bit-cast to FP32) travel in one [N, 2K] row, so the ids take the
+    custom FP32 gather instead of an int64 NCCL one. Same ids and values."""
+    n = vals.shape[0]
+    packed = torch.cat(
+        (vals.float(), (ids.to(torch.int32) + vocab_start).view(torch.float32)), dim=-1
+    )
+    gathered = tensor_model_parallel_all_gather(packed, dim=-1)
+    tp = gathered.shape[-1] // (2 * k)
+    gathered_vals = gathered.view(n, tp, 2, k)[:, :, 0].reshape(n, tp * k)
+    gathered_ids = gathered.view(torch.int32).view(n, tp, 2, k)[:, :, 1].reshape(n, tp * k)
+    top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
+    return torch.gather(gathered_ids, -1, sel).long(), top_vals, None
 
 
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
@@ -376,24 +417,45 @@ class DFlashAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        save_kv_cache = True
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
         elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
-            from sglang.kernels.ops.attention.table_qk_norm_rope import (
-                table_qk_norm_rope_,
-            )
+            kv_dest = self._fp8_kv_dest(forward_batch, qkv)
+            if kv_dest is not None:
+                from sglang.kernels.ops.speculative.dflash_kv_fp8 import (
+                    table_qk_norm_rope_kv_,
+                )
 
-            table_qk_norm_rope_(
-                qkv,
-                positions,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                self.rotary_emb.cos_sin_cache,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.q_norm.variance_epsilon,
-            )
+                table_qk_norm_rope_kv_(
+                    qkv,
+                    positions,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.rotary_emb.cos_sin_cache,
+                    *kv_dest,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.q_norm.variance_epsilon,
+                )
+                save_kv_cache = False
+            else:
+                from sglang.kernels.ops.attention.table_qk_norm_rope import (
+                    table_qk_norm_rope_,
+                )
+
+                table_qk_norm_rope_(
+                    qkv,
+                    positions,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.rotary_emb.cos_sin_cache,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.q_norm.variance_epsilon,
+                )
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -402,14 +464,68 @@ class DFlashAttention(nn.Module):
         if self.v_scale is not None:
             v = v * self.v_scale
         if self.attention_sink_bias is None:
-            attn_output = self.attn(q, k, v, forward_batch)
+            attn_output = self.attn(
+                q, k, v, forward_batch, save_kv_cache=save_kv_cache
+            )
         else:
             attn_output = self.attn(
-                q, k, v, forward_batch, sinks=self.attention_sink_bias
+                q,
+                k,
+                v,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                sinks=self.attention_sink_bias,
             )
         attn_output = self.apply_attention_output(attn_output, hidden_states)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _fp8_kv_dest(self, forward_batch: ForwardBatch, qkv: torch.Tensor):
+        """(loc, k_cache, v_cache) when the backend's K/V store is a plain FP8 row write
+        that ``table_qk_norm_rope_kv_`` reproduces byte for byte; else None."""
+        if not _DFLASH_KV_FP8_FUSE or self.v_scale is not None:
+            return None
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+        from sglang.srt.mem_cache.memory_pool import (
+            KVWriteLoc,
+            MHATokenToKVPool,
+            unwrap_write_loc,
+        )
+        from sglang.srt.model_executor.forward_context import (
+            get_attn_backend,
+            get_token_to_kv_pool,
+        )
+
+        backend = get_attn_backend()
+        pool = get_token_to_kv_pool()
+        attn = self.attn
+        if (
+            not isinstance(backend, TritonAttnBackend)
+            or type(backend)._set_kv_buffer is not TritonAttnBackend._set_kv_buffer
+            or backend.dcp_size > 1
+            or type(pool) is not MHATokenToKVPool
+            or pool.dtype != torch.float8_e4m3fn
+            or pool.is_quantized_kv_cache
+            or pool.use_hnd
+            or pool.kv_cache_layout == "vectorized_5d"
+            or attn.k_scale is not None
+            or attn.v_scale is not None
+            or not forward_batch.forward_mode.is_target_verify()
+            or qkv.stride(1) != 1
+        ):
+            return None
+        loc_info = KVWriteLoc.for_batch(
+            forward_batch, swa_loc=backend.forward_metadata.swa_out_cache_loc
+        )
+        pool._check_physical_write_loc(loc_info, "DFlash fused FP8 K/V write")
+        loc = unwrap_write_loc(loc_info)[0]
+        if loc is None or loc.numel() != qkv.shape[0]:
+            return None
+        if attn.layer_id == 0:
+            print_info_once("DFlash draft: fused FP8 K/V write in QK-norm/RoPE")
+        return loc, pool.get_key_buffer(attn.layer_id), pool.get_value_buffer(
+            attn.layer_id
+        )
 
     def apply_attention_output(
         self, attn_output: torch.Tensor, hidden_states: torch.Tensor
@@ -569,6 +685,53 @@ class DFlashGroupedConv(nn.Module):
         return self._convolve(hidden_states, coefficients, side=1)
 
 
+def conv_then_add_norm(pending_conv, x, residual, norm: RMSNorm):
+    """``norm(conv.finish(x, coefficients) + residual)`` (conv skipped for None) as
+    (normed, new residual); one kernel where it reproduces the served pair."""
+    if pending_conv is None:
+        return norm(x, residual)
+    conv, coefficients = pending_conv
+    if (
+        _DFLASH_CONV_NORM_FUSE
+        and conv.taps == 2
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and residual.is_contiguous()
+        and residual.dtype == torch.bfloat16
+        and norm.weight.dtype == torch.bfloat16
+        and x.shape[-1] == 8192
+        and coefficients.stride(-1) == 1
+        and getattr(norm, "_forward_method", None) == norm.forward_aiter
+        and getattr(norm, "_fused_pad_kernel", None) is None
+        and _aiter_triton_rmsnorm()
+    ):
+        from sglang.kernels.ops.speculative.dflash_conv_norm import (
+            conv_out_add_rmsnorm,
+        )
+
+        return conv_out_add_rmsnorm(
+            x,
+            coefficients,
+            conv.base_kernel[1],
+            residual,
+            norm.weight.data,
+            norm.variance_epsilon,
+            conv.block_size,
+            conv.group_size,
+        )
+    return norm(conv.finish(x, coefficients), residual)
+
+
+@functools.cache
+def _aiter_triton_rmsnorm() -> bool:
+    # The fused kernel mirrors aiter's Triton add-RMSNorm, the gfx1250 pick of layernorm.py.
+    from sglang.srt.layers import layernorm
+
+    fn = getattr(layernorm, "fused_add_rms_norm", None)
+    return getattr(fn, "__module__", "").startswith("aiter.ops.triton")
+
+
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
@@ -608,19 +771,32 @@ class DFlashDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        pending_conv=None,
+        defer_mlp_conv: bool = False,
+    ):
+        """``pending_conv`` is the previous layer's deferred output-side conv
+        (conv, coefficients), applied with this layer's input norm. With
+        ``defer_mlp_conv`` the layer returns (hidden, residual, pending_conv),
+        leaving its own MLP-side conv to the next norm."""
         if hidden_states.numel() == 0:
             # Keep return types consistent for upstream callers.
             if residual is None:
                 residual = hidden_states
-            return hidden_states, residual
+            if pending_conv is not None:
+                hidden_states = pending_conv[0].finish(hidden_states, pending_conv[1])
+            return (hidden_states, residual, None) if defer_mlp_conv else (
+                hidden_states,
+                residual,
+            )
 
         # Pre-norm attention with fused residual+norm when possible (Qwen3-style).
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = conv_then_add_norm(
+                pending_conv, hidden_states, residual, self.input_layernorm
+            )
 
         attention_kernel = None
         if self.attention_conv is not None:
@@ -631,15 +807,23 @@ class DFlashDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        if attention_kernel is not None:
-            attn_out = self.attention_conv.finish(attn_out, attention_kernel)
-
-        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+        hidden_states, residual = conv_then_add_norm(
+            None if attention_kernel is None else (self.attention_conv, attention_kernel),
+            attn_out,
+            residual,
+            self.post_attention_layernorm,
+        )
 
         mlp_kernel = None
         if self.mlp_conv is not None:
             hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if defer_mlp_conv:
+            return (
+                hidden_states,
+                residual,
+                None if mlp_kernel is None else (self.mlp_conv, mlp_kernel),
+            )
         if mlp_kernel is not None:
             hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         return hidden_states, residual
@@ -838,16 +1022,33 @@ class DFlashDraftModel(nn.Module):
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
+        pending_conv = None
         for layer in self.layers:
-            hidden_states, residual = layer(
-                positions, hidden_states, forward_batch, residual
-            )
+            if _DFLASH_CONV_NORM_FUSE:
+                hidden_states, residual, pending_conv = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    pending_conv=pending_conv,
+                    defer_mlp_conv=True,
+                )
+            else:
+                hidden_states, residual = layer(
+                    positions, hidden_states, forward_batch, residual
+                )
 
         if hidden_states.numel() != 0:
             if residual is None:
+                if pending_conv is not None:
+                    hidden_states = pending_conv[0].finish(
+                        hidden_states, pending_conv[1]
+                    )
                 hidden_states = self.norm(hidden_states)
             else:
-                hidden_states, _ = self.norm(hidden_states, residual)
+                hidden_states, _ = conv_then_add_norm(
+                    pending_conv, hidden_states, residual, self.norm
+                )
 
         return LogitsProcessorOutput(
             next_token_logits=None,

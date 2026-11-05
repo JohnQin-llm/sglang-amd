@@ -335,7 +335,7 @@ def _report(runner: K2Runner, period: float) -> None:
                     with torch.cuda.stream(stream):
                         hh.copy_(runner.rt.health, non_blocking=True)
                     stream.synchronize()
-                    waits = dbg.given_up_waits(hh, runner.k2.REGIONS)
+                    waits = dbg.given_up_waits(hh, runner.ops.k2.REGIONS)
                     logger.error("K2 gfx1250: rank 0 give-up records (%d CTAs), first 16:\n  %s", len(waits),
                                  "\n  ".join(waits[:16]))
                 except Exception as ex:  # reporting only
@@ -372,7 +372,7 @@ def _report_rank(runner: K2Runner, rank: int, period: float) -> None:
                 with torch.cuda.stream(stream):
                     hh.copy_(runner.rt.health, non_blocking=True)
                 stream.synchronize()
-                waits = dbg.given_up_waits(hh, runner.k2.REGIONS)
+                waits = dbg.given_up_waits(hh, runner.ops.k2.REGIONS)
                 logger.error("K2 gfx1250 rank %d: FAILED at epoch %d; %d CTAs gave up; first 12:\n  %s", rank, ep,
                              len(waits), "\n  ".join(waits[:12]))
                 return
