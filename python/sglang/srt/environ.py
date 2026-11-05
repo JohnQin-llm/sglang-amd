@@ -2022,6 +2022,15 @@ class Envs:
     SGLANG_MUSE_DFLASH_TRITON_TOPK = EnvBool(False)
     # DFlash output-side grouped conv + residual add + RMSNorm in one kernel.
     SGLANG_MUSE_DFLASH_CONV_NORM_FUSE = EnvBool(False)
+    # TP4 fused QKV projection (<= 16 rows): split-K partials from AITER's gfx1250
+    # gluon TDM batched GEMM (Triton num_stages 4 if unavailable); same bytes.
+    SGLANG_MUSE_QKV_TDM = EnvBool(False)
+    # Fused QKV epilogue on grid (m, hq + hk): K / V / cache in their own programs.
+    SGLANG_MUSE_QKV_SPLIT_EPI = EnvBool(False)
+    # gfx1250 full-attention verify split on attn_v2_split (one sequence, <= 8 rows).
+    SGLANG_MUSE_ATTN_V2 = EnvBool(False)
+    # gfx1250 sliding-window verify kv split: 4 segments per CU, 32-token tiles.
+    SGLANG_MUSE_SWA_CFG = EnvBool(False)
     # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
     # registers (O projection, MoE pooler, DFlash draft MLP).
     SGLANG_MUSE_DENSE_TILED = EnvBool(True)
