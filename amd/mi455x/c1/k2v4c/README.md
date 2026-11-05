@@ -528,3 +528,6 @@ caches) equal on every rank for k2v4b, k2v4c pf off and pf on, every layer and m
 | k2v4c pf on | 0 / 108 (nu = 63 incl.) | 480,000 (6 nu = 63 injected) | **0** | equal on 29,990 x 16 steps and all 108 sweep cases |
 | k2v4c pf off | 0 / 108 | 96,000 (2 injected) | 0 | equal on 5,997 x 16 and all 108 |
 Step p50 22.44 ms (pf on) / 22.47 ms (off), no step > +1 ms.
+
+k2v4b span trials 2 / 3 and the side checks (sleep 32 everywhere, UGW=16, FAST_POLLS=64, sticky window) are in
+`../k2v4b/README.md` (sections "Span trials 2 ..." and "Side checks ..."); k2v4b is frozen as `../k2v4b_land1`.
