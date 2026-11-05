@@ -91,6 +91,22 @@ _is_musa = is_musa()
 # rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
 _AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
 
+# Serve the aiter custom collectives (all-reduce, fused all-reduce + RMSNorm,
+# reduce-scatter, all-gather) only while aiter's graph-capture context is open,
+# so they run inside captured CUDA graphs and nowhere else. Every eager call
+# (prefill, extend) falls through to RCCL. On gfx1250 aiter collectives issued
+# eagerly could overlap graph replays on another stream and hang the GPU.
+_AITER_AR_GRAPH_ONLY = os.environ.get("SGLANG_AITER_AR_GRAPH_ONLY", "0") == "1"
+
+
+def _ca_eager_blocked(ca_comm) -> bool:
+    """True when the graph-only gate forbids this (eager) aiter collective."""
+    if not _AITER_AR_GRAPH_ONLY or ca_comm is None:
+        return False
+    if not type(ca_comm).__module__.startswith("aiter"):
+        return False
+    return not getattr(ca_comm, "_IS_CAPTURING", False)
+
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 # use int value instead of ReduceOp.SUM to support torch compile
@@ -766,6 +782,7 @@ class GroupCoordinator:
         should_use_custom_allreduce = (
             self.ca_comm is not None
             and not self.ca_comm.disabled
+            and not _ca_eager_blocked(self.ca_comm)
             and self.ca_comm.should_custom_ar(input_)
         )
         if (
@@ -835,6 +852,8 @@ class GroupCoordinator:
         """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if _ca_eager_blocked(ca_comm):
             return None
 
         # Prefer communicator-native fused API when provided.
@@ -977,6 +996,7 @@ class GroupCoordinator:
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and not should_use_pymscclpp_allreduce
+            and not _ca_eager_blocked(self.ca_comm)
             and self.ca_comm.should_custom_ar(input_)
         ):
             return "ca"
@@ -1198,6 +1218,8 @@ class GroupCoordinator:
         ):
             return False
         ca_comm = self.ca_comm
+        if _ca_eager_blocked(ca_comm):
+            return False
         # input is the full (pre-reduce) buffer; should_custom_ar bounds its size.
         if not ca_comm.should_custom_ar(input):
             return False
@@ -1315,6 +1337,7 @@ class GroupCoordinator:
             is_hip()
             and envs.SGLANG_USE_AITER_AG.get()
             and self._has_aiter_custom_all_gather()
+            and not _ca_eager_blocked(ca_comm)
             and input.is_contiguous()
             and output.is_contiguous()
             and input.dtype in (torch.float32, torch.float16, torch.bfloat16)
