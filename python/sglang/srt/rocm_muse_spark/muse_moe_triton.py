@@ -576,7 +576,30 @@ _MID_M_FP4 = dict(
 _LARGE_M_FP4 = dict(
     BLOCK_M=64, BLOCK_N=64, BLOCK_K=128, GROUP_M=8, num_warps=4, num_stages=2
 )  # M=1024 564->485us
+
+
+# gfx1250 (MI455X), one expert parallel 4 rank (64 local experts, K = I = H = 4096), output
+# bit-identical to the 64x64 tile: M=2048 0.965->0.853 ms, M=4096 1.659->1.458,
+# M=8192 2.902->2.484, M=16384 5.409->4.593 (probes/moe_large/crossover.json); M=1024 ties.
+_LARGE_M_FP4_GFX1250 = dict(
+    BLOCK_M=64, BLOCK_N=256, BLOCK_K=128, GROUP_M=8, num_warps=4, num_stages=2
+)
 CONFIG_TABLE_FP4 = {"small": _SMALL_M_FP4, "mid": _MID_M_FP4, "large": _LARGE_M_FP4}
+
+_GFX1250 = None
+
+
+def _is_gfx1250() -> bool:
+    # Resolved lazily on the first launch, so importing this module never initialises the GPU.
+    global _GFX1250
+    if _GFX1250 is None:
+        try:
+            _GFX1250 = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).gcnArchName.startswith("gfx1250")
+        except Exception:
+            _GFX1250 = False
+    return _GFX1250
 
 
 def _pick_config(M: int, topk: int, num_local: int, mxfp4: bool = False):
@@ -588,6 +611,8 @@ def _pick_config(M: int, topk: int, num_local: int, mxfp4: bool = False):
     # MXFP4 mid wins up to M=768 (rows 6144), BF16 mid only up to M=256 (rows 2048).
     if rows <= (6144 if mxfp4 else 2048):
         return table["mid"]
+    if mxfp4 and _is_gfx1250():
+        return _LARGE_M_FP4_GFX1250
     return table["large"]
 
 
