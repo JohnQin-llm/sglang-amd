@@ -60,12 +60,6 @@ try:
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
-    from sglang.srt.rocm_muse_spark.verify_attention import (
-        install as install_muse_verify_attention,
-    )
-
-    install_muse_verify_attention()
-
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
         asm_verify_attn_enabled,
         reset_verify_attn_plan_cache,

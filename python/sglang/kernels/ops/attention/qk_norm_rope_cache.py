@@ -10,31 +10,11 @@ The BF16 round trips of the unfused sequence (norm output, query scaling, RoPE p
 are explicit, so the results match the separate norm / RoPE / cache-write kernels.
 """
 
-import logging
-import os
-
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.ops.gemm.bf16_splitk_gemm import _dense_partial
-
-logger = logging.getLogger(__name__)
-
-# TP4 projection at split-K 8 (<= 16 rows): FP32 partials from AITER's gfx1250 gluon TDM batched GEMM (falls back
-# to the Triton partials at num_stages 4 when the gluon kernel is unavailable). Same K slices, same bytes.
-QKV_TDM = os.environ.get("SGLANG_MUSE_QKV_TDM", "0") == "1"
-# Epilogue grid (m, hq + hk): K / V / cache rows get their own programs instead of riding on Q heads.
-QKV_SPLIT_EPI = os.environ.get("SGLANG_MUSE_QKV_SPLIT_EPI", "0") == "1"
-_TDM_CFG = (32, 128, 3, 2)  # block N, block K, buffers, warps
-_tdm_kernel = None  # (kernel, layouts) once built, False when the gluon kernel is unavailable
-_live = set()
-
-
-def _note_live(name: str) -> None:
-    if name not in _live:
-        _live.add(name)
-        logger.info("Muse QKV projection: %s live", name)
 
 
 @triton.jit
@@ -187,107 +167,6 @@ def _qkv_epilogue(
                 offset = slot * HK * D + kh * D + d
                 tl.store(KC + offset, k.to(tl.float32) / tl.load(KS))
                 tl.store(VC + offset, v.to(tl.float32) / tl.load(VS))
-
-
-@triton.jit
-def _qkv_epilogue_split(
-    P,
-    POS,
-    COS,
-    LOC,
-    MAP,
-    KC,
-    VC,
-    QO,
-    KO,
-    VO,
-    GO,
-    KS,
-    VS,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    SK: tl.constexpr,
-    HQ: tl.constexpr,
-    HK: tl.constexpr,
-    D: tl.constexpr,
-    EPS: tl.constexpr,
-    SCALE: tl.constexpr,
-    ROPE: tl.constexpr,
-    HAS_MAP: tl.constexpr,
-    COS_STRIDE: tl.constexpr,
-):
-    """``_qkv_epilogue`` on grid (M, HQ + HK), same per-element math: programs head < HQ do gate + Q, programs
-    HQ + kh do K, V and the cache write of KV head kh."""
-    token, head = tl.program_id(0), tl.program_id(1)
-    d = tl.arange(0, D)
-    if head < HQ:
-        gate = _project_slice(P, token, (HQ + 2 * HK) * D + head * D, M, N, SK, D)
-        tl.store(GO + token * HQ * D + head * D + d, gate)
-        q = _project_slice(P, token, head * D, M, N, SK, D)
-        q = _norm_rope(q, COS, POS, EPS, SCALE, D, ROPE, True, COS_STRIDE)
-        tl.store(QO + token * HQ * D + head * D + d, q)
-    else:
-        kh = head - HQ
-        k = _project_slice(P, token, HQ * D + kh * D, M, N, SK, D)
-        v = _project_slice(P, token, (HQ + HK) * D + kh * D, M, N, SK, D)
-        k = _norm_rope(k, COS, POS, EPS, 1.0, D, ROPE, False, COS_STRIDE)
-        tl.store(KO + token * HK * D + kh * D + d, k)
-        tl.store(VO + token * HK * D + kh * D + d, v)
-        slot = tl.load(LOC + token).to(tl.int64)
-        if slot >= 0:
-            if HAS_MAP:
-                slot = tl.load(MAP + slot).to(tl.int64)
-            if slot >= 0:
-                offset = slot * HK * D + kh * D + d
-                tl.store(KC + offset, k.to(tl.float32) / tl.load(KS))
-                tl.store(VC + offset, v.to(tl.float32) / tl.load(VS))
-
-
-def _gluon_tdm_kernel():
-    """AITER's gfx1250 gluon TDM batched GEMM and its layouts for ``_TDM_CFG``, or None if unavailable."""
-    global _tdm_kernel
-    if _tdm_kernel is None:
-        try:
-            from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_a16w16 import (
-                create_shared_layouts,
-                create_wmma_layouts,
-            )
-            from aiter.ops.triton._gluon_kernels.gfx1250.gemm.batched.batched_gemm_bf16 import (
-                _KERNEL_MAP,
-            )
-
-            block_n, block_k, _, warps = _TDM_CFG
-            _tdm_kernel = (
-                _KERNEL_MAP["bandwidth_bound"],
-                create_wmma_layouts(warps),
-                create_shared_layouts(16, block_n, block_k, "TN", 16),
-            )
-        except Exception as ex:  # noqa: BLE001
-            logger.warning("Muse QKV projection: gluon TDM GEMM unavailable (%s); Triton partials", ex)
-            _tdm_kernel = False
-    return _tdm_kernel or None
-
-
-def _tdm_partials(x, weight, partials, m, n, k, split_k) -> bool:
-    built = _gluon_tdm_kernel()
-    if built is None:
-        return False
-    kern, (wmma, opa, opb), (sha, shb) = built
-    block_n, block_k, buffers, warps = _TDM_CFG
-    xq, wq = x.view(1, m, k), weight.view(1, n, k).transpose(1, 2)
-    pv = partials.view(split_k, 1, m, n)
-    split = k // split_k
-    kern[(1, split_k * triton.cdiv(m, 16) * (n // block_n))](
-        xq, wq, pv, None, m, n, k,
-        xq.stride(0), xq.stride(1), xq.stride(2), wq.stride(0), wq.stride(1), wq.stride(2),
-        pv.stride(1), pv.stride(2), pv.stride(3), pv.stride(0), 0,
-        BLOCK_M=16, BLOCK_N=block_n, BLOCK_K=block_k, NUM_BUFFERS=min(buffers, split // block_k), LAYOUT="TN",
-        SHARED_LAYOUT_A=sha, SHARED_LAYOUT_B=shb, WMMA_LAYOUT=wmma, OPERAND_LAYOUT_A=opa,
-        OPERAND_LAYOUT_B=opb, ADD_BIAS=False, NUM_KSPLIT=split_k, SPLITK_BLOCK_SIZE=split, num_warps=warps,
-        waves_per_eu=0, cache_modifier=".cg",
-    )
-    _note_live("gluon TDM split-K partials (BN 32, BK 128, split-K 8, 3 buffers, 2 warps)")
-    return True
 
 
 @triton.jit
@@ -518,36 +397,27 @@ def qkv_proj_qk_norm_rope_cache(
     assert cache_k.dtype == cache_v.dtype == torch.float8_e4m3fn
     assert cache_k.is_contiguous() and cache_v.is_contiguous()
     partials = torch.empty((split_k, m, n), device=x.device, dtype=torch.float32)
-    tdm = QKV_TDM and hq == 32 and split_k == 8 and block_m == 16
-    if not (tdm and _tdm_partials(x, weight, partials, m, n, k, split_k)):
-        if tdm:
-            _note_live("Triton split-K partials at num_stages 4")
-        _dense_partial[(n // block_n, triton.cdiv(m, block_m), split_k)](
-            x,
-            weight,
-            partials,
-            m,
-            n,
-            k,
-            block_m,
-            block_n,
-            128,
-            split_k,
-            ".cg",
-            num_warps=warps,
-            num_stages=4 if tdm else 2,
-            matrix_instr_nonkdim=16,
-        )
+    _dense_partial[(n // block_n, triton.cdiv(m, block_m), split_k)](
+        x,
+        weight,
+        partials,
+        m,
+        n,
+        k,
+        block_m,
+        block_n,
+        128,
+        split_k,
+        ".cg",
+        num_warps=warps,
+        num_stages=2,
+        matrix_instr_nonkdim=16,
+    )
     qo = torch.empty((m, hq * 64), device=x.device, dtype=torch.bfloat16)
     ko = torch.empty((m, hk * 64), device=x.device, dtype=torch.bfloat16)
     vo = torch.empty_like(ko)
     go = torch.empty_like(qo)
-    if QKV_SPLIT_EPI:
-        _note_live("split epilogue (grid m x (hq + hk))")
-        epilogue, grid = _qkv_epilogue_split, (m, hq + hk)
-    else:
-        epilogue, grid = _qkv_epilogue, (m, hq)
-    epilogue[grid](
+    _qkv_epilogue[(m, hq)](
         partials,
         positions,
         cos_sin,

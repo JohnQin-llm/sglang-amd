@@ -580,7 +580,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
         self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
-        self._ctx_kv_commit_fp8_op = False
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -2065,54 +2064,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn.v_scale,
                 )
 
-        write_all_kv = None
-        if ctx_cache_loc_2d is not None and commit_lens is not None:
-            commit = self._ctx_kv_commit_fp8()
-            if commit is not None:
-
-                def write_all_kv(cache_k: torch.Tensor, cache_v: torch.Tensor) -> None:
-                    commit(cache_k, cache_v, ctx_cache_loc_2d, commit_lens)
-
         self._fused_kv_helper.materialize(
             ctx_hidden=ctx_hidden,
             positions=ctx_positions,
             write_layer_kv=_write_layer_kv,
-            write_all_kv=write_all_kv,
         )
-
-    def _ctx_kv_commit_fp8(self):
-        """The one-launch FP8 prefix-valid commit over all draft layers, or None where
-        ``set_kv_buffer_prefix_valid``'s eager cast + tiled store is not what it reproduces."""
-        commit = getattr(self, "_ctx_kv_commit_fp8_op", False)
-        if commit is not False:
-            return commit
-        commit = None
-        if envs.SGLANG_MUSE_DFLASH_KV_FP8_FUSE.get():
-            from sglang.kernels.ops.speculative.dflash_kv_fp8 import CtxKVCommitFP8
-            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-
-            pool = self.draft_model_runner.token_to_kv_pool
-            attns = [layer.self_attn.attn for layer in self.draft_model.layers]
-            if (
-                (is_cuda() or is_hip())
-                and type(pool) is MHATokenToKVPool
-                and pool.dtype == torch.float8_e4m3fn
-                and not pool.is_quantized_kv_cache
-                and not pool.use_hnd
-                and pool.kv_cache_layout != "vectorized_5d"
-                and pool.v_row_dim == pool.row_dim
-                and all(a.k_scale is None and a.v_scale is None for a in attns)
-            ):
-                try:
-                    commit = CtxKVCommitFP8(
-                        [pool.get_key_buffer(a.layer_id) for a in attns],
-                        [pool.get_value_buffer(a.layer_id) for a in attns],
-                    )
-                    logger.info("DFlash draft: one-launch FP8 context KV commit")
-                except ValueError as e:
-                    logger.warning("DFlash FP8 context KV commit off: %s", e)
-        self._ctx_kv_commit_fp8_op = commit
-        return commit
 
     def _update_target_mamba_state_after_verify(
         self,
