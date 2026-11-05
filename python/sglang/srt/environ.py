@@ -2011,6 +2011,17 @@ class Envs:
     )
     # DFlash draft block attention to its sliding window on the split-KV kernel.
     SGLANG_MUSE_DFLASH_SPLITKV = EnvBool(False)
+    # DFlash draft FP8 KV writes in one kernel: QK-norm/RoPE + K/V store per draft
+    # layer, and the context commit of all draft layers (bitwise equal bytes).
+    SGLANG_MUSE_DFLASH_KV_FP8_FUSE = EnvBool(False)
+    # DFlash candidate top-k merge: values and ids in one custom FP32 all-gather
+    # (the int64 id gather otherwise goes to NCCL).
+    SGLANG_MUSE_DFLASH_PACKED_CANDIDATE_GATHER = EnvBool(False)
+    # DFlash candidate top-k (TP > 1) as split top-k + packed gather + merge in
+    # three Triton launches instead of torch's radix top-k and two gathers.
+    SGLANG_MUSE_DFLASH_TRITON_TOPK = EnvBool(False)
+    # DFlash output-side grouped conv + residual add + RMSNorm in one kernel.
+    SGLANG_MUSE_DFLASH_CONV_NORM_FUSE = EnvBool(False)
     # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
     # registers (O projection, MoE pooler, DFlash draft MLP).
     SGLANG_MUSE_DENSE_TILED = EnvBool(True)
