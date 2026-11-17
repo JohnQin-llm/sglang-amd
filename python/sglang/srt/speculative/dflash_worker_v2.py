@@ -434,23 +434,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
-        # Tree verify: the target sees K candidates and Q nodes, the drafter one F-wide block.
         self.tree_mode = int(get_spec().speculative_eagle_topk or 1) > 1
-        draft_spec = (
-            get_spec().override(
-                speculative_num_draft_tokens=int(
-                    get_spec().speculative_dflash_block_size
-                ),
-                speculative_eagle_topk=1,
-                speculative_num_steps=1,
-            )
-            if self.tree_mode
-            else contextlib.nullcontext()
-        )
         with (
             draft_pp_context(),
             draft_tp_context(self.draft_parallel_layout),
-            draft_spec,
+            self._draft_spec_context(),
         ):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
@@ -731,11 +719,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             "update_mamba_state_after_mtp_verify",
         )
 
+    def _draft_spec_context(self):
+        """Tree verify: the target sees K candidates and Q nodes, but the drafter, its
+        backend and its graphs always run one F-wide chain block."""
+        if not self.tree_mode:
+            return contextlib.nullcontext()
+        return get_spec().override(
+            speculative_num_draft_tokens=int(get_spec().speculative_dflash_block_size),
+            speculative_eagle_topk=1,
+            speculative_num_steps=1,
+        )
+
     def init_cuda_graphs(self):
         target_dp_enabled = get_parallel().attn_dp_enabled
         with (
             draft_pp_context(),
             draft_tp_context(self.draft_parallel_layout),
+            self._draft_spec_context(),
         ):
             capture_decode_cuda_graph = (
                 get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
@@ -2810,6 +2810,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         with (
             torch.inference_mode(),
             draft_tp_context(self.draft_parallel_layout),
+            self._draft_spec_context(),
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output

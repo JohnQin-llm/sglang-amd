@@ -2049,9 +2049,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def get_spec_info(self, num_tokens: int, ragged_verify_layout=None):
         spec_info = None
+        # DFLASH tree verify runs the target through EAGLE's tree path.
+        dflash_tree_target = (
+            self.model_runner.spec_algorithm.is_dflash_family()
+            and not self.model_runner.is_draft_worker
+            and int(get_spec().speculative_eagle_topk or 1) > 1
+        )
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or dflash_tree_target
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 

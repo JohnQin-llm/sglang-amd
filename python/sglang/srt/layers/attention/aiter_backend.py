@@ -589,10 +589,13 @@ class AiterAttnBackend(AttentionBackend):
         # mask reduces to pure causal and can go through unified_attention
         # instead of the legacy triton extend_attention_fwd. Gated on non-MLA
         # (MLA has its own verify path) and env var for opt-out.
+        # The target backend is built with the default topk=1, so the verify tree width
+        # comes from the spec config; unified attention cannot apply a tree mask.
         self._use_unified_verify = (
             self.use_triton_unified_attention
             and not self.use_mla
             and self.topk == 1
+            and int(get_spec().speculative_eagle_topk or 1) <= 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
 
