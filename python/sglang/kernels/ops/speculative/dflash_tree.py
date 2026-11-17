@@ -168,6 +168,48 @@ def build_dflash_tree_proposal(
     ``cond_log_probs`` is ``[B, L, K, K]``: the log-probability of candidate rank ``r`` at
     depth ``d`` after the candidate of rank ``p`` at depth ``d - 1``. Depth 0 ignores ``p``.
     """
+    return _build_best_first_tree(
+        candidate_ids, cond_log_probs, max_nodes=max_nodes, workspace=workspace
+    )[0]
+
+
+@torch.inference_mode()
+def build_dflash_greedy_tree_proposal(
+    candidate_ids: Tensor,
+    cond_log_probs: Tensor,
+    *,
+    max_nodes: int,
+    workspace: dict[str, Tensor] | None = None,
+) -> tuple[DFlashTreeProposal, Tensor, Tensor]:
+    """The best-first tree with ``build_dflash_sampled_tree_proposal``'s node drafts, for
+    greedy rows in a batch that verifies sampled trees: each node's K child candidates
+    with a uniform q.
+
+    Against a greedy row's one-hot target, multi-draft verification accepts a child iff
+    it is the argmax, as greedy verification does, for any q > 0 on the drafted children.
+    A uniform q keeps the verifiers' without-replacement renormalization exact; the
+    selector's q can lose the undrawn mass of a peaked node to float32 cancellation.
+    """
+    proposal, node_depths = _build_best_first_tree(
+        candidate_ids, cond_log_probs, max_nodes=max_nodes, workspace=workspace
+    )
+    batch_size, num_depths, candidate_top_k = candidate_ids.shape
+    rows = torch.arange(batch_size, device=candidate_ids.device)[:, None]
+    depths = node_depths.long().clamp(max=num_depths - 1)
+    node_draft_tokens = candidate_ids[rows, depths]
+    has_children = (node_depths < num_depths).unsqueeze(-1).float()
+    node_draft_probs = has_children.expand(-1, -1, candidate_top_k) / candidate_top_k
+    return proposal, node_draft_tokens, node_draft_probs
+
+
+def _build_best_first_tree(
+    candidate_ids: Tensor,
+    cond_log_probs: Tensor,
+    *,
+    max_nodes: int,
+    workspace: dict[str, Tensor] | None,
+) -> tuple[DFlashTreeProposal, Tensor]:
+    """The proposal and each node's depth ``[B, Q]``, 0 at the root."""
     batch_size, num_depths, candidate_top_k = candidate_ids.shape
     if cond_log_probs.shape != (
         batch_size,
@@ -204,13 +246,14 @@ def build_dflash_tree_proposal(
     selected_edges = buffer("top_scores_index", edge_shape, torch.long)
     parent_list = buffer("parent_list", (batch_size, parent_width), torch.long)
     search_shape = (batch_size, max_nodes)
+    search_depths = buffer("search_depths", search_shape, torch.int32)
     _build_dflash_tree_kernel[(batch_size,)](
         candidate_ids,
         cond_log_probs,
         draft_tokens,
         selected_edges,
         parent_list,
-        buffer("search_depths", search_shape, torch.int32),
+        search_depths,
         buffer("search_ranks", search_shape, torch.int32),
         buffer("search_log_masses", search_shape, torch.float32),
         CAND_BATCH_STRIDE=candidate_ids.stride(0),
@@ -228,10 +271,40 @@ def build_dflash_tree_proposal(
         num_warps=8,
         num_stages=1,
     )
-    return DFlashTreeProposal(
+    proposal = DFlashTreeProposal(
         draft_tokens=draft_tokens,
         parent_list=parent_list,
         top_scores_index=selected_edges,
+    )
+    return proposal, search_depths
+
+
+def select_tree_rows(
+    take_first: Tensor,
+    first: tuple[DFlashTreeProposal, Tensor, Tensor],
+    second: tuple[DFlashTreeProposal, Tensor, Tensor],
+) -> tuple[DFlashTreeProposal, Tensor, Tensor]:
+    """Per row, the tree of ``first`` where ``take_first`` ([B] bool) holds, else that of
+    ``second``; each is a proposal with its node draft tokens and probs, of equal Q and K."""
+    first_proposal, first_tokens, first_probs = first
+    second_proposal, second_tokens, second_probs = second
+    rows = take_first.view(-1, 1)
+    proposal = DFlashTreeProposal(
+        draft_tokens=torch.where(
+            rows, first_proposal.draft_tokens, second_proposal.draft_tokens
+        ),
+        parent_list=torch.where(
+            rows, first_proposal.parent_list, second_proposal.parent_list
+        ),
+        top_scores_index=torch.where(
+            rows, first_proposal.top_scores_index, second_proposal.top_scores_index
+        ),
+    )
+    node_rows = take_first.view(-1, 1, 1)
+    return (
+        proposal,
+        torch.where(node_rows, first_tokens, second_tokens),
+        torch.where(node_rows, first_probs, second_probs),
     )
 
 
@@ -531,6 +604,7 @@ def update_draw_acceptance(
     num_nodes: int,
     topk: int,
     decay: float = 0.99,
+    sampled_rows: Tensor | None = None,
 ) -> None:
     """Online estimate of the draw priors of a sampled tree from one verify step.
 
@@ -539,7 +613,8 @@ def update_draw_acceptance(
     Along each accepted path, the child taken at draw ``s`` means draws ``1..s`` were
     later draws, the last of them accepted; at the path's end every drawn child was
     rejected. ``accept_index`` holds global node ids, root first, -1 past
-    ``accept_lens``. Runs on the device without a host sync.
+    ``accept_lens``. ``sampled_rows`` ([bs] bool), when given, limits the counts to the
+    rows whose tree was sampled. Runs on the device without a host sync.
     """
     bs = accept_lens.shape[0]
     edges = top_scores_index[:bs]
@@ -549,10 +624,14 @@ def update_draw_acceptance(
     offsets = torch.arange(bs, device=edges.device).unsqueeze(1) * num_nodes
     nodes = accept_index[:bs].long() - offsets
     stepped = accept_index[:bs, 1:] >= 0
+    if sampled_rows is not None:
+        stepped = stepped & sampled_rows[:bs, None]
     taken = draw.gather(1, nodes[:, 1:].clamp(min=1) - 1)
     taken = torch.where(stepped, taken, torch.zeros_like(taken)).float()
     last = nodes.gather(1, (accept_lens.long() - 1).clamp(min=0).unsqueeze(1))
     left = children.gather(1, last.clamp(min=0)).squeeze(1)
+    if sampled_rows is not None:
+        left = torch.where(sampled_rows[:bs], left, torch.zeros_like(left))
     counts = torch.stack(
         [
             (stepped & (taken == 0)).sum().float(),

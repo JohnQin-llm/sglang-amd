@@ -18,8 +18,10 @@ import torch
 
 from sglang.kernels.ops.speculative.dflash_tree import (
     DFlashTreeProposal,
+    build_dflash_greedy_tree_proposal,
     build_dflash_sampled_tree_proposal,
     build_dflash_tree_proposal,
+    select_tree_rows,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -47,17 +49,10 @@ def propose_dflash_tree(
     candidate rank), with candidates in unary-logit order. The tree is ranked by
     temperature-1 selector log-probabilities; verification keeps sampling lossless.
     """
-    if topk > candidate_ids.shape[-1]:
-        raise ValueError(
-            f"--speculative-eagle-topk {topk} exceeds the selector's top-k "
-            f"{candidate_ids.shape[-1]}"
-        )
-    cond_log_probs = torch.log_softmax(
-        scores[:, :, :topk, :topk].float() / _SCORE_TEMP, dim=-1
-    )
+    _check_topk(candidate_ids, topk)
     return build_dflash_tree_proposal(
         candidate_ids[:, :, :topk].contiguous(),
-        cond_log_probs,
+        _greedy_cond_log_probs(scores, topk),
         max_nodes=num_nodes,
         workspace=workspace,
     )
@@ -75,11 +70,7 @@ def propose_dflash_sampled_tree(
 ) -> tuple[DFlashTreeProposal, torch.Tensor, torch.Tensor]:
     """Tree drawn from the selector's q at each request's temperature, for lossless
     multi-draft verification; also returns each node's child candidates and their q."""
-    if topk > candidate_ids.shape[-1]:
-        raise ValueError(
-            f"--speculative-eagle-topk {topk} exceeds the selector's top-k "
-            f"{candidate_ids.shape[-1]}"
-        )
+    _check_topk(candidate_ids, topk)
     logits = scores[:, :, :topk, :topk].float() / (
         temperatures.view(-1, 1, 1, 1) * _Q_TEMP
     )
@@ -90,6 +81,51 @@ def propose_dflash_sampled_tree(
         workspace=workspace,
         accept_prior=accept_prior,
     )
+
+
+def propose_dflash_mixed_tree(
+    *,
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
+    temperatures: torch.Tensor,
+    greedy_rows: torch.Tensor,
+    topk: int,
+    num_nodes: int,
+    workspace: dict[str, torch.Tensor],
+    accept_prior: tuple[float, float] | torch.Tensor | None = None,
+) -> tuple[DFlashTreeProposal, torch.Tensor, torch.Tensor]:
+    """``propose_dflash_sampled_tree`` for a batch that mixes greedy and sampling requests:
+    rows where ``greedy_rows`` holds take the best-first tree instead. Their target is
+    one-hot, so multi-draft verification of that tree accepts what greedy verification
+    accepts; the sampled rows keep the tree and draws they get without greedy rows."""
+    sampled = propose_dflash_sampled_tree(
+        candidate_ids=candidate_ids,
+        scores=scores,
+        temperatures=temperatures,
+        topk=topk,
+        num_nodes=num_nodes,
+        workspace=workspace,
+        accept_prior=accept_prior,
+    )
+    greedy = build_dflash_greedy_tree_proposal(
+        candidate_ids[:, :, :topk].contiguous(),
+        _greedy_cond_log_probs(scores, topk),
+        max_nodes=num_nodes,
+        workspace=workspace,
+    )
+    return select_tree_rows(greedy_rows, greedy, sampled)
+
+
+def _check_topk(candidate_ids: torch.Tensor, topk: int) -> None:
+    if topk > candidate_ids.shape[-1]:
+        raise ValueError(
+            f"--speculative-eagle-topk {topk} exceeds the selector's top-k "
+            f"{candidate_ids.shape[-1]}"
+        )
+
+
+def _greedy_cond_log_probs(scores: torch.Tensor, topk: int) -> torch.Tensor:
+    return torch.log_softmax(scores[:, :, :topk, :topk].float() / _SCORE_TEMP, dim=-1)
 
 
 # Online draw priors start here and then track verify outcomes.
