@@ -1,6 +1,7 @@
 """The DFLASH tree builder must pick the best-first prefixes under predecessor-conditional scores."""
 
 import heapq
+import math
 import sys
 
 import pytest
@@ -218,7 +219,8 @@ def _expected_accept_lens(proposal, cond_log_probs, calibration, prior):
             parent, child_rank = divmod(edge, k)
             lp = cond_log_probs[b, depth[parent], rank[parent], child_rank].item()
             if calibration is not None:
-                bin_ = min(int(4 * (-lp) ** 0.5), NUM_CALIBRATION_BINS - 1)
+                octave = math.floor(math.log2(max(-lp, 1e-12))) + 11
+                bin_ = min(max(octave, 0), NUM_CALIBRATION_BINS - 1)
                 slot = depth[parent] * NUM_CALIBRATION_BINS + bin_
                 hits, _, raw = calibration[:, slot].tolist()
                 lp = min(

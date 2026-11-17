@@ -18,7 +18,7 @@ from torch import Tensor
 
 
 # Edge-probability bins per depth of the online survival calibration.
-NUM_CALIBRATION_BINS = 12
+NUM_CALIBRATION_BINS = 14
 
 
 class DFlashTreeSurvival(msgspec.Struct, frozen=True):
@@ -73,10 +73,11 @@ def tree_prefix(
 
 @triton.jit
 def _calibration_bin(edge_log_prob, NUM_BINS: tl.constexpr):
-    """Bin b holds edge probabilities in (exp(-((b + 1) / 4)^2), exp(-(b / 4)^2)]: fine near
-    probability 1, where the chain's nodes sit, and coarse in the tail."""
-    root = tl.sqrt(tl.maximum(-edge_log_prob, 0.0)) * 4.0
-    return tl.minimum(root.to(tl.int32), NUM_BINS - 1)
+    """Bin b holds edges with -log p in [2^(b - 11), 2^(b - 10)), the ends open: octaves of
+    the miss rate near p = 1, where the chain's nodes sit and one coarse bin made long
+    confident chains look 15-20% shorter than they verify."""
+    octave = tl.floor(tl.log2(tl.maximum(-edge_log_prob, 1e-12))).to(tl.int32) + 11
+    return tl.minimum(tl.maximum(octave, 0), NUM_BINS - 1)
 
 
 @triton.jit
