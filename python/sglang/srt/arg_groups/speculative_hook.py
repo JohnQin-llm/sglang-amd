@@ -403,12 +403,6 @@ def _handle_dflash_tree(server_args: ServerArgs) -> None:
             f"DFLASH tree verify supports 2 <= --speculative-num-draft-tokens <= {max_nodes} "
             f"for block size {block_size} and --speculative-eagle-topk {topk}; got {num_nodes}."
         )
-    # Paged KV corrupts the tree-verify attention on aiter (measured at page 16);
-    # the other backends are unvalidated with pages.
-    if resolved_view(server_args).page_size > 1:
-        raise ValueError(
-            "DFLASH tree verify (--speculative-eagle-topk > 1) needs --page-size 1."
-        )
     declare_resolution(
         server_args,
         "_handle_dflash",
