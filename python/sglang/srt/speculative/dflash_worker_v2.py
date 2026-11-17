@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import math
 import os
@@ -57,6 +58,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_tree_verify import (
+    propose_dflash_tree,
+    verify_dflash_tree,
+)
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -108,6 +113,7 @@ from sglang.srt.speculative.spec_utils import (
     check_simulate_acc_token_mode,
     draft_pp_context,
     draft_tp_context,
+    get_plan_stream,
 )
 from sglang.srt.utils import async_h2d, is_cuda, is_hip, is_npu, is_xpu
 
@@ -428,7 +434,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
-        with draft_pp_context(), draft_tp_context(self.draft_parallel_layout):
+        # Tree verify: the target sees K candidates and Q nodes, the drafter one F-wide block.
+        self.tree_mode = int(get_spec().speculative_eagle_topk or 1) > 1
+        draft_spec = (
+            get_spec().override(
+                speculative_num_draft_tokens=int(
+                    get_spec().speculative_dflash_block_size
+                ),
+                speculative_eagle_topk=1,
+                speculative_num_steps=1,
+            )
+            if self.tree_mode
+            else contextlib.nullcontext()
+        )
+        with (
+            draft_pp_context(),
+            draft_tp_context(self.draft_parallel_layout),
+            draft_spec,
+        ):
             bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -505,7 +528,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "draft: it proposes greedy tokens, and block verification only "
                 "differs from token-wise verification for sampled proposals."
             )
-        if get_spec().speculative_num_draft_tokens is None:
+        if self.tree_mode:
+            self.block_size = int(get_spec().speculative_dflash_block_size)
+        elif get_spec().speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
             self.block_size = int(draft_config.resolve_block_size(default=16))
         else:
@@ -523,6 +548,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         self.draft_model.set_block_size(self.block_size)
         self.speculative_num_draft_tokens = int(self.block_size)
+        if self.tree_mode:
+            if self.selector is None:
+                raise ValueError(
+                    "DFLASH tree verify needs a DFlash 2 draft with a candidate selector."
+                )
+            self.tree_topk = int(get_spec().speculative_eagle_topk)
+            self.tree_num_nodes = int(get_spec().speculative_num_draft_tokens)
+            self.speculative_num_draft_tokens = self.tree_num_nodes
+            self._tree_workspace: dict[str, torch.Tensor] = {}
+            self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
         if self._is_domino and self.block_size <= 1:
             raise ValueError(
                 "DFLASH Domino requires speculative_num_draft_tokens > 1, "
@@ -739,7 +774,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         "memory is available after target backend initialization.",
                         available_mem,
                     )
-            if capture_decode_cuda_graph:
+            if capture_decode_cuda_graph and not self.tree_mode:
                 # Must run before capture so the draft graph folds the head in.
                 self._draft_sampler = self._maybe_build_draft_sampler()
                 if self._draft_sampler is not None:
@@ -2354,6 +2389,76 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def _forward_decode_tree(
+        self,
+        *,
+        batch: ScheduleBatch,
+        bs: int,
+        bonus_tokens: torch.Tensor,
+        draft_logits_output,
+        lm_head,
+        positions_2d: torch.Tensor,
+        iteration_ids: IterationIds,
+        on_publish,
+    ) -> GenerationBatchResult:
+        """Build a tree from the selector lattice, verify it, then feed the accepted
+        path's target features to the drafter like the chain path does."""
+        if self.draft_model.lm_head is None:
+            self.draft_model.lm_head = lm_head
+        draft_hidden = draft_logits_output.hidden_states
+        if draft_hidden is None:
+            raise RuntimeError("DFLASH selector draft returned no hidden states.")
+        draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+        with draft_tp_context(self.draft_parallel_layout):
+            candidate_ids, scores = _selector_lattice(
+                self.draft_model, draft_hidden[:, 1:, :], bonus_tokens
+            )
+        proposal = propose_dflash_tree(
+            candidate_ids=candidate_ids,
+            scores=scores,
+            topk=self.tree_topk,
+            num_nodes=self.tree_num_nodes,
+            workspace=self._tree_workspace,
+        )
+        result = verify_dflash_tree(
+            batch=batch,
+            bonus_tokens=bonus_tokens,
+            proposal=proposal,
+            target_worker=self.target_worker,
+            plan_stream=self.plan_stream,
+            plan_stream_ctx=self.plan_stream_ctx,
+            topk=self.tree_topk,
+            depth=int(self.block_size) - 1,
+            num_nodes=self.tree_num_nodes,
+            device=self.device,
+        )
+        if on_publish is not None:
+            on_publish(result.new_seq_lens)
+
+        # The accepted path (root first) now fronts each request's verify rows, and it
+        # is at most min(Q, F) long, so it fits the draft block's first columns.
+        width = min(self.tree_num_nodes, int(self.block_size))
+        hidden = result.logits_output.hidden_states
+        if hidden is None:
+            raise RuntimeError("DFLASH tree verify returned no target hidden states.")
+        hidden = hidden.view(bs, self.tree_num_nodes, -1)[:, :width]
+        cache_loc_2d = self._draft_write_ids(iteration_ids).view(
+            bs, int(self.block_size)
+        )[:, :width]
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+            cache_loc=cache_loc_2d.reshape(-1),
+            cache_loc_2d=cache_loc_2d,
+            positions=positions_2d[:, :width].reshape(-1),
+            commit_lens=result.accept_lens,
+        )
+        result.logits_output.hidden_states = None
+        result.next_draft_input = self._make_next_draft_input_decode(
+            bonus_tokens=result.next_draft_input.bonus_tokens.to(torch.int64),
+            new_seq_lens=result.new_seq_lens,
+        )
+        return result
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -2708,6 +2813,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
+
+        if self.tree_mode:
+            return self._forward_decode_tree(
+                batch=batch,
+                bs=bs,
+                bonus_tokens=block_ids[:, 0],
+                draft_logits_output=draft_logits_output,
+                lm_head=lm_head,
+                positions_2d=positions_2d,
+                iteration_ids=iteration_ids,
+                on_publish=on_publish,
+            )
 
         if (
             self._is_domino

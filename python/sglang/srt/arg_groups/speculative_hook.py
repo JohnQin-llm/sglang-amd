@@ -329,6 +329,90 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."
         )
 
+    if cfg.speculative_eagle_topk is not None and int(cfg.speculative_eagle_topk) > 1:
+        _handle_dflash_tree(server_args)
+    else:
+        _handle_dflash_chain(server_args)
+
+    if cfg.speculative_draft_window_size is not None:
+        block_size = int(
+            cfg.speculative_dflash_block_size or cfg.speculative_num_draft_tokens
+        )
+        if cfg.speculative_draft_window_size < block_size:
+            raise ValueError(
+                "--speculative-draft-window-size must be >= the DFLASH block size. "
+                f"window_size={cfg.speculative_draft_window_size}, block_size={block_size}."
+            )
+
+    _resolve_dflash_draft_attention_backend(server_args)
+
+    if cfg.max_running_requests is None:
+        declare_resolution(
+            server_args,
+            "_handle_dflash",
+            max_running_requests=48,
+        )
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+        )
+
+
+def _infer_dflash_block_size(cfg) -> Optional[int]:
+    from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+    from sglang.srt.utils.hf_transformers_utils import get_config
+
+    try:
+        draft_hf_config = get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+            model_override_args=json.loads(cfg.json_model_override_args),
+        )
+        return parse_dflash_draft_config(
+            draft_hf_config=draft_hf_config
+        ).resolve_block_size(default=None)
+    except Exception as e:
+        logger.warning("Failed to infer DFLASH block_size from the draft config: %s", e)
+        return None
+
+
+def _handle_dflash_tree(server_args: ServerArgs) -> None:
+    """Tree verify: the drafter runs one block of F, the target verifies Q tree nodes.
+
+    F is the draft block size, K = --speculative-eagle-topk candidates per depth, and
+    Q = --speculative-num-draft-tokens nodes including the root (the bonus token).
+    """
+    cfg = resolving_view(server_args)
+    block_size = cfg.speculative_dflash_block_size or _infer_dflash_block_size(cfg)
+    if block_size is None or int(block_size) < 3:
+        raise ValueError(
+            "DFLASH tree verify needs a draft block size >= 3; set "
+            "--speculative-dflash-block-size."
+        )
+    block_size = int(block_size)
+    if cfg.speculative_num_draft_tokens is None:
+        raise ValueError(
+            "DFLASH tree verify requires --speculative-num-draft-tokens (tree nodes)."
+        )
+    topk = int(cfg.speculative_eagle_topk)
+    num_nodes = int(cfg.speculative_num_draft_tokens)
+    # EAGLE's parent-list ABI holds K * (depth - 1) + 1 candidate rows.
+    max_nodes = min(128, topk * (block_size - 2) + 2)
+    if not 2 <= num_nodes <= max_nodes:
+        raise ValueError(
+            f"DFLASH tree verify supports 2 <= --speculative-num-draft-tokens <= {max_nodes} "
+            f"for block size {block_size} and --speculative-eagle-topk {topk}; got {num_nodes}."
+        )
+    declare_resolution(
+        server_args,
+        "_handle_dflash",
+        speculative_dflash_block_size=block_size,
+        speculative_num_steps=block_size - 1,
+    )
+
+
+def _handle_dflash_chain(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
     # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
@@ -390,31 +474,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
     if cfg.speculative_num_draft_tokens is None:
-        from sglang.srt.speculative.dflash_utils import (
-            parse_dflash_draft_config,
-        )
-
-        model_override_args = json.loads(cfg.json_model_override_args)
-        inferred_block_size = None
-        try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
-
-            draft_hf_config = get_config(
-                cfg.speculative_draft_model_path,
-                trust_remote_code=cfg.trust_remote_code,
-                revision=cfg.speculative_draft_model_revision,
-                model_override_args=model_override_args,
-            )
-            inferred_block_size = parse_dflash_draft_config(
-                draft_hf_config=draft_hf_config
-            ).resolve_block_size(default=None)
-        except Exception as e:
-            logger.warning(
-                "Failed to infer DFLASH block_size from draft model config; "
-                "defaulting speculative_num_draft_tokens to 16. Error: %s",
-                e,
-            )
-
+        inferred_block_size = _infer_dflash_block_size(cfg)
         if inferred_block_size is None:
             inferred_block_size = 16
             logger.warning(
@@ -425,27 +485,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             server_args,
             "_handle_dflash",
             speculative_num_draft_tokens=inferred_block_size,
-        )
-
-    if cfg.speculative_draft_window_size is not None:
-        draft_tokens = int(cfg.speculative_num_draft_tokens)
-        if cfg.speculative_draft_window_size < draft_tokens:
-            raise ValueError(
-                "--speculative-draft-window-size must be >= "
-                "--speculative-num-draft-tokens (block_size). "
-                f"window_size={cfg.speculative_draft_window_size}, block_size={draft_tokens}."
-            )
-
-    _resolve_dflash_draft_attention_backend(server_args)
-
-    if cfg.max_running_requests is None:
-        declare_resolution(
-            server_args,
-            "_handle_dflash",
-            max_running_requests=48,
-        )
-        logger.warning(
-            "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
 
