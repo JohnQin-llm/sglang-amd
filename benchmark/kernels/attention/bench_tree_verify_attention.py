@@ -1,15 +1,20 @@
-"""Per-step target-verify attention on ROCm (aiter backend shapes, page size 1, bf16 KV):
+"""Per-step target-verify attention on ROCm (aiter backend shapes, page size 1, bf16 KV).
 
+--mode tree:
   tree     - tree_verify_attention at Q tree nodes
-  fallback - today's tree path: extend_attention_fwd with the FULL custom mask
+  fallback - the masked tree path: extend_attention_fwd with the FULL custom mask
   chain    - the chain's verify at its block of 16: aiter unified_attention for
              Muse-Glimmer (SWA KV pool), causal extend_attention_fwd for Qwen3.8-27B
+--mode chain, at Q chain tokens:
+  old      - the chain path above
+  unified  - aiter unified_attention (Qwen with SGLANG_USE_AITER_UNIFIED_ATTN=1)
+  new      - tree_verify_attention with the causal chain mask
 
 Each method's per-layer calls for every attention layer of the model run in one
 CUDA graph, every layer with its own KV pool; L2 and MALL are flushed before each
 replay, and only the replay is timed. Reports ms per step over all layers.
 
-Usage (one GPU): python3 bench_tree_verify_attention.py [--model glimmer qwen]
+Usage (one GPU): python3 bench_tree_verify_attention.py [--mode chain] [--model glimmer qwen]
 """
 
 import argparse
@@ -138,10 +143,25 @@ def extend_step(batch, nodes, masks):
     return layer
 
 
-def unified_chain_step(batch):
+def chain_step(batch, nodes):
+    q, out = batch.q(nodes), batch.q(nodes)
+
+    def layer(i):
+        window = batch.layer_windows[i]
+        k, v = batch.pools[i]
+        tree_verify_attention(
+            q=q, k_cache=k, v_cache=v, out=out, req_to_token=batch.req_to_token,
+            req_pool_indices=batch.req_pool_indices, seq_lens=batch.seq_lens,
+            positions=None, ancestors=None, sm_scale=batch.sm_scale, window=window,
+            slot_map=batch.slot_map if window else None,
+        )  # fmt: skip
+
+    return layer
+
+
+def unified_chain_step(batch, nodes=CHAIN_BLOCK):
     from aiter.ops.triton.attention.unified_attention import unified_attention
 
-    nodes = CHAIN_BLOCK
     q, out = batch.q(nodes), batch.q(nodes)
     cu = torch.arange(0, (batch.bs + 1) * nodes, nodes, dtype=torch.int32)
     tables = {
@@ -189,16 +209,44 @@ def step_ms(layer, num_layers, flush, reps=15):
     return sorted(times)[len(times) // 2]
 
 
+def chain_main(args, gen, flush):
+    nodes_per_model = {"glimmer": [16], "qwen": [8, 16]}
+    print("model    bs   ctx  Q |    old  unified    new   (ms/step)")
+    for model, bs, ctx in itertools.product(args.model, args.bs, args.ctx):
+        nodes_list = args.nodes or nodes_per_model[model]
+        batch = Batch(model=model, bs=bs, ctx=ctx, max_nodes=max(nodes_list), gen=gen)
+        layers = len(batch.layer_windows)
+        for nodes in nodes_list:
+            unified = step_ms(unified_chain_step(batch, nodes), layers, flush)
+            if model == "glimmer":
+                old = unified
+            else:
+                old = step_ms(extend_step(batch, nodes, None), layers, flush)
+            new = step_ms(chain_step(batch, nodes), layers, flush)
+            print(
+                f"{model:8s} {bs:2d} {ctx:5d} {nodes:2d} | {old:6.3f} {unified:8.3f} "
+                f"{new:6.3f}",
+                flush=True,
+            )
+        del batch
+        torch.cuda.empty_cache()
+
+
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["tree", "chain"], default="tree")
     parser.add_argument("--model", nargs="+", default=["glimmer", "qwen"])
     parser.add_argument("--bs", type=int, nargs="+", default=[1, 4, 16])
     parser.add_argument("--ctx", type=int, nargs="+", default=[1024, 2048, 8192])
-    parser.add_argument("--nodes", type=int, nargs="+", default=[16, 32])
+    parser.add_argument("--nodes", type=int, nargs="+", default=None)
     parser.add_argument("--skip-fallback", action="store_true")
     args = parser.parse_args()
     gen = torch.Generator().manual_seed(0)
     flush = torch.empty(1 << 29, dtype=torch.uint8, device=DEVICE)
+    if args.mode == "chain":
+        chain_main(args, gen, flush)
+        return
+    args.nodes = args.nodes or [16, 32]
     print("model    bs   ctx | chain Q16 | " + " | ".join(
         f"tree Q{n:<2d} fallback Q{n:<2d}" for n in args.nodes) + "   (ms/step)")  # fmt: skip
     for model, bs, ctx in itertools.product(args.model, args.bs, args.ctx):

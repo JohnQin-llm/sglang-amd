@@ -66,6 +66,7 @@ from sglang.kernels.ops.speculative.dflash_tree import (
 )
 from sglang.srt.speculative.dflash_tree_verify import (
     ONLINE_PRIOR_START,
+    propose_dflash_mixed_tree,
     propose_dflash_sampled_tree,
     propose_dflash_tree,
     read_accept_prior_setting,
@@ -2423,7 +2424,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._tree_draw_stats = None
         self._tree_accept_prior = setting
         if setting == "online":
-            self._tree_draw_stats = torch.zeros(4, dtype=torch.float32, device=self.device)
+            self._tree_draw_stats = torch.zeros(
+                4, dtype=torch.float32, device=self.device
+            )
             self._tree_accept_prior = torch.tensor(
                 log_draw_priors(ONLINE_PRIOR_START),
                 dtype=torch.float32,
@@ -2431,8 +2434,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
     def _tree_temperatures(self, sampling_info, bs: int) -> torch.Tensor:
-        # Greedy rows in a mixed batch verify against a one-hot target, which is
-        # lossless under any q; temperature 1 just gives them a well-spread tree.
+        # Greedy rows take the best-first tree; temperature 1 only keeps their
+        # discarded sampled tree finite.
         temperatures = sampling_info.temperatures.view(-1)[:bs].float().clamp(min=1e-5)
         greedy = resolve_greedy_mask(
             bs=bs, sampling_info=sampling_info, device=self.device
@@ -2465,7 +2468,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             candidate_ids, scores = _selector_lattice(
                 self.draft_model, draft_hidden[:, 1:, :], bonus_tokens
             )
-        node_draft_tokens = node_draft_probs = None
+        node_draft_tokens = node_draft_probs = sampled_rows = None
         adaptive = self._adaptive_width
         width = self.tree_num_nodes
         greedy = _is_all_greedy(batch.sampling_info)
@@ -2477,6 +2480,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                 num_nodes=self.tree_num_nodes,
                 workspace=self._tree_workspace,
                 calibration=None if adaptive is None else adaptive.calibration_stats,
+            )
+        # Host-side check (no device sync): batches without greedy rows keep the plain
+        # sampled tree.
+        elif any(req.sampling_params.top_k <= 1 for req in batch.reqs):
+            greedy_rows = resolve_greedy_mask(
+                bs=bs, sampling_info=batch.sampling_info, device=self.device
+            )[:bs]
+            sampled_rows = ~greedy_rows
+            proposal, node_draft_tokens, node_draft_probs = propose_dflash_mixed_tree(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                temperatures=self._tree_temperatures(batch.sampling_info, bs),
+                greedy_rows=greedy_rows,
+                topk=self.tree_topk,
+                num_nodes=self.tree_num_nodes,
+                workspace=self._tree_workspace,
+                accept_prior=self._tree_accept_prior,
             )
         else:
             proposal, node_draft_tokens, node_draft_probs = propose_dflash_sampled_tree(
@@ -2540,6 +2560,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_lens=result.accept_lens,
                 num_nodes=width,
                 topk=self.tree_topk,
+                sampled_rows=sampled_rows,
             )
 
         # The accepted path (root first) now fronts each request's verify rows, and it

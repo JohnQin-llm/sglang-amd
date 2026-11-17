@@ -108,6 +108,7 @@ from sglang.srt.layers.attention.verify_mask import VerifyMask, tree_mask_numel
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
+from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -246,7 +247,10 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
     # kv_indices in window-pool ids, for the masked target-verify fallback.
     swa_kv_indices: Optional[torch.Tensor] = None
-    # [tokens] int64: bit j set when the tree verify row sees tree node j.
+    # Target verify through tree_verify_attention.
+    splitkv_verify: bool = False
+    # [tokens] int64: bit j set when the tree verify row sees tree node j;
+    # None for a chain.
     tree_ancestors: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
@@ -635,6 +639,22 @@ class AiterAttnBackend(AttentionBackend):
         self._verify_mask = (
             self._tree_verify_mask(max_bs=max_bs) if self._tree_verify else None
         )
+        # DFLASH chain blocks verify through the same kernel with a causal mask.
+        self._chain_verify = (
+            envs.SGLANG_AITER_CHAIN_VERIFY_SPLITKV.get()
+            and not self.use_mla
+            and not model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dflash()
+            and self.topk == 1
+            and int(get_spec().speculative_eagle_topk or 1) <= 1
+            and not ragged_verify_compact_enabled()
+            and not self.kv_cache_is_vectorized_5d
+            and self.v_head_dim == self.head_dim
+            and tree_verify_supported(
+                head_dim=self.head_dim, num_nodes=self.num_draft_tokens or 0
+            )
+        )
+        self._splitkv_verify = self._tree_verify or self._chain_verify
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -2444,8 +2464,16 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.spec_info.num_tokens_per_req,
                     max_kv_len,
                 )
-        elif forward_batch.forward_mode.is_target_verify() and self._tree_verify:
+        elif forward_batch.forward_mode.is_target_verify() and self._splitkv_verify:
             draft_num = forward_batch.input_ids.shape[0] // bs
+            tree_ancestors = None
+            if self._tree_verify:
+                tree_ancestors = self._fill_tree_ancestors(
+                    spec_info=spec_info,
+                    out=torch.empty(
+                        bs * draft_num, dtype=torch.int64, device=self.device
+                    ),
+                )
             self.forward_metadata = ForwardMetadata(
                 None,
                 None,
@@ -2455,12 +2483,8 @@ class AiterAttnBackend(AttentionBackend):
                 None,
                 max_extend_len=draft_num,
                 swa_out_cache_loc=swa_out_cache_loc,
-                tree_ancestors=self._fill_tree_ancestors(
-                    spec_info=spec_info,
-                    out=torch.empty(
-                        bs * draft_num, dtype=torch.int64, device=self.device
-                    ),
-                ),
+                splitkv_verify=True,
+                tree_ancestors=tree_ancestors,
             )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
@@ -3028,7 +3052,7 @@ class AiterAttnBackend(AttentionBackend):
             )
             if max_bs > self._verify_mask.max_bs:
                 self._verify_mask = self._tree_verify_mask(max_bs=max_bs)
-        elif not self.skip_prefill:
+        elif not self.skip_prefill and not self._chain_verify:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
@@ -3154,7 +3178,7 @@ class AiterAttnBackend(AttentionBackend):
             if seq_lens_cpu is not None
             else None
             if forward_mode.is_target_verify()
-            and (self._use_unified_verify or self._tree_verify)
+            and (self._use_unified_verify or self._splitkv_verify)
             else torch.max(seq_lens).item()
         )
 
@@ -3301,8 +3325,14 @@ class AiterAttnBackend(AttentionBackend):
                 # num_kv_splits_indptr=num_kv_splits_indptr,
             )
 
-        elif forward_mode.is_target_verify() and self._tree_verify:
+        elif forward_mode.is_target_verify() and self._splitkv_verify:
             draft_num = verify_tokens_per_req
+            tree_ancestors = None
+            if self._tree_verify:
+                tree_ancestors = self._fill_tree_ancestors(
+                    spec_info=spec_info,
+                    out=self.cuda_graph_tree_ancestors[: bs * draft_num],
+                )
             self.forward_metadata = ForwardMetadata(
                 None,
                 None,
@@ -3311,10 +3341,8 @@ class AiterAttnBackend(AttentionBackend):
                 draft_num,
                 None,
                 max_extend_len=draft_num,
-                tree_ancestors=self._fill_tree_ancestors(
-                    spec_info=spec_info,
-                    out=self.cuda_graph_tree_ancestors[: bs * draft_num],
-                ),
+                splitkv_verify=True,
+                tree_ancestors=tree_ancestors,
             )
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
@@ -3661,7 +3689,7 @@ class AiterAttnBackend(AttentionBackend):
             num_masked_reqs=num_masked_reqs,
         )
 
-    def _forward_tree_verify(
+    def _forward_splitkv_verify(
         self,
         *,
         q: torch.Tensor,
@@ -3688,7 +3716,7 @@ class AiterAttnBackend(AttentionBackend):
             req_to_token=self.req_to_token,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
-            positions=forward_batch.positions,
+            positions=None if self._chain_verify else forward_batch.positions,
             ancestors=self.forward_metadata.tree_ancestors,
             sm_scale=layer.scaling,
             window=window,
@@ -4390,8 +4418,8 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     o = torch.empty_like(q)
 
-                if self.forward_metadata.tree_ancestors is not None:
-                    return self._forward_tree_verify(
+                if self.forward_metadata.splitkv_verify:
+                    return self._forward_splitkv_verify(
                         q=q,
                         o=o,
                         layer=layer,

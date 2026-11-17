@@ -175,6 +175,9 @@ def copy_all_layer_kv_cache_tiled(
 
     mask = mask_loc[:, None] & mask_byte[None, :]
     vals = tl.load(src_ptr, mask=mask)
+    # A tile smaller than the layout is replicated across warps; without the barrier one
+    # warp's store can land before another warp's load of an overlapping source slot.
+    tl.debug_barrier()
     tl.store(tgt_ptr, vals, mask=mask)
 
 
