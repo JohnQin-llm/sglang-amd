@@ -603,10 +603,11 @@ class ExecMamba(msgspec.Struct):
     # stores each draft step's raw inputs into a per-slot window and the commit
     # replays the accepted prefix into the fp32 checkpoint. GDN sizes the window
     # to the draft maximum; KDA folds a (raw v, pre-norm k, gate, beta) ring of
-    # length --linear-replayssm-cache-len. Linear-chain (topk <= 1) only.
+    # length --linear-replayssm-cache-len. A GDN tree (topk > 1) folds its
+    # accepted path from a per-node window.
     enable_linear_replayssm_spec: A[
         bool,
-        "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
+        "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models with a linear chain (--speculative-eagle-topk in {None, 1}); GDN tree verify (topk > 1) replays each tree path on chip and folds the accepted path.",
     ] = False
 
 

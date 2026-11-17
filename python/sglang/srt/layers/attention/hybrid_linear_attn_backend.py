@@ -44,7 +44,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_pin_memory_available
@@ -1638,6 +1643,33 @@ class HybridLinearAttnBackend(AttentionBackend):
                 src_indices_raw=src_indices_raw,
                 null_block_id=-1,
                 ring_indices=ring_indices,
+            )
+            return
+
+        # ReplaySSM-GDN compact ring, for the same direct chain callers. It
+        # keys its cursors and ring by request row.
+        if (
+            mamba_pool.replayssm_cache_base is not None
+            and not mamba_pool.replayssm_is_kda
+        ):
+            from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+                commit_gdn_replayssm_compact_after_verify,
+            )
+
+            assert req_pool_indices is not None
+            commit_gdn_replayssm_compact_after_verify(
+                spec_state=mamba_caches,
+                write_pos=mamba_pool.replayssm_spec_write_pos,
+                cache_base=mamba_pool.replayssm_cache_base,
+                is_flush=mamba_pool.replayssm_is_flush,
+                state_batch_indices=state_indices_tensor,
+                replay_indices=req_pool_indices[:request_number],
+                accept_lens=last_correct_step_indices + 1,
+                last_correct_step_indices=last_correct_step_indices,
+                max_spec_len=max_speculative_num_draft_tokens(),
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                src_indices_raw=src_indices_raw,
             )
             return
 

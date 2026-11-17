@@ -684,8 +684,16 @@ class MambaPool:
         # fold-every-commit for KDA. The shared g allocation gates on
         # `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
+        # GDN tree verify folds too: its accepted path is not a ring prefix.
+        self.replayssm_tree_fold = bool(
+            enable_linear_replayssm_spec
+            and not cache_params.is_kda
+            and speculative_eagle_topk is not None
+            and speculative_eagle_topk > 1
+        )
         self.replayssm_spec_fold = bool(
-            enable_linear_replayssm_spec and cache_params.is_kda
+            enable_linear_replayssm_spec
+            and (cache_params.is_kda or self.replayssm_tree_fold)
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
         self.replayssm_request_ring = False
@@ -833,10 +841,10 @@ class MambaPool:
                     dtype=torch.float32,
                     device=device,
                 )
-                # KDA still uses raw-input fold-every-commit. GDN materializes
-                # its compact d/k/g history directly and needs no duplicate ring.
-                if enable_linear_replayssm_spec and cache_params.is_kda:
-                    if cache_params.is_kda or not self.replayssm_spec_fold:
+                # KDA and the GDN tree use raw-input fold-every-commit. The GDN
+                # chain materializes its compact d/k/g history directly.
+                if self.replayssm_spec_fold:
+                    if cache_params.is_kda:
                         # Backstop for the KDA ring invariants; this pool is
                         # sized with the final adaptive-aware draft maximum.
                         if L & (L - 1) != 0:

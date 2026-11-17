@@ -1567,17 +1567,32 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
-        # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
-        # non-KDA model there would scatter a None intermediate_ssm and crash.
-        _algo = (get_spec().speculative_algorithm or "").upper()
+        # DSPARK/DFLASH chains commit through the backend (KDA fold or GDN
+        # compact ring); a tree commits through spec_utils (GDN tree fold).
+        _tree = (get_spec().speculative_eagle_topk or 1) > 1
         if (
             get_exec().mamba.enable_linear_replayssm_spec
-            and _algo in ("DSPARK", "DFLASH")
-            and self.hybrid_kda_config is None
+            and _tree
+            and self.hybrid_kda_config is not None
         ):
             raise ValueError(
-                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "model; got a non-KDA model."
+                "--enable-linear-replayssm-spec with tree verify "
+                "(--speculative-eagle-topk > 1) supports GDN models only."
+            )
+        from sglang.srt.speculative.ragged_verify import (
+            RaggedVerifyMode,
+            read_ragged_verify_mode,
+        )
+
+        if (
+            get_exec().mamba.enable_linear_replayssm_spec
+            and self.hybrid_kda_config is None
+            and read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
+        ):
+            # The GDN ring-write verify kernels take the static layout only.
+            raise ValueError(
+                "--enable-linear-replayssm-spec on a GDN model requires "
+                "SGLANG_RAGGED_VERIFY_MODE=static."
             )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
@@ -3176,10 +3191,18 @@ class KVCacheConfigurator:
             self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
         )
         if replayssm_active:
-            record_len = get_exec().mamba.linear_replayssm_cache_len
+            tree_fold = (
+                self.hybrid_gdn_config is not None
+                and (get_spec().speculative_eagle_topk or 1) > 1
+            )
+            record_len = (
+                get_spec().speculative_num_draft_tokens
+                if tree_fold
+                else get_exec().mamba.linear_replayssm_cache_len
+            )
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
-                    record_len=record_len
+                    record_len=record_len, tree_fold=tree_fold
                 )
             )
         else:

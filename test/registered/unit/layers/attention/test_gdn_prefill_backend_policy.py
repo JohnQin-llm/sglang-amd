@@ -463,18 +463,29 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
     def test_target_verify_strided_qkv_routing(self):
         backend, nominal_capability = self.make_target_verify_routing_backend()
         cases = (
-            ("fp32_fold", True, False, torch.float32, 4, True, False),
-            ("short_bf16_fold", True, False, torch.bfloat16, 2, True, False),
-            ("cutedsl_fold", True, False, torch.bfloat16, 4, False, False),
-            ("circular", False, True, torch.bfloat16, 4, True, False),
-            ("nominal", False, False, torch.bfloat16, 4, False, True),
+            ("fp32_fold", True, False, False, torch.float32, 4, True, False),
+            ("short_bf16_fold", True, False, False, torch.bfloat16, 2, True, False),
+            ("cutedsl_fold", True, False, False, torch.bfloat16, 4, False, False),
+            ("tree_fold", True, True, False, torch.bfloat16, 4, True, False),
+            ("circular", False, False, True, torch.bfloat16, 4, True, False),
+            ("nominal", False, False, False, torch.bfloat16, 4, False, True),
         )
-        for name, fold, circular, dtype, draft_tokens, expected, delegates in cases:
+        for (
+            name,
+            fold,
+            tree,
+            circular,
+            dtype,
+            draft_tokens,
+            expected,
+            delegates,
+        ) in cases:
             with self.subTest(name=name):
                 nominal_capability.reset_mock()
                 actual = backend._target_verify_supports_strided_qkv(
                     retrieve_parent_token=None,
                     use_replayssm_fold=fold,
+                    use_replayssm_tree_fold=tree,
                     use_replayssm_spec=circular,
                     ssm_dtype=dtype,
                     draft_token_num=draft_tokens,

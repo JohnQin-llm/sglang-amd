@@ -1369,3 +1369,70 @@ def commit_gdn_replayssm_circular(
         BLOCK=block,
         NULL_BLOCK_ID=null_block_id,
     )
+
+
+def commit_gdn_replayssm_compact_after_verify(
+    *,
+    spec_state,  # MambaPool.SpeculativeState (all layers)
+    write_pos: torch.Tensor,
+    cache_base: torch.Tensor,
+    is_flush: torch.Tensor,
+    state_batch_indices: torch.Tensor,  # [B] per-req mamba slot
+    replay_indices: torch.Tensor,  # [B] request rows that key the ring
+    accept_lens: torch.Tensor,  # [B] int, incl. the bonus token
+    last_correct_step_indices: torch.Tensor,  # [B] conv rollback target step
+    max_spec_len: int,
+    mamba_track_indices: torch.Tensor | None = None,
+    mamba_steps_to_track: torch.Tensor | None = None,
+    src_indices_raw: torch.Tensor | None = None,
+) -> None:
+    """Commit a linear-chain verify under the compact ring: advance the request
+    cursors by the accepted count, fold capacity and track rows, then roll back
+    the conv state (and snapshot its interval-crossing window)."""
+    from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+        fused_conv_window_scatter_with_mask,
+    )
+
+    commit_gdn_replayssm_spec(
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        num_accepted=accept_lens,
+        replay_indices=replay_indices,
+        max_cache_len=spec_state.replayssm_d.shape[-2],
+        max_spec_len=max_spec_len,
+        fold_every_commit=spec_state.temporal.dtype != torch.float32,
+        null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
+    )
+    commit_gdn_replayssm_circular(
+        checkpoint_state=spec_state.temporal,
+        d_cache=spec_state.replayssm_d,
+        k_cache=spec_state.replayssm_k,
+        g_cache=spec_state.replayssm_g,
+        d_residual_cache=spec_state.replayssm_rawv,
+        k_residual_cache=spec_state.replayssm_rawk,
+        state_batch_indices=state_batch_indices,
+        replay_indices=replay_indices,
+        write_pos=write_pos,
+        cache_base=cache_base,
+        is_flush=is_flush,
+        accept_lens=accept_lens,
+        mamba_track_indices=mamba_track_indices,
+        mamba_steps_to_track=mamba_steps_to_track,
+        null_block_id=-1,
+    )
+    fused_conv_window_scatter_with_mask(
+        spec_state.conv[0],
+        spec_state.intermediate_conv_window[0],
+        state_batch_indices,
+        last_correct_step_indices,
+        src_indices_raw,
+    )
+    if mamba_track_indices is not None:
+        fused_conv_window_scatter_with_mask(
+            spec_state.conv[0],
+            spec_state.intermediate_conv_window[0],
+            mamba_track_indices,
+            mamba_steps_to_track,
+            src_indices_raw,
+        )

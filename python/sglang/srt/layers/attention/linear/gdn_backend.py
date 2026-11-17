@@ -574,6 +574,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
+        # Tree paths of the current verify: the first GDN layer builds them and
+        # every later layer of the same forward (or captured graph) reads them.
+        self._first_state_layer_id = min(self.state_layer_indices)
+        self._tree_paths = None
         # A prefill batch never holds more requests than the pool.
         self.prefill_graph_max_seqs = min(
             self.req_to_token_pool.size, envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get()
@@ -803,6 +807,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self._use_strided_target_verify_qkv = self._target_verify_supports_strided_qkv(
             retrieve_parent_token=metadata.retrieve_parent_token,
             use_replayssm_fold=use_replayssm_fold,
+            use_replayssm_tree_fold=mamba_pool.replayssm_tree_fold,
             use_replayssm_spec=use_replayssm_spec,
             ssm_dtype=mamba_cache.temporal.dtype,
             draft_token_num=forward_batch.spec_info.draft_token_num,
@@ -822,11 +827,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         *,
         retrieve_parent_token: Optional[torch.Tensor],
         use_replayssm_fold: bool,
+        use_replayssm_tree_fold: bool,
         use_replayssm_spec: bool,
         ssm_dtype: torch.dtype,
         draft_token_num: int,
     ) -> bool:
         # ReplaySSM Triton routes accept strides; the CuTeDSL fold does not.
+        if use_replayssm_fold and use_replayssm_tree_fold:
+            return True
         if use_replayssm_fold:
             return not self._replayssm_fold_uses_cutedsl(ssm_dtype, draft_token_num)
         if use_replayssm_spec:
@@ -1356,7 +1364,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
             # verify, fold on commit), circular ring, or the snapshotting
             # fallback when neither ring is allocated.
-            if use_replayssm_fold:
+            if use_replayssm_fold and mamba_pool.replayssm_tree_fold:
+                core_attn_out = self._replayssm_tree_target_verify(
+                    layer=layer,
+                    query=query,
+                    key=key,
+                    value=value,
+                    a=a,
+                    b=b,
+                    layer_cache=mamba_cache_params,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    ring_indices=intermediate_state_indices,
+                    retrieve_parent_token=retrieve_parent_token,
+                    draft_token_num=forward_batch.spec_info.draft_token_num,
+                )
+            elif use_replayssm_fold:
                 core_attn_out = self._replayssm_fold_target_verify(
                     layer=layer,
                     query=query,
@@ -1368,7 +1391,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     ssm_states=ssm_states,
                     cache_indices=cache_indices,
                     query_start_loc=query_start_loc,
-                    retrieve_parent_token=retrieve_parent_token,
                 )
             elif use_replayssm_spec:
                 core_attn_out = self._replayssm_target_verify(
@@ -1623,7 +1645,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        retrieve_parent_token: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Ring-writing verify; the commit fold replays the accepted prefix
         into ``temporal``. Uses the vendored CuTe DSL MTP kernel when the
@@ -1633,10 +1654,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             fused_sigmoid_gating_delta_rule_update,
         )
 
-        assert retrieve_parent_token is None, (
-            "ReplaySSM fold-every-commit supports a linear draft chain only "
-            "(topk <= 1); EAGLE tree verify must use the recurrent verify."
-        )
         seq_len = query.shape[1]
         batch_size = query_start_loc.shape[0] - 1
         draft_token_num = seq_len // batch_size
@@ -1687,6 +1704,63 @@ class GDNAttnBackend(MambaAttnBackendBase):
             replayssm_rawk=layer_cache.replayssm_rawk,
             replayssm_g=layer_cache.replayssm_g,
             replayssm_beta=layer_cache.replayssm_beta,
+        )
+
+    def _replayssm_tree_target_verify(
+        self,
+        *,
+        layer: RadixLinearAttention,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        layer_cache: "MambaPool.SpeculativeState",
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        ring_indices: torch.Tensor,
+        retrieve_parent_token: Optional[torch.Tensor],
+        draft_token_num: int,
+    ) -> torch.Tensor:
+        """Tree verify that keeps every node state on chip: one program per
+        root-to-leaf path. The ring takes each node's raw inputs, and the commit
+        fold replays the accepted path into ``temporal``."""
+        from sglang.kernels.ops.attention.linear.gdn_tree_verify import (
+            gdn_tree_paths,
+            gdn_tree_verify,
+        )
+
+        num_requests = key.shape[-3] // draft_token_num
+        if retrieve_parent_token is None:
+            # Dummy runs carry no tree links; the conv update then reads a chain.
+            retrieve_parent_token = torch.arange(
+                -1, draft_token_num - 1, device=query.device
+            ).expand(num_requests, draft_token_num)
+        if (
+            layer.layer_id == self._first_state_layer_id
+            or self._tree_paths is None
+            or self._tree_paths[1].shape != (num_requests, draft_token_num)
+        ):
+            self._tree_paths = gdn_tree_paths(retrieve_parent_token, draft_token_num)
+
+        return gdn_tree_verify(
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            q=query,
+            k=key,
+            v=value,
+            a=a,
+            b=b,
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
+            retrieve_parent_token=retrieve_parent_token,
+            num_draft_tokens=draft_token_num,
+            rawv_ring=layer_cache.replayssm_rawv,
+            rawk_ring=layer_cache.replayssm_rawk,
+            g_ring=layer_cache.replayssm_g,
+            beta_ring=layer_cache.replayssm_beta,
+            ring_indices=ring_indices,
+            tree_paths=self._tree_paths,
         )
 
     def _replayssm_target_verify(

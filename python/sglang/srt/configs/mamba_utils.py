@@ -124,17 +124,29 @@ class BaseLinearStateParams(ABC):
             + ssm_numel * self.dtype.temporal.itemsize
         ) * len(self.layers)
 
-    def replayssm_ring_bytes_per_req(self, record_len: int) -> int:
+    def replayssm_ring_bytes_per_req(
+        self, record_len: int, tree_fold: bool = False
+    ) -> int:
         """ReplaySSM spec-verify scratch bytes across all layers.
 
         GDN keeps compact d/k/g plus low parts for the activation-dtype d/k
-        rings. KDA keeps its raw-input fold window and d/k rings.
+        rings; a GDN tree keeps its raw-input fold window instead. KDA keeps its
+        raw-input fold window and d/k rings.
         """
         hv, v_dim, k_dim = self.shape.temporal
         h_k = self.shape.num_k_heads_per_tp
         conv_b = self.dtype.conv.itemsize
         fp32_b = 4
-        if self.is_kda:
+        if tree_fold:
+            conv_numel = int(np.sum([np.prod(shape) for shape in self.shape.conv]))
+            per_layer = (
+                hv * record_len * v_dim * conv_b  # rawv
+                + h_k * record_len * k_dim * conv_b  # rawk
+                + 2 * hv * record_len * fp32_b  # scalar g, beta
+                # Per-node conv windows, which the tree keeps dense.
+                + record_len * conv_numel * conv_b
+            )
+        elif self.is_kda:
             per_layer = (
                 hv * record_len * v_dim * conv_b  # rawv
                 + h_k * record_len * k_dim * conv_b  # rawk
