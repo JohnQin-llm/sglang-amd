@@ -88,10 +88,12 @@ def run_case(
     near_tie=False,
     splits=None,
     min_split_keys=None,
+    chain=False,
     device="cuda",
     seed=0,
 ):
-    """Max abs error of the kernel against the fp64 reference."""
+    """Max abs error of the kernel against the fp64 reference. ``chain`` verifies
+    a linear block: no ancestor masks or positions reach the kernel."""
     gen = torch.Generator().manual_seed(seed)
     num_reqs = len(prefixes)
     kv_lens = [p + nodes for p in prefixes]
@@ -111,7 +113,10 @@ def run_case(
         k = base + 1e-2 * k
         q = 4.0 * base + 1e-2 * q
     k, v, q = k.to(kv_dtype), v.to(kv_dtype), q.to(q_dtype)
-    masks = [_random_tree(nodes, gen) for _ in prefixes]
+    if chain:
+        masks = [torch.ones(nodes, nodes, dtype=torch.bool).tril() for _ in prefixes]
+    else:
+        masks = [_random_tree(nodes, gen) for _ in prefixes]
     depth = torch.cat([m.sum(1) - 1 for m in masks])
     positions = torch.tensor(prefixes).repeat_interleave(nodes) + depth
     sinks = torch.randn(heads, generator=gen) if with_sinks else None
@@ -133,8 +138,8 @@ def run_case(
         req_to_token=to(table),
         req_pool_indices=to(pool_rows),
         seq_lens=to(torch.tensor(prefixes)),
-        positions=to(positions),
-        ancestors=ancestors,
+        positions=None if chain else to(positions),
+        ancestors=None if chain else ancestors,
         sm_scale=sm_scale,
         window=window,
         slot_map=to(slot_map),
@@ -192,6 +197,28 @@ def test_near_tie_logits_across_splits(splits):
         near_tie=True, splits=splits, min_split_keys=64,
     )  # fmt: skip
     assert err < 2e-2, err
+
+
+# Chain blocks: Muse-Glimmer full and sliding-window layers (prefixes past the
+# window), Qwen3.8-27B at its block of 8.
+CHAIN_SHAPES = [
+    ([1000, 37, 4100], 16, 32, 2, 128, 0),
+    ([3000, 5, 2047], 16, 32, 2, 128, 2047),
+    ([1500, 9, 6000], 8, 24, 4, 256, 0),
+]
+
+
+@pytest.mark.parametrize("prefixes,nodes,heads,kv_heads,head_dim,window", CHAIN_SHAPES)
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_chain_matches_dense_reference(
+    prefixes, nodes, heads, kv_heads, head_dim, window, kv_dtype
+):
+    err = run_case(
+        prefixes=prefixes, nodes=nodes, heads=heads, kv_heads=kv_heads,
+        head_dim=head_dim, window=window, kv_dtype=kv_dtype, k_scale=0.5,
+        v_scale=2.0, chain=True,
+    )  # fmt: skip
+    assert err < 5e-2, err
 
 
 def test_logit_cap_and_sinks():

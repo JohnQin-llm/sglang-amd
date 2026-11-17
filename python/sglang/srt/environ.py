@@ -653,6 +653,9 @@ class Envs:
     # Attention (aiter, ROCm): verify DFLASH draft trees (--speculative-eagle-topk
     # > 1) with the split-KV tree kernel; off falls back to masked extend attention.
     SGLANG_AITER_TREE_VERIFY = EnvBool(True)
+    # Attention (aiter, ROCm): verify DFLASH chain blocks with the same split-KV
+    # kernel; off restores unified_attention or causal extend attention.
+    SGLANG_AITER_CHAIN_VERIFY_SPLITKV = EnvBool(True)
     # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
     SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
     # Attention (aiter, ROCm): hand chunked prefill the page-level KV view so

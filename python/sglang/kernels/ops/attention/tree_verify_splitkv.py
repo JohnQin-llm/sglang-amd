@@ -257,7 +257,9 @@ def _tree_verify_partials_kernel(
         qk_scale = sm_scale * 1.4426950408889634
         if K_SCALE is not None:
             qk_scale *= tl.load(K_SCALE).to(tl.float32)
-        if WINDOW > 0:
+        if ANCESTORS is None:
+            query_position = prefix + node
+        elif WINDOW > 0:
             query_position = tl.load(POSITIONS + token, mask=row_ok, other=0).to(
                 tl.int32
             )
@@ -274,11 +276,16 @@ def _tree_verify_partials_kernel(
         if split == active - 1:
             nodes = tl.arange(0, BNODE)
             key_ok = nodes < NODES
-            ancestors = tl.load(ANCESTORS + token, mask=row_ok, other=0).to(tl.int64)
-            is_ancestor = (ancestors[:, None] >> nodes[None, :].to(tl.int64)) & 1
-            visible = key_ok[None, :] & (
-                (is_ancestor != 0) | (nodes[None, :] == node[:, None])
-            )
+            if ANCESTORS is None:
+                visible = key_ok[None, :] & (nodes[None, :] <= node[:, None])
+            else:
+                ancestors = tl.load(ANCESTORS + token, mask=row_ok, other=0).to(
+                    tl.int64
+                )
+                is_ancestor = (ancestors[:, None] >> nodes[None, :].to(tl.int64)) & 1
+                visible = key_ok[None, :] & (
+                    (is_ancestor != 0) | (nodes[None, :] == node[:, None])
+                )
             slots = _gather_slots(
                 req_row, SLOT_MAP, prefix + nodes, key_ok, HAS_SLOT_MAP, True
             )
@@ -485,8 +492,8 @@ def tree_verify_attention(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
     seq_lens: torch.Tensor,
-    positions: torch.Tensor,
-    ancestors: torch.Tensor,
+    positions: Optional[torch.Tensor],
+    ancestors: Optional[torch.Tensor],
     sm_scale: float,
     window: int = 0,
     slot_map: Optional[torch.Tensor] = None,
@@ -507,8 +514,9 @@ def tree_verify_attention(
     k_cache, v_cache: [slots, kv_heads, head_dim]; the tree's K/V are already
     written, at request-table columns [seq_lens, seq_lens + nodes).
     seq_lens: [reqs] prefix lengths. positions: [reqs * nodes] each node's
-    position (prefix + depth), read only when ``window`` > 0.
-    ancestors: [reqs * nodes] int64, bit j set when the node sees node j.
+    position (prefix + depth), read only for a tree with ``window`` > 0.
+    ancestors: [reqs * nodes] int64, bit j set when the node sees node j;
+    None for a chain, where node i sees nodes 0..i at position prefix + i.
     splits: key ranges per request at most; a request uses fewer when its prefix
     gives a range under ``min_split_keys`` keys.
     window: keys visible to a query at position p are (p - window, p]; 0 = all.
@@ -524,6 +532,7 @@ def tree_verify_attention(
     assert tree_verify_supported(head_dim=head_dim, num_nodes=num_nodes)
     assert k_cache.shape[-1] == v_cache.shape[-1] == head_dim
     assert k_cache.stride(-1) == v_cache.stride(-1) == q.stride(-1) == 1
+    assert ancestors is None or window == 0 or positions is not None
     if num_tokens == 0:
         return out
 
