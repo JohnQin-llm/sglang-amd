@@ -101,11 +101,14 @@ def test_sampled_tree_draws_children_from_q():
             assert len(kids) == len(set(kids))
 
 
-@pytest.mark.parametrize("accept_prior", [None, (0.6, 0.3)])
-def test_sampled_tree_verification_commits_the_target(accept_prior):
+@pytest.mark.parametrize(
+    "accept_prior, verify_nodes", [(None, 6), ((0.6, 0.3), 6), ((0.6, 0.3), 4)]
+)
+def test_sampled_tree_verification_commits_the_target(accept_prior, verify_nodes):
     """The tree builder once let a drawn child's own q decide whether it entered the tree,
     so the children kept were biased toward high q and multi-draft verification committed
-    tokens off the target distribution (max error 0.033 here, about 20 sigma)."""
+    tokens off the target distribution (max error 0.033 here, about 20 sigma). A prefix
+    of the tree (the adaptive width) keeps each node's first draws and stays lossless."""
     rows, num_depths, k, max_nodes = 100000, 3, 4, 6
     gen = torch.Generator().manual_seed(7)
     log_q = torch.log_softmax(
@@ -120,6 +123,11 @@ def test_sampled_tree_verification_commits_the_target(accept_prior):
         max_nodes=max_nodes,
         accept_prior=accept_prior,
     )
+    proposal = tree_prefix(proposal, verify_nodes, topk=k)
+    depth = tree_depth(proposal, verify_nodes, topk=k)
+    node_tokens = node_tokens[:, :verify_nodes].contiguous()
+    node_probs = node_probs[:, :verify_nodes].contiguous()
+    max_nodes = verify_nodes
     seq_lens = torch.full((rows,), 10, dtype=torch.long, device="cuda")
     _, _, retrieve_index, next_token, next_sibling, tokens = (
         build_tree_kernel_efficient(
@@ -130,7 +138,7 @@ def test_sampled_tree_verification_commits_the_target(accept_prior):
             seq_lens,
             int(seq_lens.sum()),
             k,
-            num_depths,
+            depth,
             max_nodes,
             TreeMaskMode.FULL_MASK,
         )
@@ -139,7 +147,7 @@ def test_sampled_tree_verification_commits_the_target(accept_prior):
     tree_speculative_sampling_multi_draft(
         predicts=predicts,
         accept_index=torch.full(
-            (rows, num_depths + 1), -1, dtype=torch.int32, device="cuda"
+            (rows, depth + 1), -1, dtype=torch.int32, device="cuda"
         ),
         accept_token_num=torch.zeros(rows, dtype=torch.int32, device="cuda"),
         candidates=tokens.view(rows, max_nodes),
@@ -264,6 +272,8 @@ def test_tree_prefix_is_the_narrower_tree(width):
     wide = build_dflash_tree_proposal(candidate_ids, cond_log_probs, max_nodes=48)
     narrow = build_dflash_tree_proposal(candidate_ids, cond_log_probs, max_nodes=width)
     prefix = tree_prefix(wide, width, topk=k)
+    # A server whose own width is below the lattice depth verifies its full build.
+    whole = tree_prefix(narrow, width, topk=k)
     assert torch.equal(prefix.draft_tokens, narrow.draft_tokens)
     assert torch.equal(prefix.top_scores_index, narrow.top_scores_index)
     depth = tree_depth(wide, width, topk=k)
@@ -283,10 +293,11 @@ def test_tree_prefix_is_the_narrower_tree(width):
             width,
             TreeMaskMode.FULL_MASK,
         )
-        for p, steps in ((prefix, depth), (narrow, num_depths))
+        for p, steps in ((prefix, depth), (whole, depth), (narrow, num_depths))
     ]
-    for got, want in zip(*outs):
+    for got, whole_got, want in zip(*outs):
         assert torch.equal(got, want)
+        assert torch.equal(whole_got, want)
 
 
 def test_calibration_update_counts_reached_and_accepted_nodes():

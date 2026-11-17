@@ -57,9 +57,12 @@ def tree_prefix(
     """The tree of the first ``num_nodes`` nodes, in EAGLE's ABI at ``tree_depth``, whose
     parent list is ``topk * (depth - 1) + 1`` wide; entries of later nodes are never
     read, since no kept edge points at them."""
-    if num_nodes == proposal.draft_tokens.shape[1] + 1:
-        return proposal
     parent_width = topk * (tree_depth(proposal, num_nodes, topk=topk) - 1) + 1
+    if (
+        num_nodes == proposal.draft_tokens.shape[1] + 1
+        and parent_width == proposal.parent_list.shape[1]
+    ):
+        return proposal
     return DFlashTreeProposal(
         draft_tokens=proposal.draft_tokens[:, : num_nodes - 1].contiguous(),
         parent_list=proposal.parent_list[:, :parent_width].contiguous(),
