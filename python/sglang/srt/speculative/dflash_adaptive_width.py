@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import bisect
 import json
+import logging
 import os
 import time
 from typing import Optional
 
 import msgspec
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class StepTimer:
@@ -260,6 +263,8 @@ class AdaptiveVerifyWidth:
             graph_runner=model_runner.decode_cuda_graph_runner,
         )
         default_runner = model_runner.decode_cuda_graph_runner
+        free_before, _ = torch.cuda.mem_get_info(self._device)
+        tic = time.perf_counter()
         captures_graphs = (
             default_runner is not None
             and default_runner is not model_runner.eager_runner
@@ -288,6 +293,14 @@ class AdaptiveVerifyWidth:
             self._states[width] = VerifyWidthState(
                 attn_backend=attn_backend, graph_runner=graph_runner
             )
+        free_after, _ = torch.cuda.mem_get_info(self._device)
+        logger.info(
+            "DFLASH adaptive tree width: widths=%s, extra verify backends and graphs "
+            "took %.2f s and %.2f GB",
+            list(self._states),
+            time.perf_counter() - tic,
+            (free_before - free_after) / (1 << 30),
+        )
 
     def select_width(self, *, survival, bs: int) -> int:
         """Hand this step's expected accept lengths to a later step's host decision and
