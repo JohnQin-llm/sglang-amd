@@ -6,7 +6,10 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.speculative.dflash_tree import build_dflash_tree_proposal
+from sglang.kernels.ops.speculative.dflash_tree import (
+    build_dflash_sampled_tree_proposal,
+    build_dflash_tree_proposal,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -59,6 +62,34 @@ def test_matches_best_first_reference(num_depths, k, max_nodes):
             proposal.parent_list[b, 1 : max_nodes - 1].tolist()
             == edges[: max_nodes - 2]
         )
+
+
+def test_sampled_tree_draws_children_from_q():
+    # The first node is the root's first draw, so its token must follow q at depth 0.
+    rows, num_depths, k = 40000, 3, 4
+    gen = torch.Generator().manual_seed(3)
+    log_q = torch.log_softmax(
+        torch.randn(num_depths, k, k, generator=gen) * 1.5, dim=-1
+    )
+    candidate_ids = (
+        torch.arange(num_depths * k).view(1, num_depths, k).repeat(rows, 1, 1)
+    )
+    proposal, node_tokens, node_probs = build_dflash_sampled_tree_proposal(
+        candidate_ids.cuda(), log_q.repeat(rows, 1, 1, 1).cuda(), max_nodes=6
+    )
+    first = proposal.draft_tokens[:, 0].cpu()
+    freq = torch.bincount(first, minlength=k).double() / rows
+    assert (freq - log_q[0, 0].exp().double()).abs().max().item() < 0.012
+    assert torch.allclose(node_probs[:, 0].cpu(), log_q[0, 0].exp().expand(rows, k))
+    assert torch.equal(node_tokens[:, 0].cpu(), candidate_ids[:, 0])
+    # Siblings are listed in drawing order, so a node's children never repeat a token.
+    edges = proposal.top_scores_index.cpu()
+    for b in range(64):
+        parents = (edges[b] // k).tolist()
+        tokens = proposal.draft_tokens[b].cpu().tolist()
+        for parent in set(parents):
+            kids = [t for p, t in zip(parents, tokens) if p == parent]
+            assert len(kids) == len(set(kids))
 
 
 if __name__ == "__main__":

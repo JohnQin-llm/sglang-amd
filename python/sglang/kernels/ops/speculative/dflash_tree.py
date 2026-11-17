@@ -231,3 +231,209 @@ def build_dflash_tree_proposal(
         parent_list=parent_list,
         top_scores_index=selected_edges,
     )
+
+
+@triton.jit
+def _draw_child(cond_log_q, base, drawn, u, K: tl.constexpr):
+    """Draw one not-yet-drawn candidate from q (a row of K log-probs); -1 when none is left."""
+    ranks = tl.arange(0, K)
+    log_q = tl.load(cond_log_q + base + ranks).to(tl.float32)
+    avail = ((drawn >> ranks) & 1) == 0
+    q = tl.where(avail, tl.exp(log_q), 0.0)
+    total = tl.sum(q, axis=0)
+    hit = avail & (tl.cumsum(q, axis=0) > u * total)
+    rank = tl.min(tl.where(hit, ranks, K), axis=0)
+    # Rounding can leave u * total above the last cumsum: take the last available rank.
+    rank = tl.where(rank == K, tl.max(tl.where(avail, ranks, -1), axis=0), rank)
+    rank = tl.where(total > 0.0, rank, -1)
+    child_log_q = tl.sum(tl.where(ranks == rank, log_q, 0.0), axis=0)
+    return rank, tl.where(rank >= 0, child_log_q, -float("inf"))
+
+
+@triton.jit
+def _build_dflash_sampled_tree_kernel(
+    candidate_ids,
+    cond_log_q,
+    uniforms,
+    draft_tokens,
+    selected_edges,
+    parent_list,
+    node_depths,
+    node_ranks,
+    CAND_BATCH_STRIDE: tl.constexpr,
+    CAND_DEPTH_STRIDE: tl.constexpr,
+    LQ_BATCH_STRIDE: tl.constexpr,
+    LQ_DEPTH_STRIDE: tl.constexpr,
+    LQ_PARENT_STRIDE: tl.constexpr,
+    PARENT_BATCH_STRIDE: tl.constexpr,
+    NUM_DEPTHS: tl.constexpr,
+    K: tl.constexpr,
+    Q: tl.constexpr,
+    BLOCK_NODES: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    nodes = tl.arange(0, BLOCK_NODES)
+    lq_row = batch * LQ_BATCH_STRIDE
+    u_row = uniforms + batch * Q * K
+
+    tl.store(
+        parent_list + batch * PARENT_BATCH_STRIDE + nodes,
+        -1,
+        mask=nodes < PARENT_BATCH_STRIDE,
+    )
+    tl.store(node_depths + batch * Q, 0)
+    tl.store(node_ranks + batch * Q, 0)
+
+    # Per-node state; node 0 is the root (the bonus token) at depth 0.
+    depth = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
+    rank = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
+    mass = tl.where(nodes == 0, 0.0, -float("inf"))
+    taken = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
+    drawn = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
+    no_draws = tl.full((), 0, tl.int32)
+    root_rank, root_log_q = _draw_child(cond_log_q, lq_row, no_draws, tl.load(u_row), K)
+    next_rank = tl.where(nodes == 0, root_rank, -1)
+    next_log_q = tl.where(nodes == 0, root_log_q, -float("inf"))
+
+    for node_index in range(1, Q):
+        frontier = mass + next_log_q
+        best_mass = tl.max(frontier, axis=0)
+        parent = tl.min(tl.where(frontier == best_mass, nodes, BLOCK_NODES), axis=0)
+        is_parent = nodes == parent
+        parent_depth = tl.sum(tl.where(is_parent, depth, 0), axis=0)
+        parent_rank = tl.sum(tl.where(is_parent, rank, 0), axis=0)
+        parent_taken = tl.sum(tl.where(is_parent, taken, 0), axis=0)
+        parent_drawn = tl.sum(tl.where(is_parent, drawn, 0), axis=0)
+        child_rank = tl.sum(tl.where(is_parent, next_rank, 0), axis=0)
+        token = tl.load(
+            candidate_ids
+            + batch * CAND_BATCH_STRIDE
+            + parent_depth * CAND_DEPTH_STRIDE
+            + child_rank
+        )
+        # The k-th drawn child of a node is its k-th sibling, the order verification replays.
+        edge = parent * K + parent_taken
+        out = batch * (Q - 1) + node_index - 1
+        tl.store(draft_tokens + out, token)
+        tl.store(selected_edges + out, edge)
+        if node_index < Q - 1:
+            tl.store(parent_list + batch * PARENT_BATCH_STRIDE + node_index, edge)
+        tl.store(node_depths + batch * Q + node_index, parent_depth + 1)
+        tl.store(node_ranks + batch * Q + node_index, child_rank)
+
+        parent_drawn = parent_drawn | (1 << child_rank)
+        parent_taken += 1
+        refill_rank, refill_log_q = _draw_child(
+            cond_log_q,
+            lq_row + parent_depth * LQ_DEPTH_STRIDE + parent_rank * LQ_PARENT_STRIDE,
+            parent_drawn,
+            tl.load(u_row + parent * K + tl.minimum(parent_taken, K - 1)),
+            K,
+        )
+        child_depth = parent_depth + 1
+        first_rank, first_log_q = _draw_child(
+            cond_log_q,
+            lq_row
+            + tl.minimum(child_depth, NUM_DEPTHS - 1) * LQ_DEPTH_STRIDE
+            + child_rank * LQ_PARENT_STRIDE,
+            no_draws,
+            tl.load(u_row + node_index * K),
+            K,
+        )
+        parent_open = (parent_taken < K) & (parent_depth < NUM_DEPTHS)
+        child_open = child_depth < NUM_DEPTHS
+        taken = tl.where(is_parent, parent_taken, taken)
+        drawn = tl.where(is_parent, parent_drawn, drawn)
+        next_rank = tl.where(is_parent, refill_rank, next_rank)
+        next_log_q = tl.where(
+            is_parent, tl.where(parent_open, refill_log_q, -float("inf")), next_log_q
+        )
+        is_new = nodes == node_index
+        depth = tl.where(is_new, child_depth, depth)
+        rank = tl.where(is_new, child_rank, rank)
+        mass = tl.where(is_new, best_mass, mass)
+        next_rank = tl.where(is_new, first_rank, next_rank)
+        next_log_q = tl.where(
+            is_new, tl.where(child_open, first_log_q, -float("inf")), next_log_q
+        )
+
+
+@torch.inference_mode()
+def build_dflash_sampled_tree_proposal(
+    candidate_ids: Tensor,
+    cond_log_q: Tensor,
+    *,
+    max_nodes: int,
+    workspace: dict[str, Tensor] | None = None,
+) -> tuple[DFlashTreeProposal, Tensor, Tensor]:
+    """Sampled tree for lossless multi-draft verification at temperature > 0.
+
+    Every node draws its children one at a time without replacement from its own
+    ``q = exp(cond_log_q[b, depth, rank])``; nodes are added best-first by path log-q,
+    and a node's children enter the tree in drawing order. Returns the proposal and, per
+    node, the K candidate tokens and q of its children's distribution (rank order), which
+    the verifier replays.
+    """
+    batch_size, num_depths, candidate_top_k = candidate_ids.shape
+    if candidate_top_k > 32:
+        raise ValueError("the sampled tree tracks drawn candidates in a 32-bit mask")
+    parent_width = candidate_top_k * max(num_depths - 1, 0) + 1
+    if max_nodes < 2 or max_nodes - 1 > parent_width or max_nodes > 128:
+        raise ValueError(
+            f"EAGLE's parent-list ABI holds 2 <= Q <= min(128, K*(depth-1)+2) nodes; "
+            f"got Q={max_nodes}, K={candidate_top_k}, depth={num_depths}"
+        )
+    device = candidate_ids.device
+
+    def buffer(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> Tensor:
+        value = None if workspace is None else workspace.get(name)
+        if value is None or value.shape != shape or value.dtype != dtype:
+            value = torch.empty(shape, dtype=dtype, device=device)
+            if workspace is not None:
+                workspace[name] = value
+        return value
+
+    edge_shape = (batch_size, max_nodes - 1)
+    draft_tokens = buffer("sampled_draft_tokens", edge_shape, torch.long)
+    selected_edges = buffer("sampled_top_scores_index", edge_shape, torch.long)
+    parent_list = buffer("sampled_parent_list", (batch_size, parent_width), torch.long)
+    node_depths = buffer("node_depths", (batch_size, max_nodes), torch.int32)
+    node_ranks = buffer("node_ranks", (batch_size, max_nodes), torch.int32)
+    uniforms = torch.rand(
+        (batch_size, max_nodes, candidate_top_k), dtype=torch.float32, device=device
+    )
+    cond_log_q = cond_log_q.contiguous()
+    candidate_ids = candidate_ids.contiguous()
+    _build_dflash_sampled_tree_kernel[(batch_size,)](
+        candidate_ids,
+        cond_log_q,
+        uniforms,
+        draft_tokens,
+        selected_edges,
+        parent_list,
+        node_depths,
+        node_ranks,
+        CAND_BATCH_STRIDE=candidate_ids.stride(0),
+        CAND_DEPTH_STRIDE=candidate_ids.stride(1),
+        LQ_BATCH_STRIDE=cond_log_q.stride(0),
+        LQ_DEPTH_STRIDE=cond_log_q.stride(1),
+        LQ_PARENT_STRIDE=cond_log_q.stride(2),
+        PARENT_BATCH_STRIDE=parent_list.stride(0),
+        NUM_DEPTHS=num_depths,
+        K=candidate_top_k,
+        Q=max_nodes,
+        BLOCK_NODES=triton.next_power_of_2(max_nodes),
+        num_warps=4,
+        num_stages=1,
+    )
+    rows = torch.arange(batch_size, device=device)[:, None]
+    depths = node_depths.long().clamp(max=num_depths - 1)
+    node_draft_tokens = candidate_ids[rows, depths]
+    node_draft_probs = cond_log_q[rows, depths, node_ranks.long()].exp()
+    node_draft_probs = node_draft_probs * (node_depths < num_depths).unsqueeze(-1)
+    proposal = DFlashTreeProposal(
+        draft_tokens=draft_tokens,
+        parent_list=parent_list,
+        top_scores_index=selected_edges,
+    )
+    return proposal, node_draft_tokens, node_draft_probs

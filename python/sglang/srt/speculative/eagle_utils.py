@@ -15,6 +15,9 @@ from sglang.kernels.ops.speculative.spec_tree import (
     build_tree_kernel_efficient_func,
     verify_tree_greedy_func,
 )
+from sglang.kernels.ops.speculative.multi_draft_sampling import (
+    tree_speculative_sampling_multi_draft,
+)
 from sglang.kernels.ops.speculative.verify_sampling import (
     chain_speculative_sampling_triton,
     tree_speculative_sampling_target_only,
@@ -790,44 +793,72 @@ def eagle_sample(
         else:
             sampling_fn = tree_speculative_sampling_target_only
 
-        target_probs = sampling_softmax(
-            next_token_logits,
-            temperatures=sampling_info.temperatures,
-            rows_per_request=verify_input.draft_token_num,
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
+        if verify_input.tree_draft_probs is not None:
+            from sglang.srt.speculative.dflash_utils import (
+                build_speculative_verify_target_probs,
+            )
+
+            # Same distribution as the dense path below; top-k first keeps the
+            # top-p pass to k entries instead of a sort over the vocab. The host
+            # top-ks (sampling_info.top_ks' source) spare a device sync.
+            top_ks = {req.sampling_params.top_k for req in batch.reqs}
+            target_probs = build_speculative_verify_target_probs(
+                next_token_logits=next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=verify_input.draft_token_num,
+                bs=bs,
+                max_top_k=max(top_ks),
+                uniform_top_k_value=next(iter(top_ks)) if len(top_ks) == 1 else None,
+            )
+            sampling_fn = partial(
+                tree_speculative_sampling_multi_draft,
+                node_draft_tokens=verify_input.tree_draft_tokens,
+                node_draft_probs=verify_input.tree_draft_probs,
+            )
+            draft_probs = None
+        else:
+            target_probs = sampling_softmax(
+                next_token_logits,
+                temperatures=sampling_info.temperatures,
+                rows_per_request=verify_input.draft_token_num,
             )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+            if sampling_info.need_top_k_sampling:
+                target_probs = top_k_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                    ),
+                )  # (bs * num_draft_tokens, vocab_size)
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_k_renorm"
+                )
+            if sampling_info.need_top_p_sampling:
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                    ),
+                )
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_p_renorm"
+                )
+            target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+            draft_probs = (
+                verify_input.draft_probs
+                if use_rejection_sampling
+                else torch.zeros_like(target_probs)
             )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
-        target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = (
-            verify_input.draft_probs
-            if use_rejection_sampling
-            else torch.zeros_like(target_probs)
-        )
-        # Defense-in-depth behind the spec_hook startup allowlist: validate
-        # the actual kernel inputs before the Triton kernel.
-        if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
-        ):
-            raise ValueError(
-                "Rejection sampling requires a target-vocab draft proposal "
-                "distribution; the current speculative algorithm/draft worker "
-                "does not produce one (draft_probs missing or vocab-mismatched)."
-            )
+            # Defense-in-depth behind the spec_hook startup allowlist: validate
+            # the actual kernel inputs before the Triton kernel.
+            if use_rejection_sampling and (
+                draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+            ):
+                raise ValueError(
+                    "Rejection sampling requires a target-vocab draft proposal "
+                    "distribution; the current speculative algorithm/draft worker "
+                    "does not produce one (draft_probs missing or vocab-mismatched)."
+                )
 
         coins, coins_for_final_sampling = _verify_coins(
             sampling_info=sampling_info,
@@ -836,7 +867,7 @@ def eagle_sample(
             candidates=candidates,
             device=device,
         )
-        sampling_fn(
+        sampling_kwargs = dict(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
             accept_token_num=num_correct_drafts,  # mutable
@@ -848,11 +879,17 @@ def eagle_sample(
             uniform_samples=coins,
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=get_spec().speculative_accept_threshold_single,
-            threshold_acc=get_spec().speculative_accept_threshold_acc,
-            deterministic=True,
         )
+        if draft_probs is None:
+            sampling_fn(**sampling_kwargs)
+        else:
+            sampling_fn(
+                **sampling_kwargs,
+                draft_probs=draft_probs,
+                threshold_single=get_spec().speculative_accept_threshold_single,
+                threshold_acc=get_spec().speculative_accept_threshold_acc,
+                deterministic=True,
+            )
         del (
             target_probs,
             draft_probs,

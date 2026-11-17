@@ -34,6 +34,10 @@ class EagleVerifyInput(SpecInput):
     # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
     # vocab); only set under rejection sampling. Consumed by the verify kernel.
     draft_probs: torch.Tensor = None
+    # Multi-draft tree verify: per node, its K child candidates and their draft q
+    # ([bs, draft_token_num, K]), children listed in drawing order.
+    tree_draft_tokens: Optional[torch.Tensor] = None
+    tree_draft_probs: Optional[torch.Tensor] = None
     prepared_out_cache_loc: Optional[torch.Tensor] = None
     prepared_mrope_positions: Optional[torch.Tensor] = None
     # The iteration's plan when the draft planned the verify window

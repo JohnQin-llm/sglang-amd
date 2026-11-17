@@ -59,6 +59,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_tree_verify import (
+    propose_dflash_sampled_tree,
     propose_dflash_tree,
     verify_dflash_tree,
 )
@@ -2389,6 +2390,15 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def _tree_temperatures(self, sampling_info, bs: int) -> torch.Tensor:
+        # Greedy rows in a mixed batch verify against a one-hot target, which is
+        # lossless under any q; temperature 1 just gives them a well-spread tree.
+        temperatures = sampling_info.temperatures.view(-1)[:bs].float().clamp(min=1e-5)
+        greedy = resolve_greedy_mask(
+            bs=bs, sampling_info=sampling_info, device=self.device
+        )
+        return torch.where(greedy[:bs], 1.0, temperatures)
+
     def _forward_decode_tree(
         self,
         *,
@@ -2413,13 +2423,24 @@ class DFlashWorkerV2(BaseSpecWorker):
             candidate_ids, scores = _selector_lattice(
                 self.draft_model, draft_hidden[:, 1:, :], bonus_tokens
             )
-        proposal = propose_dflash_tree(
-            candidate_ids=candidate_ids,
-            scores=scores,
-            topk=self.tree_topk,
-            num_nodes=self.tree_num_nodes,
-            workspace=self._tree_workspace,
-        )
+        node_draft_tokens = node_draft_probs = None
+        if _is_all_greedy(batch.sampling_info):
+            proposal = propose_dflash_tree(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                topk=self.tree_topk,
+                num_nodes=self.tree_num_nodes,
+                workspace=self._tree_workspace,
+            )
+        else:
+            proposal, node_draft_tokens, node_draft_probs = propose_dflash_sampled_tree(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                temperatures=self._tree_temperatures(batch.sampling_info, bs),
+                topk=self.tree_topk,
+                num_nodes=self.tree_num_nodes,
+                workspace=self._tree_workspace,
+            )
         result = verify_dflash_tree(
             batch=batch,
             bonus_tokens=bonus_tokens,
@@ -2431,6 +2452,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             depth=int(self.block_size) - 1,
             num_nodes=self.tree_num_nodes,
             device=self.device,
+            node_draft_tokens=node_draft_tokens,
+            node_draft_probs=node_draft_probs,
         )
         if on_publish is not None:
             on_publish(result.new_seq_lens)
