@@ -638,7 +638,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
-        self._target_logits_processor = self._defer_target_verify_gather()
+        # Tree verify samples in EAGLE's verify path, which reads full-vocab
+        # softcapped logits; only the chain finishes a deferred vocab shard.
+        self._target_logits_processor = (
+            None if self.tree_mode else self._defer_target_verify_gather()
+        )
 
     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
         processors = [
