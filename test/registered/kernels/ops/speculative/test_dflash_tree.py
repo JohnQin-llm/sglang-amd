@@ -487,11 +487,13 @@ def test_mixed_batch_keeps_sampled_rows(verify_fn):
     )
     keep = ~greedy_rows
     for name in ("draft_tokens", "parent_list", "top_scores_index"):
-        mixed_value = getattr(mixed[0], name)
-        assert torch.equal(mixed_value[keep], getattr(sampled[0], name)[keep])
-        assert torch.equal(
-            mixed_value[greedy_rows], getattr(best_first, name)[greedy_rows]
+        # Only the first Q - 1 parent-list entries are written and read.
+        mixed_value, sampled_value, best_first_value = (
+            getattr(tree, name)[:, : max_nodes - 1]
+            for tree in (mixed[0], sampled[0], best_first)
         )
+        assert torch.equal(mixed_value[keep], sampled_value[keep])
+        assert torch.equal(mixed_value[greedy_rows], best_first_value[greedy_rows])
     for mixed_value, sampled_value in zip(mixed[1:], sampled[1:]):
         assert torch.equal(mixed_value[keep], sampled_value[keep])
 
