@@ -328,6 +328,7 @@ class AdaptiveVerifyWidth:
         if self._dump is not None:
             self._write_dump(
                 survival=proposal.survival,
+                accept_index=accept_index,
                 accept_lens=accept_lens,
                 width=width,
                 raw_log_mass=raw_log_mass,
@@ -342,10 +343,31 @@ class AdaptiveVerifyWidth:
             topk=topk,
         )
 
-    def _write_dump(self, *, survival, accept_lens, width, raw_log_mass) -> None:
-        """One line per step: width, then per request the accept length and the
-        predicted (calibrated, then raw) expected accept length at every width."""
+    def _write_dump(
+        self, *, survival, accept_index, accept_lens, width, raw_log_mass
+    ) -> None:
+        """One line per step: width, then per request the accept length, the predicted
+        (calibrated, then raw) expected accept length at every width, and the accept
+        length each narrower width would have had (-1 above the verified width): the
+        accepted path's leading nodes inside that prefix, since greedy verification
+        accepts the target's one path wherever the tree holds it."""
         bs = accept_lens.shape[0]
+        offsets = torch.arange(bs, device=accept_index.device).unsqueeze(1) * width
+        path = accept_index[:bs].long() - offsets
+        on_path = torch.arange(path.shape[1], device=path.device) < accept_lens.view(
+            -1, 1
+        )
+        counterfactual = []
+        for w in self.widths:
+            inside = (path < w) & on_path
+            lead = torch.cumprod(inside.int(), dim=1).sum(dim=1)
+            counterfactual.append(
+                torch.where(
+                    torch.tensor(w <= width, device=path.device),
+                    lead.float(),
+                    torch.full_like(lead, -1).float(),
+                )
+            )
         predicted = survival.prefix_accept_len[:bs, self._width_columns]
         if raw_log_mass is None:
             raw = torch.zeros_like(predicted)
@@ -353,6 +375,12 @@ class AdaptiveVerifyWidth:
             raw = 1.0 + torch.cumsum(raw_log_mass[:bs, 1:].exp(), dim=1)
             raw = raw[:, self._width_columns - 1]
         rows = torch.cat(
-            [accept_lens.view(-1, 1).float(), predicted, raw], dim=1
+            [
+                accept_lens.view(-1, 1).float(),
+                predicted,
+                raw,
+                torch.stack(counterfactual, dim=1),
+            ],
+            dim=1,
         ).tolist()
         self._dump.write(json.dumps({"width": width, "rows": rows}) + "\n")
