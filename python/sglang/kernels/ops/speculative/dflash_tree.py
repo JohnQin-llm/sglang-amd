@@ -463,6 +463,36 @@ def _max_undrawn_log_q(cond_log_q, base, drawn, K: tl.constexpr):
 
 
 @triton.jit
+def _rank_prior(
+    rank_table,
+    depth,
+    taken,
+    log_first,
+    log_miss_first,
+    log_sibling,
+    log_miss_sibling,
+    NUM_DEPTHS: tl.constexpr,
+    NUM_CLASSES: tl.constexpr,
+    RANK_TABLE: tl.constexpr,
+):
+    """Log chance that a node's draw ``taken`` is the child verification accepts, given
+    the node is accepted: the (depth, draw class) entry of ``rank_table``, each draw past
+    the last class one more miss of the sibling prior; without RANK_TABLE the draw prior."""
+    if RANK_TABLE:
+        cls = tl.minimum(taken, NUM_CLASSES - 1)
+        safe_depth = tl.minimum(depth, NUM_DEPTHS - 1)
+        later = tl.maximum(taken - (NUM_CLASSES - 1), 0).to(tl.float32)
+        return (
+            tl.load(rank_table + safe_depth * NUM_CLASSES + cls)
+            + later * log_miss_sibling
+        )
+    else:
+        return _draw_prior(
+            taken, log_first, log_miss_first, log_sibling, log_miss_sibling
+        )
+
+
+@triton.jit
 def _draw_prior(taken, log_first, log_miss_first, log_sibling, log_miss_sibling):
     """Log-probability that a node's draw number ``taken`` (0-based) is the child
     verification accepts: the first draw is accepted with prob a, each later one with
@@ -482,6 +512,7 @@ def _build_dflash_sampled_tree_kernel(
     node_depths,
     node_ranks,
     log_priors,
+    rank_table,
     cal_stats,
     prior_stats,
     node_log_survival,
@@ -500,6 +531,7 @@ def _build_dflash_sampled_tree_kernel(
     Q: tl.constexpr,
     BLOCK_NODES: tl.constexpr,
     ACCEPT_PRIOR: tl.constexpr,
+    RANK_TABLE: tl.constexpr,
     CHAIN: tl.constexpr,
     CALIBRATE: tl.constexpr,
     PRIOR_FROM_STATS: tl.constexpr,
@@ -547,8 +579,17 @@ def _build_dflash_sampled_tree_kernel(
     log_sibling = tl.load(log_priors + 2)
     log_miss_sibling = tl.load(log_priors + 3)
     if ACCEPT_PRIOR:
-        root_bound = _draw_prior(
-            no_draws, log_first, log_miss_first, log_sibling, log_miss_sibling
+        root_bound = _rank_prior(
+            rank_table,
+            no_draws,
+            no_draws,
+            log_first,
+            log_miss_first,
+            log_sibling,
+            log_miss_sibling,
+            NUM_DEPTHS,
+            NUM_CLASSES,
+            RANK_TABLE,
         )
     else:
         root_bound = _max_undrawn_log_q(cond_log_q, lq_row, no_draws, K)
@@ -606,11 +647,29 @@ def _build_dflash_sampled_tree_kernel(
         parent_taken += 1
         child_depth = parent_depth + 1
         if ACCEPT_PRIOR:
-            parent_bound = _draw_prior(
-                parent_taken, log_first, log_miss_first, log_sibling, log_miss_sibling
+            parent_bound = _rank_prior(
+                rank_table,
+                parent_depth,
+                parent_taken,
+                log_first,
+                log_miss_first,
+                log_sibling,
+                log_miss_sibling,
+                NUM_DEPTHS,
+                NUM_CLASSES,
+                RANK_TABLE,
             )
-            child_bound = _draw_prior(
-                no_draws, log_first, log_miss_first, log_sibling, log_miss_sibling
+            child_bound = _rank_prior(
+                rank_table,
+                child_depth,
+                no_draws,
+                log_first,
+                log_miss_first,
+                log_sibling,
+                log_miss_sibling,
+                NUM_DEPTHS,
+                NUM_CLASSES,
+                RANK_TABLE,
             )
             child_mass = parent_mass + parent_next
         else:
@@ -705,6 +764,7 @@ def build_dflash_sampled_tree(
     calibration: Tensor | None = None,
     calibration_prior_stats: Tensor | None = None,
     calibration_prior: float = 2.0,
+    rank_table: Tensor | None = None,
 ) -> DFlashSampledTree:
     """Sampled tree for lossless multi-draft verification at temperature > 0.
 
@@ -724,8 +784,18 @@ def build_dflash_sampled_tree(
     accept rate, ``(hits + prior * r0) / (reached + prior)``, with ``r0`` the draw prior
     or, with ``calibration_prior_stats``, that table's rate of the slot. Only the
     estimate changes, not the tree.
+
+    ``rank_table`` (``[L * NUM_DRAW_CLASSES]``, ``update_rank_table``) replaces the draw
+    prior's ranking by log accept rates per (depth, draw class) learned in earlier
+    steps; it does not depend on this step's draws, so the tree stays draw-independent.
     """
     batch_size, num_depths, candidate_top_k = candidate_ids.shape
+    if rank_table is not None and (
+        accept_prior is None or rank_table.shape != (num_depths * NUM_DRAW_CLASSES,)
+    ):
+        raise ValueError(
+            f"rank_table needs accept_prior and shape [{num_depths * NUM_DRAW_CLASSES}]"
+        )
     if candidate_top_k > 32:
         raise ValueError("the sampled tree tracks drawn candidates in a 32-bit mask")
     parent_width = candidate_top_k * max(num_depths - 1, 0) + 1
@@ -795,6 +865,7 @@ def build_dflash_sampled_tree(
         node_depths,
         node_ranks,
         log_priors,
+        rank_table if rank_table is not None else log_priors,
         calibration if calibration is not None else survival.node_edge_prob,
         (
             calibration_prior_stats
@@ -817,6 +888,7 @@ def build_dflash_sampled_tree(
         Q=max_nodes,
         BLOCK_NODES=triton.next_power_of_2(max_nodes),
         ACCEPT_PRIOR=accept_prior is not None,
+        RANK_TABLE=rank_table is not None,
         CHAIN=chain,
         CALIBRATE=calibration is not None,
         PRIOR_FROM_STATS=calibration_prior_stats is not None,
@@ -881,6 +953,22 @@ def build_dflash_sampled_tree_proposal(
         candidate_ids, cond_log_q, tree, max_nodes
     )
     return tree.proposal, node_draft_tokens, node_draft_probs
+
+
+@torch.inference_mode()
+def update_rank_table(
+    *, rank_table: Tensor, stats: Tensor, log_priors: Tensor, prior: float = 2.0
+) -> None:
+    """Log accept rate per (depth, draw class) of a sampled tree's calibration ``stats``
+    (summed over the q bins), each shrunk toward the draw prior of its class; on the
+    device without a host sync."""
+    num_depths = rank_table.shape[0] // NUM_DRAW_CLASSES
+    counts = stats[:2].view(2, num_depths, NUM_DRAW_CLASSES, -1).sum(-1)
+    draw = torch.arange(NUM_DRAW_CLASSES, device=stats.device, dtype=torch.float32)
+    later = log_priors[1] + (draw - 1) * log_priors[3] + log_priors[2]
+    prior_rate = torch.where(draw == 0, log_priors[0], later).exp()
+    rate = (counts[0] + prior * prior_rate) / (counts[1] + prior)
+    rank_table.copy_(rate.clamp(1e-6, 1.0).log().view(-1))
 
 
 @torch.inference_mode()

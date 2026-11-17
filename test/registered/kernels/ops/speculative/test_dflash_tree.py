@@ -20,6 +20,7 @@ from sglang.kernels.ops.speculative.dflash_tree import (
     tree_depth,
     tree_prefix,
     update_draw_acceptance,
+    update_rank_table,
     update_tree_calibration,
 )
 from sglang.kernels.ops.speculative.multi_draft_sampling import (
@@ -697,6 +698,52 @@ def test_chain_is_every_nodes_first_draw():
         build_dflash_sampled_tree(
             candidate_ids.cuda(), log_q.cuda(), max_nodes=num_depths + 2, chain=True
         )
+
+
+@pytest.mark.parametrize("deep_first", [True, False])
+def test_rank_table_orders_slots_by_depth(deep_first):
+    # A table that makes deep first draws likely grows the chain before any sibling; one
+    # that makes the root's second draw likelier than any depth-1 child fills the root
+    # first.
+    rows, num_depths, k = 32, 4, 8
+    log_q = torch.log_softmax(torch.zeros(rows, num_depths, k, k), dim=-1).cuda()
+    candidate_ids = (
+        torch.arange(num_depths * k).view(1, num_depths, k).repeat(rows, 1, 1).cuda()
+    )
+    rates = torch.full((num_depths, NUM_DRAW_CLASSES), 1e-3)
+    if deep_first:
+        rates[:, 0] = 0.9
+    else:
+        rates[0] = torch.tensor([0.5, 0.4, 0.3, 0.2])
+        rates[1:, 0] = 0.01
+    tree = build_dflash_sampled_tree(
+        candidate_ids,
+        log_q,
+        max_nodes=num_depths + 1,
+        accept_prior=(0.7, 0.3),
+        rank_table=rates.log().view(-1).cuda(),
+    )
+    parents = (tree.proposal.top_scores_index.cpu() // k).tolist()
+    want = list(range(num_depths)) if deep_first else [0] * num_depths
+    assert all(row == want for row in parents)
+
+
+def test_rank_table_is_the_slot_rate_by_depth_and_draw():
+    num_depths = 3
+    bins = NUM_CALIBRATION_BINS
+    stats = torch.zeros(3, num_depths * NUM_DRAW_CLASSES * bins)
+    view = stats[:2].view(2, num_depths, NUM_DRAW_CLASSES, bins)
+    view[1, 1, 0, 3] = 6.0  # depth 1, first draws: 6 reached over two bins, 5 hit
+    view[1, 1, 0, 7] = 2.0
+    view[0, 1, 0, 3] = 5.0
+    log_priors = torch.tensor(log_draw_priors((0.7, 0.3)))
+    table = torch.zeros(num_depths * NUM_DRAW_CLASSES)
+    update_rank_table(rank_table=table, stats=stats, log_priors=log_priors, prior=2.0)
+    rates = table.exp().view(num_depths, NUM_DRAW_CLASSES)
+    assert rates[1, 0].item() == pytest.approx((5 + 2 * 0.7) / (8 + 2))
+    # Without data each class keeps its draw prior: a, then (1 - a) (1 - a')^(c - 1) a'.
+    assert rates[0, 0].item() == pytest.approx(0.7)
+    assert rates[2, 2].item() == pytest.approx(0.3 * 0.7 * 0.3)
 
 
 def _sampled_survival_reference(tree, log_q, stats, prior_stats, log_priors, prior):

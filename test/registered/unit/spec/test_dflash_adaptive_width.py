@@ -219,6 +219,42 @@ class TestChainMember(CustomTestCase):
         self.assertEqual(width.choose_sampled_member(bs=1), 16)
 
 
+class TestSampledPolicy(CustomTestCase):
+    def _width(self):
+        config = AdaptiveWidthConfig(
+            widths=(32,),
+            sampled_members=(CHAIN, 16, 32),
+            cost_ms={},
+            sampled_cost_ms={CHAIN: {1: 10.0}, 16: {1: 11.0}, 32: {1: 12.0}},
+            force_width=None,
+            calibration_dump=None,
+        )
+        return AdaptiveVerifyWidth(
+            config=config, num_depths=15, chain_rows=16, device=torch.device("cpu")
+        )
+
+    def test_exploration_visits_every_other_member(self):
+        width = self._width()
+        width._sampled_stats._events = [_FakeEvent() for _ in range(4)]
+        picks = [width.choose_sampled_member(bs=1) for _ in range(128)]
+        explored = picks[31::32]
+        self.assertEqual(sorted(set(explored)), [16, 32])
+        self.assertTrue(all(p == CHAIN for i, p in enumerate(picks) if i % 32 != 31))
+
+    def test_member_scale_rescales_the_prediction(self):
+        width = self._width()
+        width._sampled_stats._events = [_FakeEvent() for _ in range(4)]
+        # 16 accepted for every 10 predicted at member 16, after plenty of verifies.
+        width._member_totals[:, 1] = torch.tensor([1.6e6, 1.0e6])
+        tree = SimpleNamespace(prefix_accept_len=torch.arange(1.0, 33.0).view(1, 32))
+        chain = SimpleNamespace(prefix_accept_len=torch.full((1, 16), 4.0))
+        out = width.predict_sampled(tree_survival=tree, chain_survival=chain, bs=1)
+        torch.testing.assert_close(out[0, 3:], torch.tensor([4.0, 16.0, 32.0]))
+        torch.testing.assert_close(
+            out[0, :3], torch.tensor([4.0, 16.0 * 1.6, 32.0]), rtol=1e-4, atol=1e-4
+        )
+
+
 class TestStaleDeviceStats(CustomTestCase):
     def test_reads_only_finished_copies_newest_last(self):
         stats = StaleDeviceStats(

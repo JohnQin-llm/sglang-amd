@@ -88,7 +88,9 @@ class AdaptiveWidthConfig(msgspec.Struct, frozen=True):
     (sampled batches fall back to ``cost_ms``). SGLANG_DFLASH_TREE_FORCE_WIDTH verifies
     at this member every step where it is one (for measurements), and
     SGLANG_DFLASH_TREE_CALIBRATION_DUMP appends per-step predicted and actual accept
-    lengths (one host sync every few dozen steps)."""
+    lengths (one host sync every few dozen steps). SGLANG_DFLASH_TREE_RANK=depth ranks
+    sampled-tree slots by accept rates learned per (depth, draw class) instead of the
+    two online draw priors."""
 
     widths: tuple[int, ...]
     sampled_members: tuple[int, ...]
@@ -96,6 +98,7 @@ class AdaptiveWidthConfig(msgspec.Struct, frozen=True):
     sampled_cost_ms: dict[int, dict[int, float]]
     force_width: Optional[int]
     calibration_dump: Optional[str]
+    rank_by_depth: bool = False
 
 
 def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
@@ -141,6 +144,7 @@ def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
         sampled_cost_ms=sampled_cost_ms,
         force_width=force_width,
         calibration_dump=calibration_dump,
+        rank_by_depth=os.environ.get("SGLANG_DFLASH_TREE_RANK") == "depth",
     )
 
 
@@ -255,6 +259,13 @@ class VerifyWidthState(msgspec.Struct, frozen=True):
 # Calibration dump lines are queued on the device and written with one host sync per
 # this many steps; arbitrary.
 _DUMP_FLUSH_STEPS = 64
+# Every this many sampled steps verify another member in turn, so the calibration of
+# members the policy does not pick stays current; arbitrary.
+_EXPLORE_EVERY = 32
+# Per-member accept-length scale: decay per verify of the member, and the prior weight
+# in accepted tokens that holds it at 1 until data arrives; arbitrary.
+_MEMBER_SCALE_DECAY = 0.98
+_MEMBER_SCALE_PRIOR = 50.0
 
 
 class AdaptiveVerifyWidth:
@@ -273,6 +284,7 @@ class AdaptiveVerifyWidth:
     ):
         from sglang.kernels.ops.speculative.dflash_tree import (
             NUM_CALIBRATION_BINS,
+            NUM_DRAW_CLASSES,
             sampled_calibration_slots,
         )
 
@@ -297,6 +309,12 @@ class AdaptiveVerifyWidth:
         self.chain_stats = (
             stats(sampled_calibration_slots(num_depths)) if self.has_chain else None
         )
+        # Filled by refresh_rank_table before the first step.
+        self.rank_table = (
+            torch.zeros(num_depths * NUM_DRAW_CLASSES, device=device)
+            if config.rank_by_depth
+            else None
+        )
         self._width_columns = torch.tensor(
             [width - 1 for width in config.widths], dtype=torch.long, device=device
         )
@@ -316,6 +334,12 @@ class AdaptiveVerifyWidth:
                 initial=[1.0] * len(config.widths), device=device
             )
         self._sampled_policy = self._sampled_stats = None
+        self._sampled_steps = 0
+        # Decayed sums of actual and predicted (per-node model) accept length over each
+        # member's verifies; their ratio rescales the member's prediction.
+        self._member_totals = torch.zeros(
+            (2, len(config.sampled_members)), dtype=torch.float32, device=device
+        )
         if len(config.sampled_members) > 1 and force not in config.sampled_members:
             self._sampled_policy = VerifyWidthPolicy(
                 widths=config.sampled_members, cost_ms=config.sampled_cost_ms
@@ -427,16 +451,22 @@ class AdaptiveVerifyWidth:
             return force
         if self._sampled_policy is None:
             return self.sampled_members[-1]
-        return self._sampled_policy.choose(
+        choice = self._sampled_policy.choose(
             bs=bs, expected_accept_lens=self._sampled_stats.latest()
         )
+        self._sampled_steps += 1
+        if self._sampled_steps % _EXPLORE_EVERY == 0:
+            others = [m for m in self.sampled_members if m != choice]
+            choice = others[(self._sampled_steps // _EXPLORE_EVERY) % len(others)]
+        return choice
 
     def predict_sampled(
         self, *, tree_survival, chain_survival, bs: int
     ) -> Optional[torch.Tensor]:
-        """Expected accept length ``[bs, members]`` of every sampled member, pushed (batch
-        mean) for later steps' decisions; None when neither a policy nor the dump reads
-        it."""
+        """Expected accept length of every sampled member, ``[bs, 2 * members]``: the
+        per-node model's rescaled by the member's measured ratio, then unscaled. The
+        rescaled batch mean is pushed for later steps' decisions. None when neither a
+        policy nor the dump reads it."""
         if self._sampled_policy is None and self._dump is None:
             return None
         columns = []
@@ -450,10 +480,14 @@ class AdaptiveVerifyWidth:
             columns.append(
                 tree_survival.prefix_accept_len[:bs, self._sampled_tree_columns]
             )
-        predicted = torch.cat(columns, dim=1)
+        raw = torch.cat(columns, dim=1)
+        scale = (self._member_totals[0] + _MEMBER_SCALE_PRIOR) / (
+            self._member_totals[1] + _MEMBER_SCALE_PRIOR
+        )
+        predicted = raw * scale
         if self._sampled_policy is not None:
             self._sampled_stats.push(predicted.mean(dim=0))
-        return predicted
+        return torch.cat([predicted, raw], dim=1)
 
     def activate(self, width: int, model_runner) -> None:
         if width == self._active:
@@ -507,6 +541,13 @@ class AdaptiveVerifyWidth:
         trees'), whose survival and edges ``proposal`` (that member's build) holds."""
         from sglang.kernels.ops.speculative.dflash_tree import update_tree_calibration
 
+        if predicted is not None:
+            j = self.sampled_members.index(member)
+            n = len(self.sampled_members)
+            totals = self._member_totals[:, j]
+            totals.mul_(_MEMBER_SCALE_DECAY).add_(
+                torch.stack([accept_lens.float().sum(), predicted[:, n + j].sum()])
+            )
         if self._dump is not None and predicted is not None:
             self._queue_dump(
                 {
@@ -525,6 +566,18 @@ class AdaptiveVerifyWidth:
             num_nodes=self.member_rows(member),
             topk=topk,
         )
+
+    def refresh_rank_table(self, log_priors: torch.Tensor) -> None:
+        """Recompute the sampled trees' ranking from their calibration statistics; the
+        next step's tree reads it, so it never sees that step's draws."""
+        from sglang.kernels.ops.speculative.dflash_tree import update_rank_table
+
+        if self.rank_table is not None:
+            update_rank_table(
+                rank_table=self.rank_table,
+                stats=self.sampled_stats,
+                log_priors=log_priors,
+            )
 
     def _queue_dump(self, header: dict, rows: torch.Tensor) -> None:
         self._dump_queue.append((header, rows))

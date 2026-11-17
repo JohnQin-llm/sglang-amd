@@ -162,6 +162,7 @@ def propose_adaptive_sampled_tree(
         workspace=workspace,
         accept_prior=accept_prior,
         calibration=adaptive.sampled_stats,
+        rank_table=adaptive.rank_table,
     )
     chain = None
     if adaptive.has_chain:

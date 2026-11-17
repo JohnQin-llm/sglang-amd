@@ -590,6 +590,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 chain_rows=int(self.block_size),
                 device=torch.device(self.device),
             )
+            if (
+                self._adaptive_width is not None
+                and self._adaptive_width.rank_table is not None
+            ):
+                if not isinstance(self._tree_accept_prior, torch.Tensor):
+                    raise ValueError(
+                        "SGLANG_DFLASH_TREE_RANK=depth needs "
+                        "SGLANG_DFLASH_TREE_ACCEPT_PRIOR=online"
+                    )
+                self._adaptive_width.refresh_rank_table(self._tree_accept_prior)
             self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
         if self._is_domino and self.block_size <= 1:
             raise ValueError(
@@ -2601,6 +2611,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 topk=self.tree_topk,
                 sampled_rows=sampled_rows,
             )
+            if sampled_plan is not None:
+                adaptive.refresh_rank_table(self._tree_accept_prior)
 
         # The accepted path (root first) now fronts each request's verify rows, and it
         # is at most min(Q, F) long, so it fits the draft block's first columns.
