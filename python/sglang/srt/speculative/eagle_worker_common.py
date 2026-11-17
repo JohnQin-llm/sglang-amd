@@ -51,6 +51,10 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import (
+        LogitsProcessor,
+        LogitsProcessorOutput,
+    )
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
@@ -491,6 +495,24 @@ def build_eagle_verify_input(
     )
 
 
+def _finish_deferred_verify_logits(
+    logits_output: LogitsProcessorOutput,
+    *,
+    deferred_logits: Optional[LogitsProcessor],
+    argmax_from_shard: bool,
+) -> Optional[torch.Tensor]:
+    """A deferring LogitsProcessor leaves the verify logits as this rank's vocab
+    shard, not yet softcapped. Return the target argmax taken off the shard when
+    ``argmax_from_shard``; otherwise gather the full logits in place and return None."""
+    logits = logits_output.next_token_logits
+    if deferred_logits is None or not deferred_logits.is_deferred_shard(logits):
+        return None
+    if argmax_from_shard:
+        return deferred_logits.deferred_argmax(logits)
+    logits_output.next_token_logits = deferred_logits.finish_deferred_gather(logits)
+    return None
+
+
 def _finalize_accept_tree_path(
     batch: ScheduleBatch,
     accept_index: torch.Tensor,
@@ -565,6 +587,8 @@ def run_eagle_verify(
     post_verify_graphs: Optional[EaglePostVerifyGraphs] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
+    deferred_logits: Optional[LogitsProcessor] = None,
+    argmax_from_shard: bool = False,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -577,6 +601,10 @@ def run_eagle_verify(
     - ``finalize_tree_path``: single-layer compacts the accepted tree path to
       the front of each per-req block for topk > 1; multi-layer has never run
       this compaction.
+
+    ``deferred_logits`` is the target's LogitsProcessor when it defers the verify
+    vocab gather (DFLASH); ``argmax_from_shard`` lets an all-greedy batch that reads
+    nothing else from the logits take the target argmax off the shard.
     """
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
@@ -663,6 +691,13 @@ def run_eagle_verify(
         pp_proxy_tensors=pp_proxy_tensors,
     )
     logits_output = forward_batch_output.logits_output
+    target_argmax = _finish_deferred_verify_logits(
+        logits_output,
+        deferred_logits=deferred_logits,
+        argmax_from_shard=argmax_from_shard
+        and post_verify_graphs is None
+        and target_worker.model_runner.canary_manager is None,
+    )
 
     kvcache = token_to_kv_pool_allocator.get_kvcache()
     clears_c128 = isinstance(kvcache, DeepSeekV4TokenToKVPool)
@@ -741,7 +776,11 @@ def run_eagle_verify(
         ),
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
+        target_argmax=target_argmax,
     )
+    if target_argmax is not None:
+        # Only the argmax left the shard; nothing downstream may read the logits.
+        logits_output.next_token_logits = None
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
     if fused_commit_outputs and topk == 1:

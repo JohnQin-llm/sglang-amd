@@ -590,6 +590,7 @@ def eagle_sample(
     simulated_acc_len: Optional[torch.Tensor] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
+    target_argmax: Optional[torch.Tensor] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -598,7 +599,8 @@ def eagle_sample(
     graph can replay the injection. simulated_acc_len_rng: the generator to draw
     it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
     injected acceptance's bonus is the target argmax on the compact top-k branch
-    too, as on the dense one.
+    too, as on the dense one. target_argmax: the greedy target tokens
+    [bs * draft_token_num], already taken off a vocab shard of the logits.
     """
     from sglang.srt.layers.dp_attention import (
         is_dp_attention_enabled,
@@ -709,7 +711,7 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-    if _verify_uses_greedy(
+    uses_greedy = _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
         is_hip=_is_hip,
@@ -717,8 +719,15 @@ def eagle_sample(
         use_rejection_sampling=use_rejection_sampling,
         has_target_only_sampler=tree_speculative_sampling_target_only is not None,
         simulate_acc_len=SIMULATE_ACC_LEN,
-    ):
-        target_predict = sampling_argmax(next_token_logits)
+    )
+    if target_argmax is not None and not uses_greedy:
+        raise ValueError("A precomputed target argmax needs the greedy verify path.")
+    if uses_greedy:
+        target_predict = (
+            target_argmax
+            if target_argmax is not None
+            else sampling_argmax(next_token_logits)
+        )
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import os
 from typing import Any
 
 import torch
@@ -20,6 +21,7 @@ from sglang.kernels.ops.speculative.dflash_tree import (
     build_dflash_sampled_tree_proposal,
     build_dflash_tree_proposal,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -50,7 +52,9 @@ def propose_dflash_tree(
             f"--speculative-eagle-topk {topk} exceeds the selector's top-k "
             f"{candidate_ids.shape[-1]}"
         )
-    cond_log_probs = torch.log_softmax(scores[:, :, :topk, :topk].float(), dim=-1)
+    cond_log_probs = torch.log_softmax(
+        scores[:, :, :topk, :topk].float() / _SCORE_TEMP, dim=-1
+    )
     return build_dflash_tree_proposal(
         candidate_ids[:, :, :topk].contiguous(),
         cond_log_probs,
@@ -75,13 +79,32 @@ def propose_dflash_sampled_tree(
             f"--speculative-eagle-topk {topk} exceeds the selector's top-k "
             f"{candidate_ids.shape[-1]}"
         )
-    logits = scores[:, :, :topk, :topk].float() / temperatures.view(-1, 1, 1, 1)
+    logits = scores[:, :, :topk, :topk].float() / (
+        temperatures.view(-1, 1, 1, 1) * _Q_TEMP
+    )
     return build_dflash_sampled_tree_proposal(
         candidate_ids[:, :, :topk].contiguous(),
         torch.log_softmax(logits, dim=-1),
         max_nodes=num_nodes,
         workspace=workspace,
+        accept_prior=_ACCEPT_PRIOR,
     )
+
+
+def _read_accept_prior() -> tuple[float, float] | None:
+    # Experiment knob: "a,a2" ranks sampled-tree slots by acceptance priors.
+    value = os.environ.get("SGLANG_DFLASH_TREE_ACCEPT_PRIOR")
+    if not value:
+        return None
+    first, sibling = (float(x) for x in value.split(","))
+    return first, sibling
+
+
+_ACCEPT_PRIOR = _read_accept_prior()
+# Experiment knobs: the greedy tree ranks by selector log-probs at this temperature, and
+# sampled trees draw (and verify) with q at the request temperature times this factor.
+_SCORE_TEMP = float(os.environ.get("SGLANG_DFLASH_TREE_SCORE_TEMP") or 1.0)
+_Q_TEMP = float(os.environ.get("SGLANG_DFLASH_TREE_Q_TEMP") or 1.0)
 
 
 def verify_dflash_tree(
@@ -98,12 +121,22 @@ def verify_dflash_tree(
     device: str,
     node_draft_tokens: torch.Tensor | None = None,
     node_draft_probs: torch.Tensor | None = None,
+    target_logits: LogitsProcessor | None = None,
+    argmax_from_shard: bool = False,
+    host_seq_lens_bound: torch.Tensor | None = None,
+    host_seq_lens_bound_sum: int | None = None,
 ) -> GenerationBatchResult:
     """Verify the tree rooted at each request's bonus token, which sits at the committed
     length and has no KV yet, so the verify batch keeps ``batch.seq_lens`` as is.
     With ``node_draft_*`` set (a sampled tree), sampling rows verify by recursive
-    rejection sampling against each node's q."""
+    rejection sampling against each node's q. ``target_logits`` is the target's
+    LogitsProcessor when it defers the verify vocab gather (see ``run_eagle_verify``)."""
     verify_batch = copy.copy(batch)
+    if verify_batch.seq_lens_cpu is None and host_seq_lens_bound is not None:
+        # Sync-free scheduling leaves no host lengths; the backend plans the verify
+        # from the allocated lengths, an upper bound, as the chain verify does.
+        verify_batch.seq_lens_cpu = host_seq_lens_bound
+        verify_batch.seq_lens_sum = host_seq_lens_bound_sum
     verify_input = build_eagle_verify_input(
         verify_batch,
         EagleDraftInput(bonus_tokens=bonus_tokens),
@@ -138,4 +171,6 @@ def verify_dflash_tree(
         device=device,
         metadata_ready_pre_pad=False,
         finalize_tree_path=True,
+        deferred_logits=target_logits,
+        argmax_from_shard=argmax_from_shard,
     )

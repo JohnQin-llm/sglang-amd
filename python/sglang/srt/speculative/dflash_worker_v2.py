@@ -238,6 +238,25 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
     return target_model.get_input_embeddings()
 
 
+def _verify_logits_skippable(batch: ScheduleBatch, sampling_info) -> bool:
+    """Whether a greedy verify may take the target argmax straight off the deferred
+    vocab shard: nothing else in the batch reads the full verify logits."""
+    if batch.has_grammar or batch.return_logprob:
+        return False
+    if sampling_info is None:
+        return True
+    penalizer = sampling_info.penalizer_orchestrator
+    return (
+        sampling_info.is_all_greedy
+        and not sampling_info.has_custom_logit_processor
+        and getattr(sampling_info, "acc_linear_penalties", None) is None
+        and (penalizer is None or not penalizer.is_required)
+        and getattr(sampling_info, "grammar_mask", None) is None
+        and getattr(sampling_info, "logit_bias", None) is None
+        and sampling_info.sampling_mask_batch_indices is None
+    )
+
+
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
@@ -638,11 +657,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
-        # Tree verify samples in EAGLE's verify path, which reads full-vocab
-        # softcapped logits; only the chain finishes a deferred vocab shard.
-        self._target_logits_processor = (
-            None if self.tree_mode else self._defer_target_verify_gather()
-        )
+        self._target_logits_processor = self._defer_target_verify_gather()
 
     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
         processors = [
@@ -656,23 +671,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         return processors[0]
 
     def _can_skip_verify_logits(self, batch: ScheduleBatch, sampling_info) -> bool:
-        if (
-            self._selector_sample is not None
-            or batch.has_grammar
-            or batch.return_logprob
-        ):
-            return False
-        if sampling_info is None:
-            return True
-        penalizer = sampling_info.penalizer_orchestrator
-        return (
-            sampling_info.is_all_greedy
-            and not sampling_info.has_custom_logit_processor
-            and getattr(sampling_info, "acc_linear_penalties", None) is None
-            and (penalizer is None or not penalizer.is_required)
-            and getattr(sampling_info, "grammar_mask", None) is None
-            and getattr(sampling_info, "logit_bias", None) is None
-            and sampling_info.sampling_mask_batch_indices is None
+        return self._selector_sample is None and _verify_logits_skippable(
+            batch, sampling_info
         )
 
     @property
@@ -2414,6 +2414,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions_2d: torch.Tensor,
         iteration_ids: IterationIds,
         on_publish,
+        host_seq_lens_bound: torch.Tensor | None,
+        host_seq_lens_bound_sum: int | None,
     ) -> GenerationBatchResult:
         """Build a tree from the selector lattice, verify it, then feed the accepted
         path's target features to the drafter like the chain path does."""
@@ -2458,6 +2460,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             device=self.device,
             node_draft_tokens=node_draft_tokens,
             node_draft_probs=node_draft_probs,
+            target_logits=self._target_logits_processor,
+            argmax_from_shard=(
+                _verify_logits_skippable(batch, batch.sampling_info)
+                and not batch.sampling_info.has_watermark_candidates
+            ),
+            host_seq_lens_bound=host_seq_lens_bound,
+            host_seq_lens_bound_sum=host_seq_lens_bound_sum,
         )
         if on_publish is not None:
             on_publish(result.new_seq_lens)
@@ -2852,6 +2861,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 positions_2d=positions_2d,
                 iteration_ids=iteration_ids,
                 on_publish=on_publish,
+                host_seq_lens_bound=draft_input.nxt_kv_lens_cpu,
+                host_seq_lens_bound_sum=draft_input.nxt_kv_lens_sum,
             )
 
         if (

@@ -237,6 +237,8 @@ class ForwardMetadata:
     swa_page_table: Optional[torch.Tensor] = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    # kv_indices in window-pool ids, for the masked target-verify fallback.
+    swa_kv_indices: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
     # (capturing, seq_lens + max_q_len) for target-verify attention
@@ -394,6 +396,10 @@ class AiterAttnBackend(AttentionBackend):
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
 
+    # Experiment: spec-v2 verify plans from host upper bounds the worker supplies,
+    # so the scheduler need not block on each verify's seq_lens publish.
+    needs_cpu_seq_lens: bool = os.environ.get("SGLANG_AITER_SYNC_FREE_SPEC") != "1"
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -527,6 +533,11 @@ class AiterAttnBackend(AttentionBackend):
         )
         self.mask_indptr = torch.zeros(
             (max_bs + 1,), dtype=torch.int64, device=model_runner.device
+        )
+        # extend_attention_fwd reads per-request window offsets once a window is set;
+        # the verify fallback passes whole contexts, so they are all 0.
+        self.zero_window_kv_offsets = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=model_runner.device
         )
         self._kv_indices_scratch: Optional[torch.Tensor] = None
         self._arange_buf: Optional[torch.Tensor] = None
@@ -2626,6 +2637,11 @@ class AiterAttnBackend(AttentionBackend):
                         custom_mask=custom_mask,
                         mask_indptr=mask_indptr,
                         max_extend_len=draft_num,
+                        swa_kv_indices=(
+                            None
+                            if self.swa_space is None
+                            else self.swa_space.ids(kv_indices)
+                        ),
                     )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
@@ -2943,6 +2959,11 @@ class AiterAttnBackend(AttentionBackend):
             )
         else:
             self.cuda_graph_kv_indices = kv_indices_buf
+        self.cuda_graph_swa_kv_indices = (
+            None
+            if self.swa_space is None
+            else torch.zeros_like(self.cuda_graph_kv_indices)
+        )
 
         if self.decode_uses_page_table:
             # Keep a distinct page-table buffer for page-table decode.  Sharing
@@ -3451,6 +3472,9 @@ class AiterAttnBackend(AttentionBackend):
                         custom_mask=custom_mask,
                         mask_indptr=mask_indptr,
                         max_extend_len=max_q_len,
+                        swa_kv_indices=self._graph_swa_kv_indices(
+                            kv_indices, seq_lens_sum
+                        ),
                     )
         elif forward_mode.is_draft_extend_v2():
             # EAGLE V2: Fixed num_draft_tokens per batch
@@ -3746,6 +3770,16 @@ class AiterAttnBackend(AttentionBackend):
         # the merge_state_triton needs lse layout [tokens, heads].
         # See https://github.com/sgl-project/sglang/blob/98fce73d5bd0a25afe7d68443d314190b1c47e64/python/sglang/kernels/ops/attention/merge_state.py#L13-L15
         return output, lse.transpose(0, 1).contiguous()
+
+    def _graph_swa_kv_indices(self, kv_indices, seq_lens_sum):
+        """The graph's kv_indices in window-pool ids, in the static buffer the captured
+        verify reads: replay translates the live prefix, capture the whole buffer."""
+        out = self.cuda_graph_swa_kv_indices
+        if out is None:
+            return None
+        n = out.numel() if seq_lens_sum is None else seq_lens_sum
+        out[:n].copy_(self.swa_space.ids(kv_indices[:n]))
+        return out
 
     @staticmethod
     def _reject_target_verify_cross_layer_kv(k, v):
@@ -4349,6 +4383,21 @@ class AiterAttnBackend(AttentionBackend):
                 if self.kv_cache_dtype == fp8_dtype and layer.k_scale is not None:
                     k_scale, v_scale = layer.k_scale_float, layer.v_scale_float
 
+                kv_indices = self.forward_metadata.kv_indices
+                window = -1
+                window_kv_offsets = None
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                ):
+                    # The unified path's (W - 1, 0) window, as q <= kv + W - 1. The
+                    # kernel takes a tree node's index for its depth, which only
+                    # narrows the window, so no evicted window slot is read.
+                    window = layer.sliding_window_size - 1
+                    window_kv_offsets = self.zero_window_kv_offsets
+                    if self.forward_metadata.swa_kv_indices is not None:
+                        kv_indices = self.forward_metadata.swa_kv_indices
+
                 self.extend_attention_fwd(
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k.contiguous(),
@@ -4358,7 +4407,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.kv_layers.read(layer.layer_id).value(),
                     self.forward_metadata.qo_indptr,
                     self.forward_metadata.kv_indptr,
-                    self.forward_metadata.kv_indices,
+                    kv_indices,
                     self.forward_metadata.custom_mask,
                     True,  # causal
                     self.forward_metadata.mask_indptr,
@@ -4367,6 +4416,8 @@ class AiterAttnBackend(AttentionBackend):
                     v_scale,
                     layer.scaling,
                     logit_cap=layer.logit_cap,
+                    sliding_window_size=window,
+                    window_kv_offsets=window_kv_offsets,
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

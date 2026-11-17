@@ -8,6 +8,8 @@ straight into `build_eagle_verify_input` with the bonus tokens as roots.
 
 from __future__ import annotations
 
+import math
+
 import msgspec
 import torch
 import triton
@@ -260,6 +262,15 @@ def _max_undrawn_log_q(cond_log_q, base, drawn, K: tl.constexpr):
 
 
 @triton.jit
+def _draw_prior(taken, log_first, log_miss_first, log_sibling, log_miss_sibling):
+    """Log-probability that a node's draw number ``taken`` (0-based) is the child
+    verification accepts: the first draw is accepted with prob a, each later one with
+    prob a' once every earlier sibling was rejected."""
+    later = log_miss_first + (taken - 1).to(tl.float32) * log_miss_sibling + log_sibling
+    return tl.where(taken == 0, log_first, later)
+
+
+@triton.jit
 def _build_dflash_sampled_tree_kernel(
     candidate_ids,
     cond_log_q,
@@ -269,6 +280,10 @@ def _build_dflash_sampled_tree_kernel(
     parent_list,
     node_depths,
     node_ranks,
+    log_first,
+    log_miss_first,
+    log_sibling,
+    log_miss_sibling,
     CAND_BATCH_STRIDE: tl.constexpr,
     CAND_DEPTH_STRIDE: tl.constexpr,
     LQ_BATCH_STRIDE: tl.constexpr,
@@ -279,6 +294,7 @@ def _build_dflash_sampled_tree_kernel(
     K: tl.constexpr,
     Q: tl.constexpr,
     BLOCK_NODES: tl.constexpr,
+    ACCEPT_PRIOR: tl.constexpr,
 ):
     batch = tl.program_id(0)
     nodes = tl.arange(0, BLOCK_NODES)
@@ -294,16 +310,23 @@ def _build_dflash_sampled_tree_kernel(
     tl.store(node_ranks + batch * Q, 0)
 
     # Per-node state; node 0 is the root (the bonus token) at depth 0. A node competes
-    # for the next slot with its path log-q plus the largest q it could still draw, a
-    # bound fixed before the draw: letting the drawn value decide whether the child
-    # enters the tree would bias the children the verifier treats as draws from q.
+    # for the next slot with a score fixed before the draw: letting the drawn value
+    # decide whether the child enters the tree would bias the children the verifier
+    # treats as draws from q. The score is the node's path score plus the value of its
+    # next draw: path log-q plus the largest q it could still draw, or with
+    # ACCEPT_PRIOR, the log-probabilities that each draw on the path is the accepted one.
     depth = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     rank = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     mass = tl.where(nodes == 0, 0.0, -float("inf"))
     taken = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     drawn = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     no_draws = tl.full((), 0, tl.int32)
-    root_bound = _max_undrawn_log_q(cond_log_q, lq_row, no_draws, K)
+    if ACCEPT_PRIOR:
+        root_bound = _draw_prior(
+            no_draws, log_first, log_miss_first, log_sibling, log_miss_sibling
+        )
+    else:
+        root_bound = _max_undrawn_log_q(cond_log_q, lq_row, no_draws, K)
     bound = tl.where(nodes == 0, root_bound, -float("inf"))
 
     for node_index in range(1, Q):
@@ -312,6 +335,7 @@ def _build_dflash_sampled_tree_kernel(
         parent = tl.min(tl.where(frontier == best, nodes, BLOCK_NODES), axis=0)
         is_parent = nodes == parent
         parent_mass = tl.sum(tl.where(is_parent, mass, 0.0), axis=0)
+        parent_next = tl.sum(tl.where(is_parent, bound, 0.0), axis=0)
         parent_depth = tl.sum(tl.where(is_parent, depth, 0), axis=0)
         parent_rank = tl.sum(tl.where(is_parent, rank, 0), axis=0)
         parent_taken = tl.sum(tl.where(is_parent, taken, 0), axis=0)
@@ -344,16 +368,26 @@ def _build_dflash_sampled_tree_kernel(
 
         parent_drawn = parent_drawn | (1 << child_rank)
         parent_taken += 1
-        parent_bound = _max_undrawn_log_q(cond_log_q, parent_row, parent_drawn, K)
         child_depth = parent_depth + 1
-        child_bound = _max_undrawn_log_q(
-            cond_log_q,
-            lq_row
-            + tl.minimum(child_depth, NUM_DEPTHS - 1) * LQ_DEPTH_STRIDE
-            + child_rank * LQ_PARENT_STRIDE,
-            no_draws,
-            K,
-        )
+        if ACCEPT_PRIOR:
+            parent_bound = _draw_prior(
+                parent_taken, log_first, log_miss_first, log_sibling, log_miss_sibling
+            )
+            child_bound = _draw_prior(
+                no_draws, log_first, log_miss_first, log_sibling, log_miss_sibling
+            )
+            child_mass = parent_mass + parent_next
+        else:
+            parent_bound = _max_undrawn_log_q(cond_log_q, parent_row, parent_drawn, K)
+            child_bound = _max_undrawn_log_q(
+                cond_log_q,
+                lq_row
+                + tl.minimum(child_depth, NUM_DEPTHS - 1) * LQ_DEPTH_STRIDE
+                + child_rank * LQ_PARENT_STRIDE,
+                no_draws,
+                K,
+            )
+            child_mass = parent_mass + child_log_q
         taken = tl.where(is_parent, parent_taken, taken)
         drawn = tl.where(is_parent, parent_drawn, drawn)
         bound = tl.where(
@@ -362,12 +396,26 @@ def _build_dflash_sampled_tree_kernel(
         is_new = nodes == node_index
         depth = tl.where(is_new, child_depth, depth)
         rank = tl.where(is_new, child_rank, rank)
-        mass = tl.where(is_new, parent_mass + child_log_q, mass)
+        mass = tl.where(is_new, child_mass, mass)
         bound = tl.where(
             is_new,
             tl.where(child_depth < NUM_DEPTHS, child_bound, -float("inf")),
             bound,
         )
+
+
+def _log_draw_priors(accept_prior: tuple[float, float] | None) -> tuple[float, ...]:
+    if accept_prior is None:
+        return (0.0, 0.0, 0.0, 0.0)
+    first, sibling = accept_prior
+    if not (0.0 < first < 1.0 and 0.0 < sibling < 1.0):
+        raise ValueError(f"accept_prior entries must lie in (0, 1); got {accept_prior}")
+    return (
+        math.log(first),
+        math.log1p(-first),
+        math.log(sibling),
+        math.log1p(-sibling),
+    )
 
 
 @torch.inference_mode()
@@ -377,15 +425,18 @@ def build_dflash_sampled_tree_proposal(
     *,
     max_nodes: int,
     workspace: dict[str, Tensor] | None = None,
+    accept_prior: tuple[float, float] | None = None,
 ) -> tuple[DFlashTreeProposal, Tensor, Tensor]:
     """Sampled tree for lossless multi-draft verification at temperature > 0.
 
     Every node draws its children one at a time without replacement from its own
     ``q = exp(cond_log_q[b, depth, rank])``; the next slot goes to the node with the best
     path log-q plus largest undrawn q, which then draws, and a node's children enter the
-    tree in drawing order. Returns the proposal and, per
-    node, the K candidate tokens and q of its children's distribution (rank order), which
-    the verifier replays.
+    tree in drawing order. ``accept_prior = (a, a')`` ranks slots instead by the chance
+    that verification reaches and accepts them, with a node's first draw accepted with
+    prob ``a`` and each later draw with prob ``a'`` after its elder siblings were
+    rejected. Returns the proposal and, per node, the K candidate tokens and q of its
+    children's distribution (rank order), which the verifier replays.
     """
     batch_size, num_depths, candidate_top_k = candidate_ids.shape
     if candidate_top_k > 32:
@@ -426,6 +477,7 @@ def build_dflash_sampled_tree_proposal(
         parent_list,
         node_depths,
         node_ranks,
+        *_log_draw_priors(accept_prior),
         CAND_BATCH_STRIDE=candidate_ids.stride(0),
         CAND_DEPTH_STRIDE=candidate_ids.stride(1),
         LQ_BATCH_STRIDE=cond_log_q.stride(0),
@@ -436,6 +488,7 @@ def build_dflash_sampled_tree_proposal(
         K=candidate_top_k,
         Q=max_nodes,
         BLOCK_NODES=triton.next_power_of_2(max_nodes),
+        ACCEPT_PRIOR=accept_prior is not None,
         num_warps=4,
         num_stages=1,
     )

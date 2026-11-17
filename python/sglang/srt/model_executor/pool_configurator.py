@@ -950,12 +950,17 @@ def compute_swa_request_cap(
     max_running_requests: int | None = None,
 ) -> int:
     """Worst-case SWA slots the scheduler holds live at max_running_requests."""
-    draft_tokens = get_spec().speculative_num_draft_tokens or 1
+    spec = get_spec()
+    # A step commits one accepted path: at most num_steps + 1 tokens, which for a
+    # tree is fewer than the num_draft_tokens nodes the verify scores.
+    committed_tokens = spec.speculative_num_draft_tokens or 1
+    if (spec.speculative_eagle_topk or 1) > 1 and spec.speculative_num_steps:
+        committed_tokens = min(committed_tokens, spec.speculative_num_steps + 1)
     eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
 
     # __________[padding][eviction_interval][window]
     # Padding to make sure eviction point is page-aligned.
-    trailing_tokens = window + eviction_interval * draft_tokens + page_size
+    trailing_tokens = window + eviction_interval * committed_tokens + page_size
     if get_spec().speculative_algorithm is None:
         decode_alloc = page_size
     elif get_schedule().disable_overlap_schedule:

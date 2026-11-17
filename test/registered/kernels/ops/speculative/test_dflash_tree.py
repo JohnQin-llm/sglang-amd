@@ -96,7 +96,8 @@ def test_sampled_tree_draws_children_from_q():
             assert len(kids) == len(set(kids))
 
 
-def test_sampled_tree_verification_commits_the_target():
+@pytest.mark.parametrize("accept_prior", [None, (0.6, 0.3)])
+def test_sampled_tree_verification_commits_the_target(accept_prior):
     """The tree builder once let a drawn child's own q decide whether it entered the tree,
     so the children kept were biased toward high q and multi-draft verification committed
     tokens off the target distribution (max error 0.033 here, about 20 sigma)."""
@@ -109,7 +110,10 @@ def test_sampled_tree_verification_commits_the_target():
     target = torch.softmax(torch.randn(vocab, generator=gen) * 1.5, dim=-1)
     candidate_ids = torch.arange(vocab).view(1, num_depths, k).repeat(rows, 1, 1).cuda()
     proposal, node_tokens, node_probs = build_dflash_sampled_tree_proposal(
-        candidate_ids, log_q.repeat(rows, 1, 1, 1).cuda(), max_nodes=max_nodes
+        candidate_ids,
+        log_q.repeat(rows, 1, 1, 1).cuda(),
+        max_nodes=max_nodes,
+        accept_prior=accept_prior,
     )
     seq_lens = torch.full((rows,), 10, dtype=torch.long, device="cuda")
     _, _, retrieve_index, next_token, next_sibling, tokens = (
@@ -146,6 +150,24 @@ def test_sampled_tree_verification_commits_the_target():
     first = predicts.view(rows, max_nodes)[:, 0].long().cpu()
     freq = torch.bincount(first, minlength=vocab).double() / rows
     assert (freq - target.double()).abs().max().item() < 0.008
+
+
+def test_accept_prior_grows_depth_before_siblings():
+    # With a likely first draw and an unlikely second one, the tree is the full-depth
+    # chain before any node takes a second child.
+    rows, num_depths, k = 64, 4, 8
+    log_q = torch.log_softmax(torch.zeros(rows, num_depths, k, k), dim=-1)
+    candidate_ids = torch.arange(num_depths * k).view(1, num_depths, k).repeat(rows, 1, 1)
+    proposal, _, _ = build_dflash_sampled_tree_proposal(
+        candidate_ids.cuda(),
+        log_q.cuda(),
+        max_nodes=num_depths + 3,
+        accept_prior=(0.9, 0.05),
+    )
+    parents = (proposal.top_scores_index.cpu() // k).tolist()
+    for row in parents:
+        assert row[:num_depths] == list(range(num_depths))
+        assert row[num_depths:] == [0, 0]
 
 
 if __name__ == "__main__":
