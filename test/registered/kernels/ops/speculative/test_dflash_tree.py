@@ -7,9 +7,13 @@ import pytest
 import torch
 
 from sglang.kernels.ops.speculative.dflash_tree import (
+    NUM_CALIBRATION_BINS,
     build_dflash_sampled_tree_proposal,
     build_dflash_tree_proposal,
+    tree_depth,
+    tree_prefix,
     update_draw_acceptance,
+    update_tree_calibration,
 )
 from sglang.kernels.ops.speculative.multi_draft_sampling import (
     tree_speculative_sampling_multi_draft,
@@ -191,6 +195,138 @@ def test_online_draw_acceptance_counts():
     )
     assert stats.tolist() == [1.0, 4.0, 2.0, 3.0]
     assert torch.allclose(log_priors.exp()[[0, 2]], torch.tensor([2 / 6, 3 / 5]))
+
+
+def _expected_accept_lens(proposal, cond_log_probs, calibration, prior):
+    """Reference survival: each edge's probability, scaled by its (parent depth,
+    probability bin) factor and capped at 1, multiplied down the path."""
+    bs, num_edges = proposal.top_scores_index.shape
+    k = cond_log_probs.shape[-1]
+    out = []
+    for b in range(bs):
+        depth, rank, log_surv, total, row = [0], [0], [0.0], 1.0, [1.0]
+        for i in range(num_edges):
+            edge = proposal.top_scores_index[b, i].item()
+            parent, child_rank = divmod(edge, k)
+            lp = cond_log_probs[b, depth[parent], rank[parent], child_rank].item()
+            if calibration is not None:
+                bin_ = min(int(4 * (-lp) ** 0.5), NUM_CALIBRATION_BINS - 1)
+                slot = depth[parent] * NUM_CALIBRATION_BINS + bin_
+                hits, _, raw = calibration[:, slot].tolist()
+                lp = min(
+                    lp + torch.tensor((hits + prior) / (raw + prior)).log().item(), 0.0
+                )
+            depth.append(depth[parent] + 1)
+            rank.append(child_rank)
+            log_surv.append(log_surv[parent] + lp)
+            total += torch.tensor(log_surv[-1]).exp().item()
+            row.append(total)
+        out.append(row)
+    return torch.tensor(out)
+
+
+@pytest.mark.parametrize("calibrated", [False, True])
+def test_prefix_accept_len_matches_reference(calibrated):
+    gen = torch.Generator().manual_seed(11)
+    bs, num_depths, k, max_nodes = 4, 7, 8, 24
+    candidate_ids = torch.randint(0, 50000, (bs, num_depths, k), generator=gen)
+    scores = torch.randn(bs, num_depths, k, k, generator=gen) * 2
+    cond_log_probs = torch.log_softmax(scores, dim=-1)
+    calibration = None
+    if calibrated:
+        raw = torch.rand(num_depths * NUM_CALIBRATION_BINS, generator=gen) * 20
+        hits = raw * (0.3 + 1.2 * torch.rand(raw.shape, generator=gen))
+        calibration = torch.stack([hits, raw * 2, raw])
+    proposal = build_dflash_tree_proposal(
+        candidate_ids.cuda(),
+        cond_log_probs.cuda(),
+        max_nodes=max_nodes,
+        calibration=None if calibration is None else calibration.cuda(),
+        calibration_prior=2.0,
+    )
+    expected = _expected_accept_lens(proposal, cond_log_probs, calibration, prior=2.0)
+    torch.testing.assert_close(
+        proposal.survival.prefix_accept_len.cpu(), expected, rtol=1e-4, atol=1e-4
+    )
+
+
+@pytest.mark.parametrize("width", [8, 16, 32])
+def test_tree_prefix_is_the_narrower_tree(width):
+    # The adaptive width verifies the first n nodes of the Q_max build; best-first order
+    # makes that the n-node build exactly, which the EAGLE tree kernel must accept, also
+    # when n nodes cannot reach the lattice depth.
+    gen = torch.Generator().manual_seed(5)
+    bs, num_depths, k = 3, 15, 16
+    candidate_ids = torch.randint(0, 50000, (bs, num_depths, k), generator=gen).cuda()
+    cond_log_probs = torch.log_softmax(
+        torch.randn(bs, num_depths, k, k, generator=gen) * 2, dim=-1
+    ).cuda()
+    wide = build_dflash_tree_proposal(candidate_ids, cond_log_probs, max_nodes=48)
+    narrow = build_dflash_tree_proposal(candidate_ids, cond_log_probs, max_nodes=width)
+    prefix = tree_prefix(wide, width, topk=k)
+    assert torch.equal(prefix.draft_tokens, narrow.draft_tokens)
+    assert torch.equal(prefix.top_scores_index, narrow.top_scores_index)
+    depth = tree_depth(wide, width, topk=k)
+    assert depth == min(num_depths, width - 1)
+    seq_lens = torch.full((bs,), 20, dtype=torch.long, device="cuda")
+    bonus = torch.zeros(bs, dtype=torch.long, device="cuda")
+    outs = [
+        build_tree_kernel_efficient(
+            bonus,
+            p.parent_list,
+            p.top_scores_index,
+            p.draft_tokens,
+            seq_lens,
+            int(seq_lens.sum()),
+            k,
+            steps,
+            width,
+            TreeMaskMode.FULL_MASK,
+        )
+        for p, steps in ((prefix, depth), (narrow, num_depths))
+    ]
+    for got, want in zip(*outs):
+        assert torch.equal(got, want)
+
+
+def test_calibration_update_counts_reached_and_accepted_nodes():
+    # Root -> node 1 (rank 0) -> node 2 (rank 0); root -> node 3 (rank 1); node 1 -> node
+    # 4 (rank 1). The path root, 1, 4 reaches nodes 1, 3 (root's children) and 2, 4
+    # (node 1's children) and accepts 1 and 4; a 4-node prefix never sees node 4.
+    k, max_nodes = 4, 5
+    num_depths = 3
+    candidate_ids = torch.arange(num_depths * k).view(1, num_depths, k).cuda()
+    log_p = torch.full((1, num_depths, k, k), -10.0)
+    log_p[0, 0, 0, 0], log_p[0, 0, 0, 1] = -0.1, -1.0
+    log_p[0, 1, 0, 0], log_p[0, 1, 0, 1] = -0.2, -1.5
+    proposal = build_dflash_tree_proposal(
+        candidate_ids, log_p.cuda(), max_nodes=max_nodes
+    )
+    assert proposal.top_scores_index[0].tolist() == [0, 4, 1, 5]
+    num_slots = num_depths * NUM_CALIBRATION_BINS
+    for width, path, length, want_hits, want_trials in (
+        (5, [0, 1, 4], 3, 2.0, 4.0),
+        (4, [0, 1], 2, 1.0, 3.0),
+    ):
+        stats = torch.ones(3, num_slots, device="cuda")
+        update_tree_calibration(
+            stats=stats,
+            survival=proposal.survival,
+            top_scores_index=proposal.top_scores_index,
+            accept_index=torch.tensor([path + [-1] * (4 - len(path))]).cuda(),
+            accept_lens=torch.tensor([length]).cuda(),
+            num_nodes=width,
+            topk=k,
+            decay=0.5,
+        )
+        decayed = 0.5 * num_slots
+        assert stats[0].sum().item() == pytest.approx(decayed + want_hits)
+        assert stats[1].sum().item() == pytest.approx(decayed + want_trials)
+        probs = proposal.survival.node_edge_prob[0, 1:width].sum().item()
+        assert stats[2].sum().item() == pytest.approx(decayed + probs, rel=1e-5)
+        # Depth-1 nodes (2 and 4) land in parent-depth row 1.
+        row1 = stats[1, NUM_CALIBRATION_BINS : 2 * NUM_CALIBRATION_BINS].sum().item()
+        assert row1 == pytest.approx(0.5 * NUM_CALIBRATION_BINS + width - 3)
 
 
 if __name__ == "__main__":

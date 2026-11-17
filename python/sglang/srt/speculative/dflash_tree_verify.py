@@ -40,12 +40,15 @@ def propose_dflash_tree(
     topk: int,
     num_nodes: int,
     workspace: dict[str, torch.Tensor],
+    calibration: torch.Tensor | None = None,
 ) -> DFlashTreeProposal:
     """Best-first tree over the first ``topk`` candidates of the selector lattice.
 
     ``candidate_ids`` is ``[B, L, K]`` and ``scores`` ``[B, L, K, K]`` (predecessor rank,
     candidate rank), with candidates in unary-logit order. The tree is ranked by
     temperature-1 selector log-probabilities; verification keeps sampling lossless.
+    ``calibration`` (``update_tree_calibration``'s statistics) only changes the
+    proposal's survival estimate, not the tree.
     """
     if topk > candidate_ids.shape[-1]:
         raise ValueError(
@@ -60,6 +63,7 @@ def propose_dflash_tree(
         cond_log_probs,
         max_nodes=num_nodes,
         workspace=workspace,
+        calibration=calibration,
     )
 
 
