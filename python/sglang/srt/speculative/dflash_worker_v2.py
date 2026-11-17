@@ -66,6 +66,7 @@ from sglang.kernels.ops.speculative.dflash_tree import (
 )
 from sglang.srt.speculative.dflash_tree_verify import (
     ONLINE_PRIOR_START,
+    propose_adaptive_sampled_tree,
     propose_dflash_mixed_tree,
     propose_dflash_sampled_tree,
     propose_dflash_tree,
@@ -73,8 +74,10 @@ from sglang.srt.speculative.dflash_tree_verify import (
     verify_dflash_tree,
 )
 from sglang.srt.speculative.dflash_adaptive_width import (
+    CHAIN,
     AdaptiveVerifyWidth,
     make_step_timer,
+    member_label,
 )
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -584,6 +587,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._adaptive_width = AdaptiveVerifyWidth.maybe_create(
                 max_width=self.tree_num_nodes,
                 num_depths=int(self.block_size) - 1,
+                chain_rows=int(self.block_size),
                 device=torch.device(self.device),
             )
             self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
@@ -2468,7 +2472,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             candidate_ids, scores = _selector_lattice(
                 self.draft_model, draft_hidden[:, 1:, :], bonus_tokens
             )
-        node_draft_tokens = node_draft_probs = sampled_rows = None
+        node_draft_tokens = node_draft_probs = sampled_rows = sampled_plan = None
         adaptive = self._adaptive_width
         width = self.tree_num_nodes
         greedy = _is_all_greedy(batch.sampling_info)
@@ -2498,6 +2502,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                 workspace=self._tree_workspace,
                 accept_prior=self._tree_accept_prior,
             )
+        elif adaptive is not None:
+            sampled_plan = propose_adaptive_sampled_tree(
+                adaptive=adaptive,
+                candidate_ids=candidate_ids,
+                scores=scores,
+                temperatures=self._tree_temperatures(batch.sampling_info, bs),
+                topk=self.tree_topk,
+                num_nodes=self.tree_num_nodes,
+                workspace=self._tree_workspace,
+                accept_prior=self._tree_accept_prior,
+                bs=bs,
+            )
+            proposal = sampled_plan.proposal
+            node_draft_tokens = sampled_plan.node_draft_tokens
+            node_draft_probs = sampled_plan.node_draft_probs
+            width = sampled_plan.rows
         else:
             proposal, node_draft_tokens, node_draft_probs = propose_dflash_sampled_tree(
                 candidate_ids=candidate_ids,
@@ -2509,15 +2529,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_prior=self._tree_accept_prior,
             )
         if adaptive is not None:
-            width = adaptive.select_width(survival=proposal.survival, bs=bs)
+            if sampled_plan is None:
+                width = adaptive.select_width(survival=proposal.survival, bs=bs)
+                if node_draft_tokens is not None and width < self.tree_num_nodes:
+                    # A sampled tree's prefix keeps each node's first draws, in draw
+                    # order, and the width never depends on this step's draws.
+                    node_draft_tokens = node_draft_tokens[:, :width].contiguous()
+                    node_draft_probs = node_draft_probs[:, :width].contiguous()
             adaptive.activate(width, self.target_worker.model_runner)
             if self._step_timer is not None:
-                self._step_timer.set_rows(width)
-            if node_draft_tokens is not None and width < self.tree_num_nodes:
-                # A sampled tree's prefix keeps each node's first draws, in draw order,
-                # and the width never depends on this step's draws, so it stays lossless.
-                node_draft_tokens = node_draft_tokens[:, :width].contiguous()
-                node_draft_probs = node_draft_probs[:, :width].contiguous()
+                self._step_timer.set_member(
+                    str(width)
+                    if sampled_plan is None
+                    else member_label(sampled_plan.member)
+                )
         verify_proposal = tree_prefix(proposal, width, topk=self.tree_topk)
         result = verify_dflash_tree(
             batch=batch,
@@ -2551,7 +2576,21 @@ class DFlashWorkerV2(BaseSpecWorker):
                 topk=self.tree_topk,
                 raw_log_mass=self._tree_workspace.get("search_log_masses"),
             )
-        if node_draft_probs is not None and self._tree_draw_stats is not None:
+        if sampled_plan is not None:
+            adaptive.after_sampled_verify(
+                member=sampled_plan.member,
+                proposal=sampled_plan.proposal,
+                predicted=sampled_plan.predicted,
+                accept_index=result.accept_index,
+                accept_lens=result.accept_lens,
+                topk=self.tree_topk,
+            )
+        # The draw priors rank tree slots, so the chain's single draws do not feed them.
+        if (
+            node_draft_probs is not None
+            and self._tree_draw_stats is not None
+            and (sampled_plan is None or sampled_plan.member != CHAIN)
+        ):
             update_draw_acceptance(
                 stats=self._tree_draw_stats,
                 log_priors=self._tree_accept_prior,
@@ -2600,7 +2639,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._step_timer.begin(
                 is_decode=not is_extend and not batch.forward_mode.is_idle(),
                 bs=len(batch.seq_lens),
-                rows=self.tree_num_nodes if self.tree_mode else 0,
+                member=str(self.tree_num_nodes) if self.tree_mode else "0",
             )
 
         if is_extend:

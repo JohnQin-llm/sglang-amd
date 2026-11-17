@@ -4,11 +4,15 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.speculative.dflash_adaptive_width import (
+    CHAIN,
+    AdaptiveVerifyWidth,
+    AdaptiveWidthConfig,
     StaleDeviceStats,
     VerifyWidthPolicy,
     interpolate_cost,
@@ -76,6 +80,7 @@ class TestReadConfig(CustomTestCase):
     def _env(self, **values):
         keys = (
             "SGLANG_DFLASH_TREE_WIDTHS",
+            "SGLANG_DFLASH_TREE_SAMPLED_WIDTHS",
             "SGLANG_DFLASH_TREE_COST_TABLE",
             "SGLANG_DFLASH_TREE_FORCE_WIDTH",
             "SGLANG_DFLASH_TREE_CALIBRATION_DUMP",
@@ -84,17 +89,17 @@ class TestReadConfig(CustomTestCase):
         env.update(values)
         return patch.dict(os.environ, env, clear=True)
 
-    def _table(self):
+    def _table(self, sampled=None):
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-        json.dump(
-            {
-                "cost_ms": {
-                    str(q): {str(b): ms for b, ms in row.items()}
-                    for q, row in _COST_MS.items()
-                }
-            },
-            f,
-        )
+        table = {
+            "cost_ms": {
+                str(q): {str(b): ms for b, ms in row.items()}
+                for q, row in _COST_MS.items()
+            }
+        }
+        if sampled is not None:
+            table["sampled_cost_ms"] = sampled
+        json.dump(table, f)
         f.close()
         self.addCleanup(os.unlink, f.name)
         return f.name
@@ -127,6 +132,91 @@ class TestReadConfig(CustomTestCase):
             SGLANG_DFLASH_TREE_WIDTHS="16,32", SGLANG_DFLASH_TREE_FORCE_WIDTH="16"
         ):
             self.assertEqual(read_adaptive_width_config(32).force_width, 16)
+
+    def test_sampled_members_with_the_chain(self):
+        sampled = {"chain": {"1": 14.0, "16": 22.0}, "32": {"1": 16.0, "16": 36.0}}
+        with self._env(
+            SGLANG_DFLASH_TREE_WIDTHS="16,32",
+            SGLANG_DFLASH_TREE_SAMPLED_WIDTHS="32,chain",
+            SGLANG_DFLASH_TREE_COST_TABLE=self._table(sampled),
+        ):
+            config = read_adaptive_width_config(32)
+        self.assertEqual(config.widths, (16, 32))
+        self.assertEqual(config.sampled_members, (CHAIN, 32))
+        self.assertEqual(config.sampled_cost_ms[CHAIN][16], 22.0)
+        self.assertEqual(config.cost_ms[16][16], 24.0)
+
+    def test_sampled_members_need_sampled_costs(self):
+        with self._env(
+            SGLANG_DFLASH_TREE_SAMPLED_WIDTHS="chain,32",
+            SGLANG_DFLASH_TREE_COST_TABLE=self._table(),
+        ):
+            with self.assertRaises(ValueError):
+                read_adaptive_width_config(32)
+
+    def test_sampled_batches_reuse_the_greedy_table(self):
+        with self._env(
+            SGLANG_DFLASH_TREE_WIDTHS="16,32",
+            SGLANG_DFLASH_TREE_COST_TABLE=self._table(),
+        ):
+            config = read_adaptive_width_config(32)
+        self.assertEqual(config.sampled_members, (16, 32))
+        self.assertEqual(config.sampled_cost_ms, config.cost_ms)
+
+    def test_greedy_widths_hold_no_chain(self):
+        with self._env(SGLANG_DFLASH_TREE_WIDTHS="chain,32"):
+            with self.assertRaises(ValueError):
+                read_adaptive_width_config(32)
+
+    def test_forced_chain(self):
+        with self._env(
+            SGLANG_DFLASH_TREE_SAMPLED_WIDTHS="chain,16,32",
+            SGLANG_DFLASH_TREE_FORCE_WIDTH="chain",
+        ):
+            config = read_adaptive_width_config(32)
+        self.assertEqual(config.force_width, CHAIN)
+        width = AdaptiveVerifyWidth(
+            config=config, num_depths=7, chain_rows=8, device=torch.device("cpu")
+        )
+        self.assertEqual(width.choose_sampled_member(bs=4), CHAIN)
+        self.assertEqual(width.member_rows(CHAIN), 8)
+        # Greedy batches keep the server width; only the chain's 8 rows need graphs.
+        self.assertEqual(width.select_width(survival=None, bs=4), 32)
+        self.assertEqual(width._captured_rows(), [8])
+
+
+class TestChainMember(CustomTestCase):
+    def test_policy_falls_back_to_the_chain_at_high_load(self):
+        # Shaped like Qwen at T=1: the chain verifies 8 rows, the tree 16.
+        cost = {CHAIN: {1: 20.0, 16: 28.0}, 16: {1: 20.5, 16: 37.0}}
+        policy = VerifyWidthPolicy(widths=(CHAIN, 16), cost_ms=cost)
+        accept_lens = [3.95, 4.35]
+        self.assertEqual(policy.choose(bs=1, expected_accept_lens=accept_lens), 16)
+        self.assertEqual(policy.choose(bs=16, expected_accept_lens=accept_lens), CHAIN)
+
+    def test_member_choice_reads_only_earlier_steps(self):
+        config = AdaptiveWidthConfig(
+            widths=(16,),
+            sampled_members=(CHAIN, 16),
+            cost_ms={},
+            sampled_cost_ms={CHAIN: {1: 10.0}, 16: {1: 10.0}},
+            force_width=None,
+            calibration_dump=None,
+        )
+        width = AdaptiveVerifyWidth(
+            config=config, num_depths=15, chain_rows=16, device=torch.device("cpu")
+        )
+        width._sampled_stats._events = [_FakeEvent() for _ in range(4)]
+        # Equal cost: before any copy lands the tie goes to the chain.
+        self.assertEqual(width.choose_sampled_member(bs=1), CHAIN)
+        tree = SimpleNamespace(prefix_accept_len=torch.tensor([[1.0] * 15 + [6.0]]))
+        chain = SimpleNamespace(prefix_accept_len=torch.tensor([[1.0] * 15 + [5.0]]))
+        width.predict_sampled(tree_survival=tree, chain_survival=chain, bs=1)
+        # The copy has not landed yet, so this step's draws cannot steer the choice.
+        self.assertEqual(width.choose_sampled_member(bs=1), CHAIN)
+        for event in width._sampled_stats._events:
+            event.done = True
+        self.assertEqual(width.choose_sampled_member(bs=1), 16)
 
 
 class TestStaleDeviceStats(CustomTestCase):

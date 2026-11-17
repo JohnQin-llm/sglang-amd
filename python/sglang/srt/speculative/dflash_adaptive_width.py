@@ -7,6 +7,13 @@ picks the verify width ``Q`` from a small captured set to maximize the batch's e
 tokens per second, ``bs * E[AL](Q) / c(bs, Q)``, where ``c`` is a measured step-time
 table. The host never waits for the GPU: it reads the expected lengths of an earlier
 step from pinned memory once that step's copy has landed.
+
+Batches with sampling rows build the sampled tree and, when the chain is a member, the
+chain (every node's first draw, as deep as the draft block) from the same q. Their
+survival estimates are calibrated online per (depth, draw class, drawn-q bin) and may
+depend on the draws, so the member is chosen from earlier steps' estimates only. The
+chain under traversal verification is block verification, so the policy can fall back
+to the DFlash chain with block verification wherever it is predicted best.
 """
 
 from __future__ import annotations
@@ -25,18 +32,19 @@ logger = logging.getLogger(__name__)
 
 
 class StepTimer:
-    """Debug instrumentation: appends ``bs rows interval_s`` for consecutive decode steps.
+    """Debug instrumentation: appends ``bs member interval_s`` for consecutive decode steps.
 
     With overlap scheduling the host-side interval between consecutive decode calls is
     the pipeline period, i.e. the step cost, whether the GPU or the host is the bound.
-    ``rows`` is the verify width per request (0 for the chain path)."""
+    ``member`` is the verify width per request, "chain" for the chain member of a tree
+    worker, and 0 for the DFLASH chain path."""
 
     def __init__(self, path: str):
         self._file = open(path, "a", buffering=1 << 16)
         self._prev: Optional[list] = None
         self._lines = 0
 
-    def begin(self, *, is_decode: bool, bs: int, rows: int) -> None:
+    def begin(self, *, is_decode: bool, bs: int, member: str) -> None:
         now = time.perf_counter()
         prev = self._prev
         if prev is not None and prev[1] and is_decode:
@@ -44,11 +52,11 @@ class StepTimer:
             self._lines += 1
             if self._lines % 32 == 0:
                 self._file.flush()
-        self._prev = [now, is_decode, bs, rows]
+        self._prev = [now, is_decode, bs, member]
 
-    def set_rows(self, rows: int) -> None:
+    def set_member(self, member: str) -> None:
         if self._prev is not None:
-            self._prev[3] = rows
+            self._prev[3] = member
 
 
 def make_step_timer() -> Optional[StepTimer]:
@@ -56,61 +64,102 @@ def make_step_timer() -> Optional[StepTimer]:
     return StepTimer(path) if path else None
 
 
+# Member id of the chain in a sampled width set: every node's first draw, one path as
+# deep as the draft block, whose traversal verification is block verification.
+CHAIN = 0
+
+
+def member_label(member: int) -> str:
+    return "chain" if member == CHAIN else str(member)
+
+
+def _parse_members(value: str) -> tuple[int, ...]:
+    """ "chain,16,32" -> (CHAIN, 16, 32): the chain first, then widths ascending."""
+    members = {CHAIN if x.strip() == "chain" else int(x) for x in value.split(",")}
+    return tuple(sorted(members))
+
+
 class AdaptiveWidthConfig(msgspec.Struct, frozen=True):
-    """Experiment knobs: SGLANG_DFLASH_TREE_WIDTHS ("16,32"; its largest entry must be
-    --speculative-num-draft-tokens), SGLANG_DFLASH_TREE_COST_TABLE (JSON of
-    ``{"cost_ms": {"<Q>": {"<bs>": ms}}}``), SGLANG_DFLASH_TREE_FORCE_WIDTH (verify at
-    this width every step; for measurements), SGLANG_DFLASH_TREE_CALIBRATION_DUMP
-    (append per-step predicted and actual accept lengths; syncs every step)."""
+    """Experiment knobs: SGLANG_DFLASH_TREE_WIDTHS ("16,32") for greedy batches and
+    SGLANG_DFLASH_TREE_SAMPLED_WIDTHS ("chain,16,32"; default the greedy widths) for
+    batches with sampling rows; the largest tree width must be
+    --speculative-num-draft-tokens. SGLANG_DFLASH_TREE_COST_TABLE is a JSON of
+    ``{"cost_ms": {"<Q>": {"<bs>": ms}}, "sampled_cost_ms": {"chain" | "<Q>": ...}}``
+    (sampled batches fall back to ``cost_ms``). SGLANG_DFLASH_TREE_FORCE_WIDTH verifies
+    at this member every step where it is one (for measurements), and
+    SGLANG_DFLASH_TREE_CALIBRATION_DUMP appends per-step predicted and actual accept
+    lengths (one host sync every few dozen steps)."""
 
     widths: tuple[int, ...]
+    sampled_members: tuple[int, ...]
     cost_ms: dict[int, dict[int, float]]
+    sampled_cost_ms: dict[int, dict[int, float]]
     force_width: Optional[int]
     calibration_dump: Optional[str]
 
 
 def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
     value = os.environ.get("SGLANG_DFLASH_TREE_WIDTHS")
+    sampled_value = os.environ.get("SGLANG_DFLASH_TREE_SAMPLED_WIDTHS")
     calibration_dump = os.environ.get("SGLANG_DFLASH_TREE_CALIBRATION_DUMP") or None
-    if not value:
-        if calibration_dump is None:
-            return None
-        value = str(max_width)
-    widths = tuple(sorted({int(x) for x in value.split(",")}))
-    if widths[-1] != max_width:
+    force = os.environ.get("SGLANG_DFLASH_TREE_FORCE_WIDTH")
+    if not (value or sampled_value or calibration_dump or force):
+        return None
+    widths = _parse_members(value) if value else (max_width,)
+    sampled_members = _parse_members(sampled_value) if sampled_value else widths
+    if CHAIN in widths:
+        raise ValueError("the chain member is for sampled batches only")
+    trees = sorted((set(widths) | set(sampled_members)) - {CHAIN})
+    if not trees or trees[-1] != max_width:
         raise ValueError(
-            f"SGLANG_DFLASH_TREE_WIDTHS={value} must end at "
+            f"the largest tree width of {widths} and {sampled_members} must be "
             f"--speculative-num-draft-tokens={max_width}"
         )
-    if widths[0] < 2:
-        raise ValueError(f"tree verify widths must be >= 2, got {widths}")
-    force = os.environ.get("SGLANG_DFLASH_TREE_FORCE_WIDTH")
-    force_width = int(force) if force else None
-    if force_width is not None and force_width not in widths:
-        raise ValueError(f"forced width {force_width} is not in {widths}")
+    if trees[0] < 2:
+        raise ValueError(f"tree verify widths must be >= 2, got {trees}")
+    force_width = _parse_members(force)[0] if force else None
+    if force_width is not None and force_width not in widths + sampled_members:
+        raise ValueError(
+            f"forced width {force} is not in {widths} or {sampled_members}"
+        )
     table_path = os.environ.get("SGLANG_DFLASH_TREE_COST_TABLE")
-    cost_ms = load_cost_table(table_path) if table_path else {}
-    if len(widths) > 1 and force_width is None:
-        missing = [q for q in widths if q not in cost_ms]
-        if missing:
-            raise ValueError(
-                f"SGLANG_DFLASH_TREE_COST_TABLE has no step costs for widths {missing}"
-            )
+    cost_ms, sampled_cost_ms = load_cost_table(table_path) if table_path else ({}, {})
+    for name, members, costs in (
+        ("greedy", widths, cost_ms),
+        ("sampled", sampled_members, sampled_cost_ms),
+    ):
+        if len(members) > 1 and force_width not in members:
+            missing = [member_label(m) for m in members if m not in costs]
+            if missing:
+                raise ValueError(
+                    f"SGLANG_DFLASH_TREE_COST_TABLE has no {name} step costs for {missing}"
+                )
     return AdaptiveWidthConfig(
         widths=widths,
+        sampled_members=sampled_members,
         cost_ms=cost_ms,
+        sampled_cost_ms=sampled_cost_ms,
         force_width=force_width,
         calibration_dump=calibration_dump,
     )
 
 
-def load_cost_table(path: str) -> dict[int, dict[int, float]]:
-    """``{"cost_ms": {"<Q>": {"<bs>": ms}}}`` -> ``{Q: {bs: ms}}``."""
+def load_cost_table(
+    path: str,
+) -> tuple[dict[int, dict[int, float]], dict[int, dict[int, float]]]:
+    """The greedy and sampled step-cost tables, ``{member: {bs: ms}}``; the sampled one
+    is the greedy one where the file has no ``sampled_cost_ms``."""
     with open(path) as f:
-        raw = json.load(f)["cost_ms"]
-    return {
-        int(q): {int(b): float(ms) for b, ms in row.items()} for q, row in raw.items()
-    }
+        raw = json.load(f)
+
+    def table(section: dict) -> dict[int, dict[int, float]]:
+        return {
+            _parse_members(q)[0]: {int(b): float(ms) for b, ms in row.items()}
+            for q, row in section.items()
+        }
+
+    greedy = table(raw["cost_ms"])
+    return greedy, table(raw["sampled_cost_ms"]) if "sampled_cost_ms" in raw else greedy
 
 
 def interpolate_cost(row: dict[int, float], bs: int) -> float:
@@ -127,7 +176,8 @@ def interpolate_cost(row: dict[int, float], bs: int) -> float:
 
 
 class VerifyWidthPolicy:
-    """Picks the width with the most expected tokens per second at this batch size."""
+    """Picks the width (or member) with the most expected tokens per second at this batch
+    size."""
 
     def __init__(
         self, *, widths: tuple[int, ...], cost_ms: dict[int, dict[int, float]]
@@ -202,39 +252,76 @@ class VerifyWidthState(msgspec.Struct, frozen=True):
     graph_runner: object
 
 
+# Calibration dump lines are queued on the device and written with one host sync per
+# this many steps; arbitrary.
+_DUMP_FLUSH_STEPS = 64
+
+
 class AdaptiveVerifyWidth:
-    """Per-step verify width for one DFLASH tree worker: the online survival calibration,
-    the expected accept lengths handed to the host, the policy, and one target verify
-    backend and graph set per width."""
+    """Per-step verify width for one DFLASH tree worker: the online survival
+    calibrations (greedy trees, sampled trees, the sampled chain), the expected accept
+    lengths handed to the host, the policies, and one target verify backend and graph
+    set per verify row count."""
 
     def __init__(
         self,
         *,
         config: AdaptiveWidthConfig,
         num_depths: int,
+        chain_rows: int,
         device: torch.device,
     ):
-        from sglang.kernels.ops.speculative.dflash_tree import NUM_CALIBRATION_BINS
+        from sglang.kernels.ops.speculative.dflash_tree import (
+            NUM_CALIBRATION_BINS,
+            sampled_calibration_slots,
+        )
 
         self.widths = config.widths
-        self.max_width = config.widths[-1]
+        self.sampled_members = config.sampled_members
+        self.max_width = max(config.widths + config.sampled_members)
+        self.chain_rows = chain_rows
+        self.has_chain = CHAIN in config.sampled_members
+        if self.has_chain and chain_rows > self.max_width:
+            raise ValueError(
+                f"the chain verifies {chain_rows} rows, more than the server width "
+                f"{self.max_width}"
+            )
         self._config = config
         self._device = device
-        self.calibration_stats = torch.zeros(
-            (3, num_depths * NUM_CALIBRATION_BINS), dtype=torch.float32, device=device
+
+        def stats(slots: int) -> torch.Tensor:
+            return torch.zeros((3, slots), dtype=torch.float32, device=device)
+
+        self.calibration_stats = stats(num_depths * NUM_CALIBRATION_BINS)
+        self.sampled_stats = stats(sampled_calibration_slots(num_depths))
+        self.chain_stats = (
+            stats(sampled_calibration_slots(num_depths)) if self.has_chain else None
         )
         self._width_columns = torch.tensor(
             [width - 1 for width in config.widths], dtype=torch.long, device=device
         )
-        self._policy = None
-        self._stats = None
-        if len(config.widths) > 1 and config.force_width is None:
+        self._sampled_tree_columns = torch.tensor(
+            [m - 1 for m in config.sampled_members if m != CHAIN],
+            dtype=torch.long,
+            device=device,
+        )
+        force = config.force_width
+        self._policy = self._stats = None
+        if len(config.widths) > 1 and force not in config.widths:
             self._policy = VerifyWidthPolicy(
                 widths=config.widths, cost_ms=config.cost_ms
             )
             # Before the first copy lands, rank widths by cost alone.
             self._stats = StaleDeviceStats(
                 initial=[1.0] * len(config.widths), device=device
+            )
+        self._sampled_policy = self._sampled_stats = None
+        if len(config.sampled_members) > 1 and force not in config.sampled_members:
+            self._sampled_policy = VerifyWidthPolicy(
+                widths=config.sampled_members, cost_ms=config.sampled_cost_ms
+            )
+            self._sampled_stats = StaleDeviceStats(
+                initial=[1.0] * len(config.sampled_members), device=device
             )
         self._states: dict[int, VerifyWidthState] = {}
         self._active: Optional[int] = None
@@ -243,19 +330,37 @@ class AdaptiveVerifyWidth:
             if config.calibration_dump
             else None
         )
+        self._dump_queue: list[tuple[dict, torch.Tensor]] = []
 
     @classmethod
     def maybe_create(
-        cls, *, max_width: int, num_depths: int, device: torch.device
+        cls,
+        *,
+        max_width: int,
+        num_depths: int,
+        chain_rows: int,
+        device: torch.device,
     ) -> Optional["AdaptiveVerifyWidth"]:
         config = read_adaptive_width_config(max_width)
         if config is None:
             return None
-        return cls(config=config, num_depths=num_depths, device=device)
+        return cls(
+            config=config, num_depths=num_depths, chain_rows=chain_rows, device=device
+        )
+
+    def member_rows(self, member: int) -> int:
+        return self.chain_rows if member == CHAIN else member
+
+    def _captured_rows(self) -> list[int]:
+        force = self._config.force_width
+        greedy = (force,) if force in self.widths else self.widths
+        sampled = (force,) if force in self.sampled_members else self.sampled_members
+        rows = {self.member_rows(m) for m in greedy + sampled}
+        return sorted(rows - {self.max_width})
 
     def capture(self, model_runner) -> None:
-        """Build a target verify backend and graph set per width below the startup one,
-        whose backend and graphs serve the largest width."""
+        """Build a target verify backend and graph set per row count below the startup
+        one, whose backend and graphs serve the largest width."""
         from sglang.srt.runtime_context import get_spec
 
         self._states[self.max_width] = VerifyWidthState(
@@ -269,12 +374,7 @@ class AdaptiveVerifyWidth:
             default_runner is not None
             and default_runner is not model_runner.eager_runner
         )
-        for width in self.widths[:-1]:
-            if (
-                self._config.force_width is not None
-                and width != self._config.force_width
-            ):
-                continue
+        for width in self._captured_rows():
             with get_spec().override(speculative_num_draft_tokens=width):
                 saved_flag = model_runner.init_new_workspace
                 try:
@@ -295,28 +395,65 @@ class AdaptiveVerifyWidth:
             )
         free_after, _ = torch.cuda.mem_get_info(self._device)
         logger.info(
-            "DFLASH adaptive tree width: widths=%s, extra verify backends and graphs "
-            "took %.2f s and %.2f GB",
-            list(self._states),
+            "DFLASH adaptive tree width: greedy %s, sampled %s, verify rows %s; extra "
+            "verify backends and graphs took %.2f s and %.2f GB",
+            list(self.widths),
+            [member_label(m) for m in self.sampled_members],
+            sorted(self._states),
             time.perf_counter() - tic,
             (free_before - free_after) / (1 << 30),
         )
 
     def select_width(self, *, survival, bs: int) -> int:
-        """Hand this step's expected accept lengths to a later step's host decision and
-        pick this step's width from an earlier one's. ``survival`` is None for a tree
-        without an acceptance estimate (a sampled tree ranked by q), verified at the
-        largest width."""
-        if self._config.force_width is not None:
-            return self._config.force_width
-        if survival is None:
-            return self.max_width
-        if self._policy is None:
+        """Greedy batches: hand this step's expected accept lengths to a later step's
+        host decision and pick this step's width from an earlier one's. ``survival`` is
+        None for a tree without an acceptance estimate, verified at the largest width."""
+        force = self._config.force_width
+        if force is not None and force in self.widths:
+            return force
+        if survival is None or self._policy is None:
             return self.max_width
         self._stats.push(
             survival.prefix_accept_len[:bs, self._width_columns].mean(dim=0)
         )
         return self._policy.choose(bs=bs, expected_accept_lens=self._stats.latest())
+
+    def choose_sampled_member(self, *, bs: int) -> int:
+        """Batches with sampling rows: the member to verify, from earlier steps'
+        expected accept lengths only. A sampled tree's estimate depends on its draws, so
+        reading this step's would make the verified prefix depend on them."""
+        force = self._config.force_width
+        if force is not None and force in self.sampled_members:
+            return force
+        if self._sampled_policy is None:
+            return self.sampled_members[-1]
+        return self._sampled_policy.choose(
+            bs=bs, expected_accept_lens=self._sampled_stats.latest()
+        )
+
+    def predict_sampled(
+        self, *, tree_survival, chain_survival, bs: int
+    ) -> Optional[torch.Tensor]:
+        """Expected accept length ``[bs, members]`` of every sampled member, pushed (batch
+        mean) for later steps' decisions; None when neither a policy nor the dump reads
+        it."""
+        if self._sampled_policy is None and self._dump is None:
+            return None
+        columns = []
+        if self.has_chain:
+            columns.append(
+                chain_survival.prefix_accept_len[
+                    :bs, self.chain_rows - 1 : self.chain_rows
+                ]
+            )
+        if self._sampled_tree_columns.numel():
+            columns.append(
+                tree_survival.prefix_accept_len[:bs, self._sampled_tree_columns]
+            )
+        predicted = torch.cat(columns, dim=1)
+        if self._sampled_policy is not None:
+            self._sampled_stats.push(predicted.mean(dim=0))
+        return predicted
 
     def activate(self, width: int, model_runner) -> None:
         if width == self._active:
@@ -339,7 +476,7 @@ class AdaptiveVerifyWidth:
         from sglang.kernels.ops.speculative.dflash_tree import update_tree_calibration
 
         if self._dump is not None:
-            self._write_dump(
+            self._queue_greedy_dump(
                 survival=proposal.survival,
                 accept_index=accept_index,
                 accept_lens=accept_lens,
@@ -356,7 +493,54 @@ class AdaptiveVerifyWidth:
             topk=topk,
         )
 
-    def _write_dump(
+    def after_sampled_verify(
+        self,
+        *,
+        member: int,
+        proposal,
+        predicted: Optional[torch.Tensor],
+        accept_index: torch.Tensor,
+        accept_lens: torch.Tensor,
+        topk: int,
+    ) -> None:
+        """Update the verified member's calibration (the chain's, or the sampled
+        trees'), whose survival and edges ``proposal`` (that member's build) holds."""
+        from sglang.kernels.ops.speculative.dflash_tree import update_tree_calibration
+
+        if self._dump is not None and predicted is not None:
+            self._queue_dump(
+                {
+                    "kind": "sampled",
+                    "member": member_label(member),
+                    "members": [member_label(m) for m in self.sampled_members],
+                },
+                torch.cat([accept_lens.view(-1, 1).float(), predicted], dim=1),
+            )
+        update_tree_calibration(
+            stats=self.chain_stats if member == CHAIN else self.sampled_stats,
+            survival=proposal.survival,
+            top_scores_index=proposal.top_scores_index,
+            accept_index=accept_index,
+            accept_lens=accept_lens,
+            num_nodes=self.member_rows(member),
+            topk=topk,
+        )
+
+    def _queue_dump(self, header: dict, rows: torch.Tensor) -> None:
+        self._dump_queue.append((header, rows))
+        if len(self._dump_queue) < _DUMP_FLUSH_STEPS:
+            return
+        flat = torch.cat([r.reshape(-1) for _, r in self._dump_queue]).tolist()
+        offset = 0
+        for header, r in self._dump_queue:
+            n, m = r.shape
+            values = flat[offset : offset + n * m]
+            offset += n * m
+            line = dict(header, rows=[values[i * m : (i + 1) * m] for i in range(n)])
+            self._dump.write(json.dumps(line) + "\n")
+        self._dump_queue = []
+
+    def _queue_greedy_dump(
         self, *, survival, accept_index, accept_lens, width, raw_log_mass
     ) -> None:
         """One line per step: width, then per request the accept length, the predicted
@@ -395,5 +579,5 @@ class AdaptiveVerifyWidth:
                 torch.stack(counterfactual, dim=1),
             ],
             dim=1,
-        ).tolist()
-        self._dump.write(json.dumps({"width": width, "rows": rows}) + "\n")
+        )
+        self._queue_dump({"width": width}, rows)

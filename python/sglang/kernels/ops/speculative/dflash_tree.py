@@ -19,13 +19,16 @@ from torch import Tensor
 
 # Edge-probability bins per depth of the online survival calibration.
 NUM_CALIBRATION_BINS = 14
+# Draw classes of a sampled node's calibration slot: its parent's first, second, third,
+# and every later draw.
+NUM_DRAW_CLASSES = 4
 
 
 class DFlashTreeSurvival(msgspec.Struct, frozen=True):
     """Per node ``[B, Q]``, root first: log of the predicted chance that verification
     accepts the node, ``prefix_accept_len[:, n - 1]``, the expected accept length of the
-    tree's first ``n`` nodes, and for greedy trees the node's calibration slot
-    (``depth * NUM_CALIBRATION_BINS + bin``, -1 at the root) and raw edge probability."""
+    tree's first ``n`` nodes, the node's calibration slot (-1 at the root) and its raw
+    edge probability (selector probability, or the drawn q of a sampled tree)."""
 
     node_log_survival: Tensor
     prefix_accept_len: Tensor
@@ -479,8 +482,13 @@ def _build_dflash_sampled_tree_kernel(
     node_depths,
     node_ranks,
     log_priors,
+    cal_stats,
+    prior_stats,
     node_log_survival,
+    node_cal_slot,
+    node_edge_prob,
     prefix_accept_len,
+    cal_prior,
     CAND_BATCH_STRIDE: tl.constexpr,
     CAND_DEPTH_STRIDE: tl.constexpr,
     LQ_BATCH_STRIDE: tl.constexpr,
@@ -492,11 +500,17 @@ def _build_dflash_sampled_tree_kernel(
     Q: tl.constexpr,
     BLOCK_NODES: tl.constexpr,
     ACCEPT_PRIOR: tl.constexpr,
+    CHAIN: tl.constexpr,
+    CALIBRATE: tl.constexpr,
+    PRIOR_FROM_STATS: tl.constexpr,
+    NUM_BINS: tl.constexpr,
+    NUM_CLASSES: tl.constexpr,
 ):
     batch = tl.program_id(0)
     nodes = tl.arange(0, BLOCK_NODES)
     lq_row = batch * LQ_BATCH_STRIDE
     u_row = uniforms + batch * Q * K
+    num_slots = NUM_DEPTHS * NUM_CLASSES * NUM_BINS
 
     tl.store(
         parent_list + batch * PARENT_BATCH_STRIDE + nodes,
@@ -506,6 +520,8 @@ def _build_dflash_sampled_tree_kernel(
     tl.store(node_depths + batch * Q, 0)
     tl.store(node_ranks + batch * Q, 0)
     tl.store(node_log_survival + batch * Q, 0.0)
+    tl.store(node_cal_slot + batch * Q, -1)
+    tl.store(node_edge_prob + batch * Q, 1.0)
     tl.store(prefix_accept_len + batch * Q, 1.0)
     expected_len = 1.0
 
@@ -515,9 +531,13 @@ def _build_dflash_sampled_tree_kernel(
     # treats as draws from q. The score is the node's path score plus the value of its
     # next draw: path log-q plus the largest q it could still draw, or with
     # ACCEPT_PRIOR, the log-probabilities that each draw on the path is the accepted one.
+    # CHAIN gives every node one child, its first draw: the DFlash chain as a tree.
     depth = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     rank = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     mass = tl.where(nodes == 0, 0.0, -float("inf"))
+    # Log survival estimate per node; with CALIBRATE it may use the drawn values, since
+    # only later steps' width decisions read it.
+    survival = tl.zeros((BLOCK_NODES,), dtype=tl.float32)
     taken = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     drawn = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     no_draws = tl.full((), 0, tl.int32)
@@ -535,12 +555,16 @@ def _build_dflash_sampled_tree_kernel(
     bound = tl.where(nodes == 0, root_bound, -float("inf"))
 
     for node_index in range(1, Q):
-        frontier = mass + bound
-        best = tl.max(frontier, axis=0)
-        parent = tl.min(tl.where(frontier == best, nodes, BLOCK_NODES), axis=0)
+        if CHAIN:
+            parent = node_index - 1
+        else:
+            frontier = mass + bound
+            best = tl.max(frontier, axis=0)
+            parent = tl.min(tl.where(frontier == best, nodes, BLOCK_NODES), axis=0)
         is_parent = nodes == parent
         parent_mass = tl.sum(tl.where(is_parent, mass, 0.0), axis=0)
         parent_next = tl.sum(tl.where(is_parent, bound, 0.0), axis=0)
+        parent_survival = tl.sum(tl.where(is_parent, survival, 0.0), axis=0)
         parent_depth = tl.sum(tl.where(is_parent, depth, 0), axis=0)
         parent_rank = tl.sum(tl.where(is_parent, rank, 0), axis=0)
         parent_taken = tl.sum(tl.where(is_parent, taken, 0), axis=0)
@@ -571,6 +595,13 @@ def _build_dflash_sampled_tree_kernel(
         tl.store(node_depths + batch * Q + node_index, parent_depth + 1)
         tl.store(node_ranks + batch * Q + node_index, child_rank)
 
+        # Calibration slot: (parent depth, draw class, octave bin of the drawn q).
+        cal_slot = (
+            parent_depth * NUM_CLASSES + tl.minimum(parent_taken, NUM_CLASSES - 1)
+        ) * NUM_BINS + _calibration_bin(child_log_q, NUM_BINS)
+        draw_log_prior = _draw_prior(
+            parent_taken, log_first, log_miss_first, log_sibling, log_miss_sibling
+        )
         parent_drawn = parent_drawn | (1 << child_rank)
         parent_taken += 1
         child_depth = parent_depth + 1
@@ -593,9 +624,28 @@ def _build_dflash_sampled_tree_kernel(
                 K,
             )
             child_mass = parent_mass + child_log_q
-        # With ACCEPT_PRIOR a node's mass is the log chance verification accepts it.
-        expected_len += tl.exp(child_mass)
-        tl.store(node_log_survival + batch * Q + node_index, child_mass)
+        if CALIBRATE:
+            # The chance verification accepts the node once its parent is accepted:
+            # the slot's decayed hit rate, shrunk toward the draw prior, or toward the
+            # rate of the same slot in prior_stats.
+            prior_rate = tl.exp(draw_log_prior)
+            if PRIOR_FROM_STATS:
+                prior_hits = tl.load(prior_stats + cal_slot)
+                prior_reached = tl.load(prior_stats + num_slots + cal_slot)
+                prior_rate = (prior_hits + cal_prior * prior_rate) / (
+                    prior_reached + cal_prior
+                )
+            hits = tl.load(cal_stats + cal_slot)
+            reached = tl.load(cal_stats + num_slots + cal_slot)
+            rate = (hits + cal_prior * prior_rate) / (reached + cal_prior)
+            child_survival = parent_survival + tl.log(tl.minimum(rate, 1.0))
+        else:
+            # With ACCEPT_PRIOR a node's mass is the log chance verification accepts it.
+            child_survival = child_mass
+        expected_len += tl.exp(child_survival)
+        tl.store(node_log_survival + batch * Q + node_index, child_survival)
+        tl.store(node_cal_slot + batch * Q + node_index, cal_slot)
+        tl.store(node_edge_prob + batch * Q + node_index, tl.exp(child_log_q))
         tl.store(prefix_accept_len + batch * Q + node_index, expected_len)
         taken = tl.where(is_parent, parent_taken, taken)
         drawn = tl.where(is_parent, parent_drawn, drawn)
@@ -606,6 +656,7 @@ def _build_dflash_sampled_tree_kernel(
         depth = tl.where(is_new, child_depth, depth)
         rank = tl.where(is_new, child_rank, rank)
         mass = tl.where(is_new, child_mass, mass)
+        survival = tl.where(is_new, child_survival, survival)
         bound = tl.where(
             is_new,
             tl.where(child_depth < NUM_DEPTHS, child_bound, -float("inf")),
@@ -627,15 +678,34 @@ def log_draw_priors(accept_prior: tuple[float, float] | None) -> tuple[float, ..
     )
 
 
+def sampled_calibration_slots(num_depths: int) -> int:
+    """Slots of a sampled tree's survival calibration: (parent depth, draw class, bin)."""
+    return num_depths * NUM_DRAW_CLASSES * NUM_CALIBRATION_BINS
+
+
+class DFlashSampledTree(msgspec.Struct, frozen=True):
+    """A sampled tree and, per node ``[B, Q]``, its depth (0 at the root) and its rank
+    among its parent's K candidates, from which ``sampled_node_drafts`` rebuilds the
+    distribution its children were drawn from."""
+
+    proposal: DFlashTreeProposal
+    node_depths: Tensor
+    node_ranks: Tensor
+
+
 @torch.inference_mode()
-def build_dflash_sampled_tree_proposal(
+def build_dflash_sampled_tree(
     candidate_ids: Tensor,
     cond_log_q: Tensor,
     *,
     max_nodes: int,
     workspace: dict[str, Tensor] | None = None,
     accept_prior: tuple[float, float] | Tensor | None = None,
-) -> tuple[DFlashTreeProposal, Tensor, Tensor]:
+    chain: bool = False,
+    calibration: Tensor | None = None,
+    calibration_prior_stats: Tensor | None = None,
+    calibration_prior: float = 2.0,
+) -> DFlashSampledTree:
     """Sampled tree for lossless multi-draft verification at temperature > 0.
 
     Every node draws its children one at a time without replacement from its own
@@ -645,9 +715,15 @@ def build_dflash_sampled_tree_proposal(
     that verification reaches and accepts them, with a node's first draw accepted with
     prob ``a`` and each later draw with prob ``a'`` after its elder siblings were
     rejected; a float32 tensor holds ``(log a, log(1 - a), log a', log(1 - a'))`` on the
-    device instead, for priors updated online. Returns the proposal and, per node, the K
-    candidate tokens and q of its children's distribution (rank order), which the
-    verifier replays.
+    device instead, for priors updated online. ``chain`` makes it a single path of
+    ``max_nodes`` nodes, each the first draw of the one before: the DFlash chain, whose
+    traversal verification is block verification.
+
+    ``calibration`` (``[3, sampled_calibration_slots(L)]``, ``update_tree_calibration``'s
+    statistics) makes the survival estimate the product down the path of each slot's
+    accept rate, ``(hits + prior * r0) / (reached + prior)``, with ``r0`` the draw prior
+    or, with ``calibration_prior_stats``, that table's rate of the slot. Only the
+    estimate changes, not the tree.
     """
     batch_size, num_depths, candidate_top_k = candidate_ids.shape
     if candidate_top_k > 32:
@@ -658,9 +734,21 @@ def build_dflash_sampled_tree_proposal(
             f"EAGLE's parent-list ABI holds 2 <= Q <= min(128, K*(depth-1)+2) nodes; "
             f"got Q={max_nodes}, K={candidate_top_k}, depth={num_depths}"
         )
+    if chain and max_nodes > num_depths + 1:
+        raise ValueError(
+            f"a chain of {max_nodes} nodes is deeper than the lattice ({num_depths})"
+        )
+    num_slots = sampled_calibration_slots(num_depths)
+    for stats in (calibration, calibration_prior_stats):
+        if stats is not None and stats.shape != (3, num_slots):
+            raise ValueError(
+                f"calibration must be [3, {num_slots}], got {tuple(stats.shape)}"
+            )
     device = candidate_ids.device
+    prefix = "chain_" if chain else "sampled_"
 
     def buffer(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> Tensor:
+        name = prefix + name
         value = None if workspace is None else workspace.get(name)
         if value is None or value.shape != shape or value.dtype != dtype:
             value = torch.empty(shape, dtype=dtype, device=device)
@@ -669,18 +757,17 @@ def build_dflash_sampled_tree_proposal(
         return value
 
     edge_shape = (batch_size, max_nodes - 1)
-    draft_tokens = buffer("sampled_draft_tokens", edge_shape, torch.long)
-    selected_edges = buffer("sampled_top_scores_index", edge_shape, torch.long)
-    parent_list = buffer("sampled_parent_list", (batch_size, parent_width), torch.long)
-    node_depths = buffer("node_depths", (batch_size, max_nodes), torch.int32)
-    node_ranks = buffer("node_ranks", (batch_size, max_nodes), torch.int32)
+    node_shape = (batch_size, max_nodes)
+    draft_tokens = buffer("draft_tokens", edge_shape, torch.long)
+    selected_edges = buffer("top_scores_index", edge_shape, torch.long)
+    parent_list = buffer("parent_list", (batch_size, parent_width), torch.long)
+    node_depths = buffer("node_depths", node_shape, torch.int32)
+    node_ranks = buffer("node_ranks", node_shape, torch.int32)
     survival = DFlashTreeSurvival(
-        node_log_survival=buffer(
-            "sampled_node_log_survival", (batch_size, max_nodes), torch.float32
-        ),
-        prefix_accept_len=buffer(
-            "sampled_prefix_accept_len", (batch_size, max_nodes), torch.float32
-        ),
+        node_log_survival=buffer("node_log_survival", node_shape, torch.float32),
+        prefix_accept_len=buffer("prefix_accept_len", node_shape, torch.float32),
+        node_cal_slot=buffer("node_cal_slot", node_shape, torch.int32),
+        node_edge_prob=buffer("node_edge_prob", node_shape, torch.float32),
     )
     uniforms = torch.rand(
         (batch_size, max_nodes, candidate_top_k), dtype=torch.float32, device=device
@@ -708,8 +795,17 @@ def build_dflash_sampled_tree_proposal(
         node_depths,
         node_ranks,
         log_priors,
+        calibration if calibration is not None else survival.node_edge_prob,
+        (
+            calibration_prior_stats
+            if calibration_prior_stats is not None
+            else survival.node_edge_prob
+        ),
         survival.node_log_survival,
+        survival.node_cal_slot,
+        survival.node_edge_prob,
         survival.prefix_accept_len,
+        float(calibration_prior),
         CAND_BATCH_STRIDE=candidate_ids.stride(0),
         CAND_DEPTH_STRIDE=candidate_ids.stride(1),
         LQ_BATCH_STRIDE=cond_log_q.stride(0),
@@ -721,21 +817,70 @@ def build_dflash_sampled_tree_proposal(
         Q=max_nodes,
         BLOCK_NODES=triton.next_power_of_2(max_nodes),
         ACCEPT_PRIOR=accept_prior is not None,
+        CHAIN=chain,
+        CALIBRATE=calibration is not None,
+        PRIOR_FROM_STATS=calibration_prior_stats is not None,
+        NUM_BINS=NUM_CALIBRATION_BINS,
+        NUM_CLASSES=NUM_DRAW_CLASSES,
         num_warps=4,
         num_stages=1,
     )
-    rows = torch.arange(batch_size, device=device)[:, None]
-    depths = node_depths.long().clamp(max=num_depths - 1)
-    node_draft_tokens = candidate_ids[rows, depths]
-    node_draft_probs = cond_log_q[rows, depths, node_ranks.long()].exp()
-    node_draft_probs = node_draft_probs * (node_depths < num_depths).unsqueeze(-1)
     proposal = DFlashTreeProposal(
         draft_tokens=draft_tokens,
         parent_list=parent_list,
         top_scores_index=selected_edges,
-        survival=survival if accept_prior is not None else None,
+        survival=(
+            survival if accept_prior is not None or calibration is not None else None
+        ),
     )
-    return proposal, node_draft_tokens, node_draft_probs
+    return DFlashSampledTree(
+        proposal=proposal, node_depths=node_depths, node_ranks=node_ranks
+    )
+
+
+def sampled_node_drafts(
+    candidate_ids: Tensor, cond_log_q: Tensor, tree: DFlashSampledTree, num_nodes: int
+) -> tuple[Tensor, Tensor]:
+    """Per node of the tree's first ``num_nodes``, the K candidate tokens and q of its
+    children's distribution (rank order), which the verifier replays; q is zero at the
+    lattice's last depth, whose nodes have no children."""
+    num_depths = candidate_ids.shape[1]
+    node_depths = tree.node_depths[:, :num_nodes]
+    rows = torch.arange(candidate_ids.shape[0], device=candidate_ids.device)[:, None]
+    depths = node_depths.long().clamp(max=num_depths - 1)
+    node_draft_tokens = candidate_ids[rows, depths]
+    node_draft_probs = cond_log_q[
+        rows, depths, tree.node_ranks[:, :num_nodes].long()
+    ].exp()
+    node_draft_probs = node_draft_probs * (node_depths < num_depths).unsqueeze(-1)
+    return node_draft_tokens, node_draft_probs
+
+
+@torch.inference_mode()
+def build_dflash_sampled_tree_proposal(
+    candidate_ids: Tensor,
+    cond_log_q: Tensor,
+    *,
+    max_nodes: int,
+    workspace: dict[str, Tensor] | None = None,
+    accept_prior: tuple[float, float] | Tensor | None = None,
+    chain: bool = False,
+) -> tuple[DFlashTreeProposal, Tensor, Tensor]:
+    """``build_dflash_sampled_tree`` with every node's drafts (``sampled_node_drafts``)."""
+    candidate_ids = candidate_ids.contiguous()
+    cond_log_q = cond_log_q.contiguous()
+    tree = build_dflash_sampled_tree(
+        candidate_ids,
+        cond_log_q,
+        max_nodes=max_nodes,
+        workspace=workspace,
+        accept_prior=accept_prior,
+        chain=chain,
+    )
+    node_draft_tokens, node_draft_probs = sampled_node_drafts(
+        candidate_ids, cond_log_q, tree, max_nodes
+    )
+    return tree.proposal, node_draft_tokens, node_draft_probs
 
 
 @torch.inference_mode()
@@ -859,11 +1004,12 @@ def update_tree_calibration(
     topk: int,
     decay: float = 0.998,
 ) -> None:
-    """Online survival calibration from one greedy tree verify, on the device.
+    """Online survival calibration from one tree verify, on the device.
 
-    ``stats`` is ``[3, depths * NUM_CALIBRATION_BINS]``: decayed counts, per (parent
-    depth, edge-probability bin) slot, of nodes accepted, nodes reached (parent
-    accepted), and the reached nodes' raw edge probabilities. ``top_scores_index`` and
+    ``stats`` is ``[3, slots]``: decayed counts, per calibration slot (greedy trees:
+    parent depth and edge-probability bin; sampled trees: also the draw class), of nodes
+    accepted, nodes reached (parent accepted), and the reached nodes' raw edge
+    probabilities. ``top_scores_index`` and
     ``survival`` are the builder's (any width), ``num_nodes`` the verified prefix, and
     ``accept_index`` holds global node ids of the verified batch, root first, -1 past
     ``accept_lens``.

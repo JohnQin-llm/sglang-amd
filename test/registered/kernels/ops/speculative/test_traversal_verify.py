@@ -20,10 +20,10 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-l
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
-def _sampled_tree(candidate_ids, log_q, max_nodes):
+def _sampled_tree(candidate_ids, log_q, max_nodes, chain=False):
     rows, num_depths, k = candidate_ids.shape
     proposal, node_tokens, node_probs = build_dflash_sampled_tree_proposal(
-        candidate_ids, log_q, max_nodes=max_nodes
+        candidate_ids, log_q, max_nodes=max_nodes, chain=chain
     )
     seq_lens = torch.full((rows,), 10, dtype=torch.long, device="cuda")
     _, _, retrive_index, next_token, next_sibling, tokens = build_tree_kernel_efficient(
@@ -130,10 +130,12 @@ def test_kernel_matches_reference(num_depths, k, max_nodes, vocab):
     assert len(set(ref_accept_num.tolist())) >= 3
 
 
-def test_sampled_tree_traversal_commits_the_target():
+@pytest.mark.parametrize("chain, max_nodes", [(False, 8), (True, 4)])
+def test_sampled_tree_traversal_commits_the_target(chain, max_nodes):
     """The first two committed tokens must follow the target jointly; a round that commits
-    one token is extended by a target draw (Lemma A.1 of arXiv 2505.12398)."""
-    rows, num_depths, k, max_nodes = 200000, 3, 4, 8
+    one token is extended by a target draw (Lemma A.1 of arXiv 2505.12398). The chain
+    (the adaptive width's block-verification member) too."""
+    rows, num_depths, k = 200000, 3, 4
     gen = torch.Generator().manual_seed(11)
     log_q = torch.log_softmax(
         torch.randn(num_depths, k, k, generator=gen) * 2.0, dim=-1
@@ -152,7 +154,7 @@ def test_sampled_tree_traversal_commits_the_target():
     torch.manual_seed(12)
     candidate_ids = torch.arange(vocab).view(1, num_depths, k).repeat(rows, 1, 1)
     tree = _sampled_tree(
-        candidate_ids.cuda(), log_q.repeat(rows, 1, 1, 1).cuda(), max_nodes
+        candidate_ids.cuda(), log_q.repeat(rows, 1, 1, 1).cuda(), max_nodes, chain
     )
     # The target after a node depends on the node's token (a bigram model).
     target_probs = next_target.cuda()[tree["candidates"]]

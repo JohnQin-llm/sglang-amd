@@ -11,9 +11,12 @@ import torch
 
 from sglang.kernels.ops.speculative.dflash_tree import (
     NUM_CALIBRATION_BINS,
+    NUM_DRAW_CLASSES,
     build_dflash_greedy_tree_proposal,
+    build_dflash_sampled_tree,
     build_dflash_sampled_tree_proposal,
     build_dflash_tree_proposal,
+    log_draw_priors,
     tree_depth,
     tree_prefix,
     update_draw_acceptance,
@@ -672,6 +675,101 @@ def test_mixed_batch_keeps_sampled_rows(verify_fn):
     used = all_index[keep][all_index[keep] >= 0].long()
     assert torch.equal(mixed_predicts[used], all_predicts[used])
     assert all_num[keep].max().item() >= 2
+
+
+def test_chain_is_every_nodes_first_draw():
+    rows, num_depths, k = 64, 7, 8
+    gen = torch.Generator().manual_seed(4)
+    log_q = torch.log_softmax(torch.randn(rows, num_depths, k, k, generator=gen), -1)
+    candidate_ids = torch.randint(0, 50000, (rows, num_depths, k), generator=gen)
+    tree = build_dflash_sampled_tree(
+        candidate_ids.cuda(), log_q.cuda(), max_nodes=num_depths + 1, chain=True
+    )
+    nodes = torch.arange(1, num_depths + 1)
+    assert torch.equal(
+        tree.proposal.top_scores_index.cpu(), ((nodes - 1) * k).expand(rows, -1)
+    )
+    assert torch.equal(tree.node_depths[:, 1:].cpu(), nodes.int().expand(rows, -1))
+    ranks = tree.node_ranks[:, 1:].long().cpu()
+    tokens = candidate_ids.gather(2, ranks.unsqueeze(-1)).squeeze(-1)
+    assert torch.equal(tree.proposal.draft_tokens.cpu(), tokens)
+    with pytest.raises(ValueError):
+        build_dflash_sampled_tree(
+            candidate_ids.cuda(), log_q.cuda(), max_nodes=num_depths + 2, chain=True
+        )
+
+
+def _sampled_survival_reference(tree, log_q, stats, prior_stats, log_priors, prior):
+    """Calibrated survival of a sampled build: per node, its slot's rate shrunk toward
+    the draw prior (or toward ``prior_stats``' rate of the slot), multiplied down."""
+    edges = tree.proposal.top_scores_index.cpu()
+    depths, ranks = tree.node_depths.cpu(), tree.node_ranks.cpu()
+    bs, num_edges = edges.shape
+    k = log_q.shape[-1]
+    first, miss_first, sibling, miss_sibling = log_priors
+    slots, out = [], []
+    for b in range(bs):
+        log_surv, total, row, slot_row = [0.0], 1.0, [1.0], [-1]
+        for i in range(num_edges):
+            parent, draw = divmod(edges[b, i].item(), k)
+            d, r = depths[b, parent].item(), ranks[b, parent].item()
+            lq = log_q[b, d, r, ranks[b, i + 1]].item()
+            octave = math.floor(math.log2(max(-lq, 1e-12))) + 11
+            slot = (d * NUM_DRAW_CLASSES + min(draw, NUM_DRAW_CLASSES - 1)) * (
+                NUM_CALIBRATION_BINS
+            ) + min(max(octave, 0), NUM_CALIBRATION_BINS - 1)
+            r0 = math.exp(
+                first if draw == 0 else miss_first + (draw - 1) * miss_sibling + sibling
+            )
+            if prior_stats is not None:
+                ph, pr = prior_stats[0, slot].item(), prior_stats[1, slot].item()
+                r0 = (ph + prior * r0) / (pr + prior)
+            hits, reached = stats[0, slot].item(), stats[1, slot].item()
+            rate = min((hits + prior * r0) / (reached + prior), 1.0)
+            log_surv.append(log_surv[parent] + math.log(rate))
+            total += math.exp(log_surv[-1])
+            row.append(total)
+            slot_row.append(slot)
+        out.append(row)
+        slots.append(slot_row)
+    return torch.tensor(out), torch.tensor(slots, dtype=torch.int32)
+
+
+@pytest.mark.parametrize("chain", [False, True])
+def test_calibrated_sampled_survival_matches_reference(chain):
+    gen = torch.Generator().manual_seed(13)
+    bs, num_depths, k = 4, 7, 8
+    max_nodes = num_depths + 1 if chain else 24
+    candidate_ids = torch.randint(0, 50000, (bs, num_depths, k), generator=gen)
+    log_q = torch.log_softmax(torch.randn(bs, num_depths, k, k, generator=gen) * 2, -1)
+    num_slots = num_depths * NUM_DRAW_CLASSES * NUM_CALIBRATION_BINS
+
+    def random_stats():
+        reached = torch.rand(num_slots, generator=gen) * 20
+        hits = reached * torch.rand(num_slots, generator=gen)
+        return torch.stack([hits, reached, reached * 0.5])
+
+    stats = random_stats()
+    prior_stats = random_stats() if chain else None
+    accept_prior = (0.7, 0.3)
+    tree = build_dflash_sampled_tree(
+        candidate_ids.cuda(),
+        log_q.cuda(),
+        max_nodes=max_nodes,
+        accept_prior=accept_prior,
+        chain=chain,
+        calibration=stats.cuda(),
+        calibration_prior_stats=None if prior_stats is None else prior_stats.cuda(),
+        calibration_prior=2.0,
+    )
+    expected, slots = _sampled_survival_reference(
+        tree, log_q, stats, prior_stats, log_draw_priors(accept_prior), prior=2.0
+    )
+    survival = tree.proposal.survival
+    assert torch.equal(survival.node_cal_slot.cpu(), slots)
+    torch.testing.assert_close(
+        survival.prefix_accept_len.cpu(), expected, rtol=1e-4, atol=1e-4
+    )
 
 
 if __name__ == "__main__":

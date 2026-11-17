@@ -14,19 +14,23 @@ import dataclasses
 import os
 from typing import Any
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.speculative.dflash_tree import (
     DFlashTreeProposal,
     build_dflash_greedy_tree_proposal,
+    build_dflash_sampled_tree,
     build_dflash_sampled_tree_proposal,
     build_dflash_tree_proposal,
+    sampled_node_drafts,
     select_tree_rows,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.speculative.dflash_adaptive_width import CHAIN, AdaptiveVerifyWidth
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_common import (
@@ -74,16 +78,120 @@ def propose_dflash_sampled_tree(
 ) -> tuple[DFlashTreeProposal, torch.Tensor, torch.Tensor]:
     """Tree drawn from the selector's q at each request's temperature, for lossless
     multi-draft verification; also returns each node's child candidates and their q."""
+    lattice = sampled_lattice(
+        candidate_ids=candidate_ids,
+        scores=scores,
+        temperatures=temperatures,
+        topk=topk,
+    )
+    return build_dflash_sampled_tree_proposal(
+        lattice.candidate_ids,
+        lattice.cond_log_q,
+        max_nodes=num_nodes,
+        workspace=workspace,
+        accept_prior=accept_prior,
+    )
+
+
+class SampledLattice(msgspec.Struct, frozen=True):
+    """What sampled trees draw from: the first ``topk`` selector candidates ``[B, L, K]``
+    and, per (depth, predecessor rank), their q at each request's temperature as
+    log-probs ``[B, L, K, K]``."""
+
+    candidate_ids: torch.Tensor
+    cond_log_q: torch.Tensor
+
+
+def sampled_lattice(
+    *,
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
+    temperatures: torch.Tensor,
+    topk: int,
+) -> SampledLattice:
     _check_topk(candidate_ids, topk)
     logits = scores[:, :, :topk, :topk].float() / (
         temperatures.view(-1, 1, 1, 1) * _Q_TEMP
     )
-    return build_dflash_sampled_tree_proposal(
-        candidate_ids[:, :, :topk].contiguous(),
-        torch.log_softmax(logits, dim=-1),
+    return SampledLattice(
+        candidate_ids=candidate_ids[:, :, :topk].contiguous(),
+        cond_log_q=torch.log_softmax(logits, dim=-1),
+    )
+
+
+class SampledVerifyPlan(msgspec.Struct, frozen=True):
+    """One step's sampled verify under the adaptive width: the chosen member, its verify
+    rows, its build (proposal with survival and edges), its node drafts, and every
+    member's expected accept length ``[bs, members]`` (None when nothing reads it)."""
+
+    member: int
+    rows: int
+    proposal: DFlashTreeProposal
+    node_draft_tokens: torch.Tensor
+    node_draft_probs: torch.Tensor
+    predicted: torch.Tensor | None
+
+
+def propose_adaptive_sampled_tree(
+    *,
+    adaptive: AdaptiveVerifyWidth,
+    candidate_ids: torch.Tensor,
+    scores: torch.Tensor,
+    temperatures: torch.Tensor,
+    topk: int,
+    num_nodes: int,
+    workspace: dict[str, torch.Tensor],
+    accept_prior: tuple[float, float] | torch.Tensor | None,
+    bs: int,
+) -> SampledVerifyPlan:
+    """Choose the member from earlier steps, then build the sampled tree at ``num_nodes``
+    and, when the chain is a member, the chain from the same q; their survival
+    estimates feed later steps. Each member verifies its own build, which keeps every
+    node's first draws in draw order, so it stays lossless."""
+    member = adaptive.choose_sampled_member(bs=bs)
+    lattice = sampled_lattice(
+        candidate_ids=candidate_ids,
+        scores=scores,
+        temperatures=temperatures,
+        topk=topk,
+    )
+    tree = build_dflash_sampled_tree(
+        lattice.candidate_ids,
+        lattice.cond_log_q,
         max_nodes=num_nodes,
         workspace=workspace,
         accept_prior=accept_prior,
+        calibration=adaptive.sampled_stats,
+    )
+    chain = None
+    if adaptive.has_chain:
+        chain = build_dflash_sampled_tree(
+            lattice.candidate_ids,
+            lattice.cond_log_q,
+            max_nodes=adaptive.chain_rows,
+            workspace=workspace,
+            accept_prior=accept_prior,
+            chain=True,
+            calibration=adaptive.chain_stats,
+            calibration_prior_stats=adaptive.sampled_stats,
+        )
+    predicted = adaptive.predict_sampled(
+        tree_survival=tree.proposal.survival,
+        chain_survival=None if chain is None else chain.proposal.survival,
+        bs=bs,
+    )
+    chosen = chain if member == CHAIN else tree
+    rows = adaptive.member_rows(member)
+    node_draft_tokens, node_draft_probs = sampled_node_drafts(
+        lattice.candidate_ids, lattice.cond_log_q, chosen, rows
+    )
+    return SampledVerifyPlan(
+        member=member,
+        rows=rows,
+        proposal=chosen.proposal,
+        node_draft_tokens=node_draft_tokens,
+        node_draft_probs=node_draft_probs,
+        predicted=predicted,
     )
 
 
