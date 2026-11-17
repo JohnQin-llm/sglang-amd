@@ -18,6 +18,9 @@ from sglang.kernels.ops.speculative.spec_tree import (
 from sglang.kernels.ops.speculative.multi_draft_sampling import (
     tree_speculative_sampling_multi_draft,
 )
+from sglang.kernels.ops.speculative.traversal_verify import (
+    tree_speculative_sampling_traversal,
+)
 from sglang.kernels.ops.speculative.verify_sampling import (
     chain_speculative_sampling_triton,
     tree_speculative_sampling_target_only,
@@ -819,8 +822,14 @@ def eagle_sample(
                 max_top_k=max(top_ks),
                 uniform_top_k_value=next(iter(top_ks)) if len(top_ks) == 1 else None,
             )
+            # Block verification on a sampled tree is Traversal Verification
+            # (arXiv 2505.12398), which reduces to it on a chain.
             sampling_fn = partial(
-                tree_speculative_sampling_multi_draft,
+                (
+                    tree_speculative_sampling_traversal
+                    if get_spec().speculative_use_block_verification
+                    else tree_speculative_sampling_multi_draft
+                ),
                 node_draft_tokens=verify_input.tree_draft_tokens,
                 node_draft_probs=verify_input.tree_draft_probs,
             )

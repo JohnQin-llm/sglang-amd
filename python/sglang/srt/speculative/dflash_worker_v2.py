@@ -58,9 +58,15 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.kernels.ops.speculative.dflash_tree import (
+    log_draw_priors,
+    update_draw_acceptance,
+)
 from sglang.srt.speculative.dflash_tree_verify import (
+    ONLINE_PRIOR_START,
     propose_dflash_sampled_tree,
     propose_dflash_tree,
+    read_accept_prior_setting,
     verify_dflash_tree,
 )
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
@@ -565,6 +571,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.tree_num_nodes = int(get_spec().speculative_num_draft_tokens)
             self.speculative_num_draft_tokens = self.tree_num_nodes
             self._tree_workspace: dict[str, torch.Tensor] = {}
+            self._init_tree_accept_prior()
             self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
         if self._is_domino and self.block_size <= 1:
             raise ValueError(
@@ -2394,6 +2401,20 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def _init_tree_accept_prior(self) -> None:
+        # Online priors keep decayed draw counts on the device; the tree builder reads
+        # the log priors each step, so no host sync is needed.
+        setting = read_accept_prior_setting()
+        self._tree_draw_stats = None
+        self._tree_accept_prior = setting
+        if setting == "online":
+            self._tree_draw_stats = torch.zeros(4, dtype=torch.float32, device=self.device)
+            self._tree_accept_prior = torch.tensor(
+                log_draw_priors(ONLINE_PRIOR_START),
+                dtype=torch.float32,
+                device=self.device,
+            )
+
     def _tree_temperatures(self, sampling_info, bs: int) -> torch.Tensor:
         # Greedy rows in a mixed batch verify against a one-hot target, which is
         # lossless under any q; temperature 1 just gives them a well-spread tree.
@@ -2446,6 +2467,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 topk=self.tree_topk,
                 num_nodes=self.tree_num_nodes,
                 workspace=self._tree_workspace,
+                accept_prior=self._tree_accept_prior,
             )
         result = verify_dflash_tree(
             batch=batch,
@@ -2470,6 +2492,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if on_publish is not None:
             on_publish(result.new_seq_lens)
+        if node_draft_probs is not None and self._tree_draw_stats is not None:
+            update_draw_acceptance(
+                stats=self._tree_draw_stats,
+                log_priors=self._tree_accept_prior,
+                top_scores_index=proposal.top_scores_index,
+                accept_index=result.accept_index,
+                accept_lens=result.accept_lens,
+                num_nodes=self.tree_num_nodes,
+                topk=self.tree_topk,
+            )
 
         # The accepted path (root first) now fronts each request's verify rows, and it
         # is at most min(Q, F) long, so it fits the draft block's first columns.

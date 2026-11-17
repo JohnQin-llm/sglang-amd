@@ -9,6 +9,7 @@ import torch
 from sglang.kernels.ops.speculative.dflash_tree import (
     build_dflash_sampled_tree_proposal,
     build_dflash_tree_proposal,
+    update_draw_acceptance,
 )
 from sglang.kernels.ops.speculative.multi_draft_sampling import (
     tree_speculative_sampling_multi_draft,
@@ -157,7 +158,9 @@ def test_accept_prior_grows_depth_before_siblings():
     # chain before any node takes a second child.
     rows, num_depths, k = 64, 4, 8
     log_q = torch.log_softmax(torch.zeros(rows, num_depths, k, k), dim=-1)
-    candidate_ids = torch.arange(num_depths * k).view(1, num_depths, k).repeat(rows, 1, 1)
+    candidate_ids = (
+        torch.arange(num_depths * k).view(1, num_depths, k).repeat(rows, 1, 1)
+    )
     proposal, _, _ = build_dflash_sampled_tree_proposal(
         candidate_ids.cuda(),
         log_q.cuda(),
@@ -168,6 +171,26 @@ def test_accept_prior_grows_depth_before_siblings():
     for row in parents:
         assert row[:num_depths] == list(range(num_depths))
         assert row[num_depths:] == [0, 0]
+
+
+def test_online_draw_acceptance_counts():
+    # Root draws node 1 then 3; node 1 draws node 2 then 4. Paths: root's second draw
+    # accepted; node 1 then its second draw; nothing accepted at the root.
+    q, k = 5, 4
+    edges = torch.tensor([[0, 4, 1, 5]] * 3)
+    accept_index = torch.tensor([[0, 3, -1], [q, q + 1, q + 4], [2 * q, -1, -1]])
+    stats, log_priors = torch.zeros(4), torch.zeros(4)
+    update_draw_acceptance(
+        stats=stats,
+        log_priors=log_priors,
+        top_scores_index=edges,
+        accept_index=accept_index,
+        accept_lens=torch.tensor([2, 3, 1]),
+        num_nodes=q,
+        topk=k,
+    )
+    assert stats.tolist() == [1.0, 4.0, 2.0, 3.0]
+    assert torch.allclose(log_priors.exp()[[0, 2]], torch.tensor([2 / 6, 3 / 5]))
 
 
 if __name__ == "__main__":

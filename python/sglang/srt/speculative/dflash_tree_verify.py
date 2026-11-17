@@ -71,6 +71,7 @@ def propose_dflash_sampled_tree(
     topk: int,
     num_nodes: int,
     workspace: dict[str, torch.Tensor],
+    accept_prior: tuple[float, float] | torch.Tensor | None = None,
 ) -> tuple[DFlashTreeProposal, torch.Tensor, torch.Tensor]:
     """Tree drawn from the selector's q at each request's temperature, for lossless
     multi-draft verification; also returns each node's child candidates and their q."""
@@ -87,20 +88,26 @@ def propose_dflash_sampled_tree(
         torch.log_softmax(logits, dim=-1),
         max_nodes=num_nodes,
         workspace=workspace,
-        accept_prior=_ACCEPT_PRIOR,
+        accept_prior=accept_prior,
     )
 
 
-def _read_accept_prior() -> tuple[float, float] | None:
-    # Experiment knob: "a,a2" ranks sampled-tree slots by acceptance priors.
+# Online draw priors start here and then track verify outcomes.
+ONLINE_PRIOR_START = (0.7, 0.3)
+
+
+def read_accept_prior_setting() -> str | tuple[float, float] | None:
+    """Experiment knob SGLANG_DFLASH_TREE_ACCEPT_PRIOR: unset ranks sampled-tree slots
+    by q mass, "a,a2" by fixed draw priors, "online" by priors estimated while serving."""
     value = os.environ.get("SGLANG_DFLASH_TREE_ACCEPT_PRIOR")
     if not value:
         return None
+    if value == "online":
+        return value
     first, sibling = (float(x) for x in value.split(","))
     return first, sibling
 
 
-_ACCEPT_PRIOR = _read_accept_prior()
 # Experiment knobs: the greedy tree ranks by selector log-probs at this temperature, and
 # sampled trees draw (and verify) with q at the request temperature times this factor.
 _SCORE_TEMP = float(os.environ.get("SGLANG_DFLASH_TREE_SCORE_TEMP") or 1.0)

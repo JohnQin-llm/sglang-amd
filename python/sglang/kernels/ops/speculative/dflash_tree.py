@@ -280,10 +280,7 @@ def _build_dflash_sampled_tree_kernel(
     parent_list,
     node_depths,
     node_ranks,
-    log_first,
-    log_miss_first,
-    log_sibling,
-    log_miss_sibling,
+    log_priors,
     CAND_BATCH_STRIDE: tl.constexpr,
     CAND_DEPTH_STRIDE: tl.constexpr,
     LQ_BATCH_STRIDE: tl.constexpr,
@@ -321,6 +318,11 @@ def _build_dflash_sampled_tree_kernel(
     taken = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     drawn = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     no_draws = tl.full((), 0, tl.int32)
+    # log a, log(1 - a), log a', log(1 - a'); read only with ACCEPT_PRIOR.
+    log_first = tl.load(log_priors + 0)
+    log_miss_first = tl.load(log_priors + 1)
+    log_sibling = tl.load(log_priors + 2)
+    log_miss_sibling = tl.load(log_priors + 3)
     if ACCEPT_PRIOR:
         root_bound = _draw_prior(
             no_draws, log_first, log_miss_first, log_sibling, log_miss_sibling
@@ -404,7 +406,7 @@ def _build_dflash_sampled_tree_kernel(
         )
 
 
-def _log_draw_priors(accept_prior: tuple[float, float] | None) -> tuple[float, ...]:
+def log_draw_priors(accept_prior: tuple[float, float] | None) -> tuple[float, ...]:
     if accept_prior is None:
         return (0.0, 0.0, 0.0, 0.0)
     first, sibling = accept_prior
@@ -425,7 +427,7 @@ def build_dflash_sampled_tree_proposal(
     *,
     max_nodes: int,
     workspace: dict[str, Tensor] | None = None,
-    accept_prior: tuple[float, float] | None = None,
+    accept_prior: tuple[float, float] | Tensor | None = None,
 ) -> tuple[DFlashTreeProposal, Tensor, Tensor]:
     """Sampled tree for lossless multi-draft verification at temperature > 0.
 
@@ -435,8 +437,10 @@ def build_dflash_sampled_tree_proposal(
     tree in drawing order. ``accept_prior = (a, a')`` ranks slots instead by the chance
     that verification reaches and accepts them, with a node's first draw accepted with
     prob ``a`` and each later draw with prob ``a'`` after its elder siblings were
-    rejected. Returns the proposal and, per node, the K candidate tokens and q of its
-    children's distribution (rank order), which the verifier replays.
+    rejected; a float32 tensor holds ``(log a, log(1 - a), log a', log(1 - a'))`` on the
+    device instead, for priors updated online. Returns the proposal and, per node, the K
+    candidate tokens and q of its children's distribution (rank order), which the
+    verifier replays.
     """
     batch_size, num_depths, candidate_top_k = candidate_ids.shape
     if candidate_top_k > 32:
@@ -468,6 +472,17 @@ def build_dflash_sampled_tree_proposal(
     )
     cond_log_q = cond_log_q.contiguous()
     candidate_ids = candidate_ids.contiguous()
+    if isinstance(accept_prior, Tensor):
+        log_priors = accept_prior
+    else:
+        key = f"log_draw_priors{accept_prior}"
+        log_priors = None if workspace is None else workspace.get(key)
+        if log_priors is None:
+            log_priors = torch.tensor(
+                log_draw_priors(accept_prior), dtype=torch.float32, device=device
+            )
+            if workspace is not None:
+                workspace[key] = log_priors
     _build_dflash_sampled_tree_kernel[(batch_size,)](
         candidate_ids,
         cond_log_q,
@@ -477,7 +492,7 @@ def build_dflash_sampled_tree_proposal(
         parent_list,
         node_depths,
         node_ranks,
-        *_log_draw_priors(accept_prior),
+        log_priors,
         CAND_BATCH_STRIDE=candidate_ids.stride(0),
         CAND_DEPTH_STRIDE=candidate_ids.stride(1),
         LQ_BATCH_STRIDE=cond_log_q.stride(0),
@@ -503,3 +518,52 @@ def build_dflash_sampled_tree_proposal(
         top_scores_index=selected_edges,
     )
     return proposal, node_draft_tokens, node_draft_probs
+
+
+@torch.inference_mode()
+def update_draw_acceptance(
+    *,
+    stats: Tensor,
+    log_priors: Tensor,
+    top_scores_index: Tensor,
+    accept_index: Tensor,
+    accept_lens: Tensor,
+    num_nodes: int,
+    topk: int,
+    decay: float = 0.99,
+) -> None:
+    """Online estimate of the draw priors of a sampled tree from one verify step.
+
+    ``stats`` holds decayed counts (first-draw accepts, first draws, later-draw accepts,
+    later draws); ``log_priors`` receives ``(log a, log(1 - a), log a', log(1 - a'))``.
+    Along each accepted path, the child taken at draw ``s`` means draws ``1..s`` were
+    later draws, the last of them accepted; at the path's end every drawn child was
+    rejected. ``accept_index`` holds global node ids, root first, -1 past
+    ``accept_lens``. Runs on the device without a host sync.
+    """
+    bs = accept_lens.shape[0]
+    edges = top_scores_index[:bs]
+    draw = edges % topk
+    children = torch.zeros(bs, num_nodes, dtype=torch.float32, device=edges.device)
+    children.scatter_add_(1, edges // topk, torch.ones_like(edges, dtype=torch.float32))
+    offsets = torch.arange(bs, device=edges.device).unsqueeze(1) * num_nodes
+    nodes = accept_index[:bs].long() - offsets
+    stepped = accept_index[:bs, 1:] >= 0
+    taken = draw.gather(1, nodes[:, 1:].clamp(min=1) - 1)
+    taken = torch.where(stepped, taken, torch.zeros_like(taken)).float()
+    last = nodes.gather(1, (accept_lens.long() - 1).clamp(min=0).unsqueeze(1))
+    left = children.gather(1, last.clamp(min=0)).squeeze(1)
+    counts = torch.stack(
+        [
+            (stepped & (taken == 0)).sum().float(),
+            stepped.sum().float() + (left > 0).sum().float(),
+            (taken > 0).sum().float(),
+            taken.sum() + (left - 1).clamp(min=0).sum(),
+        ]
+    )
+    stats.mul_(decay).add_(counts)
+    first = ((stats[0] + 1) / (stats[1] + 2)).clamp(0.05, 0.95)
+    later = ((stats[2] + 1) / (stats[3] + 2)).clamp(0.05, 0.95)
+    log_priors.copy_(
+        torch.stack([first.log(), (-first).log1p(), later.log(), (-later).log1p()])
+    )

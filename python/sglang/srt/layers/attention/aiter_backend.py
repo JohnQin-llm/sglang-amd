@@ -86,6 +86,11 @@ from sglang.kernels.ops.attention.dcp_kernels import (
 )
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
 from sglang.kernels.ops.attention.pad import pad_sequence_with_mask
+from sglang.kernels.ops.attention.tree_verify_splitkv import (
+    tree_ancestor_bits,
+    tree_verify_attention,
+    tree_verify_supported,
+)
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
 from sglang.srt.configs.model_config import AttentionArch
@@ -99,8 +104,10 @@ from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
+from sglang.srt.layers.attention.verify_mask import VerifyMask, tree_mask_numel
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -239,6 +246,8 @@ class ForwardMetadata:
     swa_out_cache_loc: Optional[torch.Tensor] = None
     # kv_indices in window-pool ids, for the masked target-verify fallback.
     swa_kv_indices: Optional[torch.Tensor] = None
+    # [tokens] int64: bit j set when the tree verify row sees tree node j.
+    tree_ancestors: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
     # (capturing, seq_lens + max_q_len) for target-verify attention
@@ -608,6 +617,23 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and int(get_spec().speculative_eagle_topk or 1) <= 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
+        )
+        # DFLASH draft trees verify through tree_verify_attention, which reads the
+        # QLEN_ONLY tree mask this backend lends the drafter (verify_mask).
+        self._tree_verify = (
+            envs.SGLANG_AITER_TREE_VERIFY.get()
+            and not self.use_mla
+            and not model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dflash_family()
+            and int(get_spec().speculative_eagle_topk or 1) > 1
+            and not self.kv_cache_is_vectorized_5d
+            and self.v_head_dim == self.head_dim
+            and tree_verify_supported(
+                head_dim=self.head_dim, num_nodes=self.num_draft_tokens or 0
+            )
+        )
+        self._verify_mask = (
+            self._tree_verify_mask(max_bs=max_bs) if self._tree_verify else None
         )
 
         # aiter kernel related initialization
@@ -2418,6 +2444,24 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.spec_info.num_tokens_per_req,
                     max_kv_len,
                 )
+        elif forward_batch.forward_mode.is_target_verify() and self._tree_verify:
+            draft_num = forward_batch.input_ids.shape[0] // bs
+            self.forward_metadata = ForwardMetadata(
+                None,
+                None,
+                None,
+                None,
+                draft_num,
+                None,
+                max_extend_len=draft_num,
+                swa_out_cache_loc=swa_out_cache_loc,
+                tree_ancestors=self._fill_tree_ancestors(
+                    spec_info=spec_info,
+                    out=torch.empty(
+                        bs * draft_num, dtype=torch.int64, device=self.device
+                    ),
+                ),
+            )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
                 draft_num = spec_info.draft_token_num
@@ -2978,7 +3022,13 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-        if not self.skip_prefill:
+        if self._tree_verify:
+            self.cuda_graph_tree_ancestors = torch.zeros(
+                max_bs * self.num_draft_tokens, dtype=torch.int64, device=self.device
+            )
+            if max_bs > self._verify_mask.max_bs:
+                self._verify_mask = self._tree_verify_mask(max_bs=max_bs)
+        elif not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
                 dtype=torch.uint8,
@@ -3097,13 +3147,14 @@ class AiterAttnBackend(AttentionBackend):
         use_asm_cprr_verify = False
 
         swa_page_table = None
-        # Unified verify never reads this host max (replay sizes from
+        # Unified and tree verify never read this host max (replay sizes from
         # max_context_len); torch.max(seq_lens).item() would sync every replay.
         max_kv_len = (
             seq_lens_cpu.max().item()
             if seq_lens_cpu is not None
             else None
-            if forward_mode.is_target_verify() and self._use_unified_verify
+            if forward_mode.is_target_verify()
+            and (self._use_unified_verify or self._tree_verify)
             else torch.max(seq_lens).item()
         )
 
@@ -3250,6 +3301,21 @@ class AiterAttnBackend(AttentionBackend):
                 # num_kv_splits_indptr=num_kv_splits_indptr,
             )
 
+        elif forward_mode.is_target_verify() and self._tree_verify:
+            draft_num = verify_tokens_per_req
+            self.forward_metadata = ForwardMetadata(
+                None,
+                None,
+                None,
+                None,
+                draft_num,
+                None,
+                max_extend_len=draft_num,
+                tree_ancestors=self._fill_tree_ancestors(
+                    spec_info=spec_info,
+                    out=self.cuda_graph_tree_ancestors[: bs * draft_num],
+                ),
+            )
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
             assert verify_tokens_per_req is not None
@@ -3560,6 +3626,79 @@ class AiterAttnBackend(AttentionBackend):
         # This override prevents overlap-plan stream mode from failing with the
         # base class NotImplementedError.
         pass
+
+    @property
+    def verify_mask(self) -> Optional[VerifyMask]:
+        return self._verify_mask
+
+    def _tree_verify_mask(self, *, max_bs: int) -> VerifyMask:
+        mode = TreeMaskMode.QLEN_ONLY
+        numel = tree_mask_numel(
+            mode, max_bs, self.num_draft_tokens, self.max_context_len
+        )
+        return VerifyMask(
+            buffer=torch.zeros(numel, dtype=torch.bool, device=self.device),
+            mode=mode,
+            max_bs=max_bs,
+        )
+
+    def _fill_tree_ancestors(
+        self, *, spec_info: Optional[SpecInput], out: torch.Tensor
+    ) -> torch.Tensor:
+        """Each verify row's visible tree nodes as a bitmask, from the QLEN_ONLY
+        mask. Requests it does not cover (graph capture) see only themselves;
+        graph padding requests may read stale cells, which stay in range."""
+        nodes = self.num_draft_tokens
+        tree_mask = self._verify_mask.buffer
+        num_masked_reqs = 0
+        if spec_info is not None and spec_info.custom_mask is not None:
+            tree_mask = spec_info.custom_mask
+            num_masked_reqs = tree_mask.numel() // (nodes * nodes)
+        return tree_ancestor_bits(
+            tree_mask=tree_mask,
+            out=out,
+            num_nodes=nodes,
+            num_masked_reqs=num_masked_reqs,
+        )
+
+    def _forward_tree_verify(
+        self,
+        *,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        k_descale: Optional[torch.Tensor],
+        v_descale: Optional[torch.Tensor],
+        sinks: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
+        window = 0
+        slot_map = None
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            # The unified path's (W - 1, 0) window: q - k <= W - 1.
+            window = layer.sliding_window_size
+            if self.use_sliding_window_kv_pool:
+                slot_map = self.swa_kv_pool.full_to_swa_index_mapping
+        tree_verify_attention(
+            q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k_cache=k_cache.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+            v_cache=v_cache.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+            out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            req_to_token=self.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+            positions=forward_batch.positions,
+            ancestors=self.forward_metadata.tree_ancestors,
+            sm_scale=layer.scaling,
+            window=window,
+            slot_map=slot_map,
+            k_scale=k_descale,
+            v_scale=v_descale,
+            logit_cap=layer.logit_cap,
+            sinks=sinks,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _use_fused_fp8_kv_write(self, layer: RadixAttention) -> bool:
         # Fused write reuses K's num_heads/head_dim for V, so it needs FP8,
@@ -4250,6 +4389,17 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 else:
                     o = torch.empty_like(q)
+
+                if self.forward_metadata.tree_ancestors is not None:
+                    return self._forward_tree_verify(
+                        q=q,
+                        o=o,
+                        layer=layer,
+                        forward_batch=forward_batch,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        sinks=sinks,
+                    )
 
                 # target_verify goes through unified_attention when topk == 1
                 # (the linear draft chain gives a pure causal mask). MLA and
