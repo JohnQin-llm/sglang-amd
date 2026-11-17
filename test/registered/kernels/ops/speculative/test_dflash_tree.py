@@ -10,10 +10,14 @@ from sglang.kernels.ops.speculative.dflash_tree import (
     build_dflash_sampled_tree_proposal,
     build_dflash_tree_proposal,
 )
+from sglang.kernels.ops.speculative.multi_draft_sampling import (
+    tree_speculative_sampling_multi_draft,
+)
+from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-register_amd_ci(est_time=10, stage="jit-kernel-unit", runner_config="amd")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _reference(candidate_ids, cond_log_probs, max_nodes):
@@ -90,6 +94,58 @@ def test_sampled_tree_draws_children_from_q():
         for parent in set(parents):
             kids = [t for p, t in zip(parents, tokens) if p == parent]
             assert len(kids) == len(set(kids))
+
+
+def test_sampled_tree_verification_commits_the_target():
+    """The tree builder once let a drawn child's own q decide whether it entered the tree,
+    so the children kept were biased toward high q and multi-draft verification committed
+    tokens off the target distribution (max error 0.033 here, about 20 sigma)."""
+    rows, num_depths, k, max_nodes = 100000, 3, 4, 6
+    gen = torch.Generator().manual_seed(7)
+    log_q = torch.log_softmax(
+        torch.randn(num_depths, k, k, generator=gen) * 2.0, dim=-1
+    )
+    vocab = num_depths * k
+    target = torch.softmax(torch.randn(vocab, generator=gen) * 1.5, dim=-1)
+    candidate_ids = torch.arange(vocab).view(1, num_depths, k).repeat(rows, 1, 1).cuda()
+    proposal, node_tokens, node_probs = build_dflash_sampled_tree_proposal(
+        candidate_ids, log_q.repeat(rows, 1, 1, 1).cuda(), max_nodes=max_nodes
+    )
+    seq_lens = torch.full((rows,), 10, dtype=torch.long, device="cuda")
+    _, _, retrieve_index, next_token, next_sibling, tokens = (
+        build_tree_kernel_efficient(
+            torch.zeros(rows, dtype=torch.long, device="cuda"),
+            proposal.parent_list,
+            proposal.top_scores_index,
+            proposal.draft_tokens,
+            seq_lens,
+            int(seq_lens.sum()),
+            k,
+            num_depths,
+            max_nodes,
+            TreeMaskMode.FULL_MASK,
+        )
+    )
+    predicts = torch.full((rows * max_nodes,), -1, dtype=torch.int32, device="cuda")
+    tree_speculative_sampling_multi_draft(
+        predicts=predicts,
+        accept_index=torch.full(
+            (rows, num_depths + 1), -1, dtype=torch.int32, device="cuda"
+        ),
+        accept_token_num=torch.zeros(rows, dtype=torch.int32, device="cuda"),
+        candidates=tokens.view(rows, max_nodes),
+        retrive_index=retrieve_index.view(rows, max_nodes),
+        retrive_next_token=next_token.view(rows, max_nodes),
+        retrive_next_sibling=next_sibling.view(rows, max_nodes),
+        uniform_samples=torch.rand(rows, max_nodes, device="cuda"),
+        uniform_samples_for_final_sampling=torch.rand(rows, device="cuda"),
+        target_probs=target.cuda().expand(rows, max_nodes, vocab).contiguous(),
+        node_draft_tokens=node_tokens,
+        node_draft_probs=node_probs,
+    )
+    first = predicts.view(rows, max_nodes)[:, 0].long().cpu()
+    freq = torch.bincount(first, minlength=vocab).double() / rows
+    assert (freq - target.double()).abs().max().item() < 0.008
 
 
 if __name__ == "__main__":

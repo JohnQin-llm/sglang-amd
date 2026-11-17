@@ -251,6 +251,15 @@ def _draw_child(cond_log_q, base, drawn, u, K: tl.constexpr):
 
 
 @triton.jit
+def _max_undrawn_log_q(cond_log_q, base, drawn, K: tl.constexpr):
+    """Largest log q among a row's not-yet-drawn candidates; -inf when none is left."""
+    ranks = tl.arange(0, K)
+    log_q = tl.load(cond_log_q + base + ranks).to(tl.float32)
+    avail = ((drawn >> ranks) & 1) == 0
+    return tl.max(tl.where(avail, log_q, -float("inf")), axis=0)
+
+
+@triton.jit
 def _build_dflash_sampled_tree_kernel(
     candidate_ids,
     cond_log_q,
@@ -284,27 +293,39 @@ def _build_dflash_sampled_tree_kernel(
     tl.store(node_depths + batch * Q, 0)
     tl.store(node_ranks + batch * Q, 0)
 
-    # Per-node state; node 0 is the root (the bonus token) at depth 0.
+    # Per-node state; node 0 is the root (the bonus token) at depth 0. A node competes
+    # for the next slot with its path log-q plus the largest q it could still draw, a
+    # bound fixed before the draw: letting the drawn value decide whether the child
+    # enters the tree would bias the children the verifier treats as draws from q.
     depth = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     rank = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     mass = tl.where(nodes == 0, 0.0, -float("inf"))
     taken = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     drawn = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     no_draws = tl.full((), 0, tl.int32)
-    root_rank, root_log_q = _draw_child(cond_log_q, lq_row, no_draws, tl.load(u_row), K)
-    next_rank = tl.where(nodes == 0, root_rank, -1)
-    next_log_q = tl.where(nodes == 0, root_log_q, -float("inf"))
+    root_bound = _max_undrawn_log_q(cond_log_q, lq_row, no_draws, K)
+    bound = tl.where(nodes == 0, root_bound, -float("inf"))
 
     for node_index in range(1, Q):
-        frontier = mass + next_log_q
-        best_mass = tl.max(frontier, axis=0)
-        parent = tl.min(tl.where(frontier == best_mass, nodes, BLOCK_NODES), axis=0)
+        frontier = mass + bound
+        best = tl.max(frontier, axis=0)
+        parent = tl.min(tl.where(frontier == best, nodes, BLOCK_NODES), axis=0)
         is_parent = nodes == parent
+        parent_mass = tl.sum(tl.where(is_parent, mass, 0.0), axis=0)
         parent_depth = tl.sum(tl.where(is_parent, depth, 0), axis=0)
         parent_rank = tl.sum(tl.where(is_parent, rank, 0), axis=0)
         parent_taken = tl.sum(tl.where(is_parent, taken, 0), axis=0)
         parent_drawn = tl.sum(tl.where(is_parent, drawn, 0), axis=0)
-        child_rank = tl.sum(tl.where(is_parent, next_rank, 0), axis=0)
+        parent_row = (
+            lq_row + parent_depth * LQ_DEPTH_STRIDE + parent_rank * LQ_PARENT_STRIDE
+        )
+        child_rank, child_log_q = _draw_child(
+            cond_log_q,
+            parent_row,
+            parent_drawn,
+            tl.load(u_row + parent * K + parent_taken),
+            K,
+        )
         token = tl.load(
             candidate_ids
             + batch * CAND_BATCH_STRIDE
@@ -323,38 +344,29 @@ def _build_dflash_sampled_tree_kernel(
 
         parent_drawn = parent_drawn | (1 << child_rank)
         parent_taken += 1
-        refill_rank, refill_log_q = _draw_child(
-            cond_log_q,
-            lq_row + parent_depth * LQ_DEPTH_STRIDE + parent_rank * LQ_PARENT_STRIDE,
-            parent_drawn,
-            tl.load(u_row + parent * K + tl.minimum(parent_taken, K - 1)),
-            K,
-        )
+        parent_bound = _max_undrawn_log_q(cond_log_q, parent_row, parent_drawn, K)
         child_depth = parent_depth + 1
-        first_rank, first_log_q = _draw_child(
+        child_bound = _max_undrawn_log_q(
             cond_log_q,
             lq_row
             + tl.minimum(child_depth, NUM_DEPTHS - 1) * LQ_DEPTH_STRIDE
             + child_rank * LQ_PARENT_STRIDE,
             no_draws,
-            tl.load(u_row + node_index * K),
             K,
         )
-        parent_open = (parent_taken < K) & (parent_depth < NUM_DEPTHS)
-        child_open = child_depth < NUM_DEPTHS
         taken = tl.where(is_parent, parent_taken, taken)
         drawn = tl.where(is_parent, parent_drawn, drawn)
-        next_rank = tl.where(is_parent, refill_rank, next_rank)
-        next_log_q = tl.where(
-            is_parent, tl.where(parent_open, refill_log_q, -float("inf")), next_log_q
+        bound = tl.where(
+            is_parent, tl.where(parent_taken < K, parent_bound, -float("inf")), bound
         )
         is_new = nodes == node_index
         depth = tl.where(is_new, child_depth, depth)
         rank = tl.where(is_new, child_rank, rank)
-        mass = tl.where(is_new, best_mass, mass)
-        next_rank = tl.where(is_new, first_rank, next_rank)
-        next_log_q = tl.where(
-            is_new, tl.where(child_open, first_log_q, -float("inf")), next_log_q
+        mass = tl.where(is_new, parent_mass + child_log_q, mass)
+        bound = tl.where(
+            is_new,
+            tl.where(child_depth < NUM_DEPTHS, child_bound, -float("inf")),
+            bound,
         )
 
 
@@ -369,8 +381,9 @@ def build_dflash_sampled_tree_proposal(
     """Sampled tree for lossless multi-draft verification at temperature > 0.
 
     Every node draws its children one at a time without replacement from its own
-    ``q = exp(cond_log_q[b, depth, rank])``; nodes are added best-first by path log-q,
-    and a node's children enter the tree in drawing order. Returns the proposal and, per
+    ``q = exp(cond_log_q[b, depth, rank])``; the next slot goes to the node with the best
+    path log-q plus largest undrawn q, which then draws, and a node's children enter the
+    tree in drawing order. Returns the proposal and, per
     node, the K candidate tokens and q of its children's distribution (rank order), which
     the verifier replays.
     """
