@@ -526,15 +526,21 @@ def _verify_uses_greedy(
     is_hip: bool,
     is_xpu: bool,
     use_rejection_sampling: bool,
+    has_target_only_sampler: bool,
+    simulate_acc_len: float,
 ) -> bool:
     """Whether EAGLE verify must commit argmax instead of taking the sampling path.
 
-    HIP has no CUDA/MUSA sampling-verify kernels, so it used to be listed here
-    unconditionally. Rejection sampling routes it through the pure-Triton chain
-    sampler instead, so only a HIP run without that still has to go greedy. Every
-    other platform reduces to the original predicate.
+    HIP samples through the Triton chain sampler under rejection sampling and through
+    the Triton target-only tree sampler otherwise. Under SGLANG_SIMULATE_ACC_LEN it
+    stays on argmax, because the simulated acceptance overwrites the result anyway.
+    Every other platform reduces to the original predicate.
     """
-    return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
+    if is_all_greedy or is_cpu or is_xpu:
+        return True
+    if is_hip and not use_rejection_sampling:
+        return simulate_acc_len > 0 or not has_target_only_sampler
+    return False
 
 
 def _can_use_sparse_uno_tree_target_sampling(
@@ -706,6 +712,8 @@ def eagle_sample(
         is_hip=_is_hip,
         is_xpu=_is_xpu,
         use_rejection_sampling=use_rejection_sampling,
+        has_target_only_sampler=tree_speculative_sampling_target_only is not None,
+        simulate_acc_len=SIMULATE_ACC_LEN,
     ):
         target_predict = sampling_argmax(next_token_logits)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
