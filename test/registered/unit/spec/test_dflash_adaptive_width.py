@@ -245,7 +245,7 @@ class TestSampledPolicy(CustomTestCase):
         width = self._width()
         width._sampled_stats._events = [_FakeEvent() for _ in range(4)]
         # 16 accepted for every 10 predicted at member 16, after plenty of verifies.
-        width._member_totals[:, 1] = torch.tensor([1.6e6, 1.0e6])
+        width._member_totals[:, 1] = torch.tensor([1.6e9, 1.0e9])
         tree = SimpleNamespace(prefix_accept_len=torch.arange(1.0, 33.0).view(1, 32))
         chain = SimpleNamespace(prefix_accept_len=torch.full((1, 16), 4.0))
         out = width.predict_sampled(tree_survival=tree, chain_survival=chain, bs=1)

@@ -263,9 +263,11 @@ _DUMP_FLUSH_STEPS = 64
 # members the policy does not pick stays current; arbitrary.
 _EXPLORE_EVERY = 32
 # Per-member accept-length scale: decay per verify of the member, and the prior weight
-# in accepted tokens that holds it at 1 until data arrives; arbitrary.
-_MEMBER_SCALE_DECAY = 0.98
-_MEMBER_SCALE_PRIOR = 50.0
+# in accepted tokens that holds it at 1 until data arrives. A weaker prior let a dozen
+# exploration steps at batch size 1 (accept length sd ~3 tokens each) move a member's
+# scale by 25% on Glimmer at T=1; otherwise arbitrary.
+_MEMBER_SCALE_DECAY = 0.995
+_MEMBER_SCALE_PRIOR = 1000.0
 
 
 class AdaptiveVerifyWidth:
@@ -609,15 +611,11 @@ class AdaptiveVerifyWidth:
         )
         counterfactual = []
         for w in self.widths:
+            if w > width:
+                counterfactual.append(torch.full_like(accept_lens, -1).float())
+                continue
             inside = (path < w) & on_path
-            lead = torch.cumprod(inside.int(), dim=1).sum(dim=1)
-            counterfactual.append(
-                torch.where(
-                    torch.tensor(w <= width, device=path.device),
-                    lead.float(),
-                    torch.full_like(lead, -1).float(),
-                )
-            )
+            counterfactual.append(torch.cumprod(inside.int(), dim=1).sum(dim=1).float())
         predicted = survival.prefix_accept_len[:bs, self._width_columns]
         if raw_log_mass is None:
             raw = torch.zeros_like(predicted)
