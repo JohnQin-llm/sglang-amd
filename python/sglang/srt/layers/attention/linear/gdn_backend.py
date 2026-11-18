@@ -77,6 +77,15 @@ _fused_decode_verify_real_tensors = (
 )
 
 
+def _chain_ring_empty_at_verify(
+    *, ring_len: int, draft_token_num: int, checkpoint_dtype: torch.dtype
+) -> bool:
+    # Mirrors _advance_gdn_spec_cursors_kernel: a commit folds the whole ring
+    # when write_pos + 2 x the draft window exceeds it, and on every commit for
+    # 16-bit checkpoints, so such a chain verify never sees history.
+    return ring_len <= 2 * draft_token_num or checkpoint_dtype != torch.float32
+
+
 class GDNMISMetadata(msgspec.Struct, frozen=True):
     query_token_indices: torch.Tensor
     query_cu_seqlens: torch.Tensor
@@ -578,6 +587,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # every later layer of the same forward (or captured graph) reads them.
         self._first_state_layer_id = min(self.state_layer_indices)
         self._tree_paths = None
+        self._use_wy_verify = envs.SGLANG_ENABLE_GDN_WY_VERIFY.get()
+        self._tree_ancestors = None
         # A prefill batch never holds more requests than the pool.
         self.prefill_graph_max_seqs = min(
             self.req_to_token_pool.size, envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get()
@@ -1723,11 +1734,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         draft_token_num: int,
     ) -> torch.Tensor:
         """Tree verify that keeps every node state on chip: one program per
-        root-to-leaf path. The ring takes each node's raw inputs, and the commit
-        fold replays the accepted path into ``temporal``."""
+        root-to-leaf path, or per request with the chunked tree kernel. The ring
+        takes each node's raw inputs, and the commit fold replays the accepted
+        path into ``temporal``."""
         from sglang.kernels.ops.attention.linear.gdn_tree_verify import (
             gdn_tree_paths,
             gdn_tree_verify,
+        )
+        from sglang.kernels.ops.attention.linear.gdn_tree_wy_verify import (
+            gdn_tree_ancestors,
+            gdn_tree_wy_verify,
         )
 
         num_requests = key.shape[-3] // draft_token_num
@@ -1736,14 +1752,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token = torch.arange(
                 -1, draft_token_num - 1, device=query.device
             ).expand(num_requests, draft_token_num)
-        if (
-            layer.layer_id == self._first_state_layer_id
-            or self._tree_paths is None
-            or self._tree_paths[1].shape != (num_requests, draft_token_num)
-        ):
-            self._tree_paths = gdn_tree_paths(retrieve_parent_token, draft_token_num)
-
-        return gdn_tree_verify(
+        verify_inputs = dict(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             q=query,
@@ -1760,8 +1769,28 @@ class GDNAttnBackend(MambaAttnBackendBase):
             g_ring=layer_cache.replayssm_g,
             beta_ring=layer_cache.replayssm_beta,
             ring_indices=ring_indices,
-            tree_paths=self._tree_paths,
         )
+        first_layer = layer.layer_id == self._first_state_layer_id
+        if self._use_wy_verify:
+            if (
+                first_layer
+                or self._tree_ancestors is None
+                or self._tree_ancestors.shape != (num_requests, draft_token_num)
+            ):
+                self._tree_ancestors = gdn_tree_ancestors(
+                    retrieve_parent_token, draft_token_num
+                )
+            return gdn_tree_wy_verify(
+                tree_ancestors=self._tree_ancestors, **verify_inputs
+            )
+
+        if (
+            first_layer
+            or self._tree_paths is None
+            or self._tree_paths[1].shape != (num_requests, draft_token_num)
+        ):
+            self._tree_paths = gdn_tree_paths(retrieve_parent_token, draft_token_num)
+        return gdn_tree_verify(tree_paths=self._tree_paths, **verify_inputs)
 
     def _replayssm_target_verify(
         self,
@@ -1809,6 +1838,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b = b.reshape(seq_len, HV)
         d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
         max_cache_len = d_cache.shape[-2]  # ring length L
+        if (
+            self._use_wy_verify
+            and layer_cache.replayssm_rawv is not None
+            and _chain_ring_empty_at_verify(
+                ring_len=max_cache_len,
+                draft_token_num=draft_token_num,
+                checkpoint_dtype=layer_cache.temporal.dtype,
+            )
+        ):
+            from sglang.kernels.ops.attention.linear.gdn_tree_wy_verify import (
+                gdn_chain_wy_verify,
+            )
+
+            out = gdn_chain_wy_verify(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=q,
+                k=k,
+                v=v,
+                a=a,
+                b=b,
+                checkpoint_state=layer_cache.temporal,
+                d_cache=d_cache,
+                k_cache=layer_cache.replayssm_k,
+                g_cache=layer_cache.replayssm_g,
+                d_residual_cache=layer_cache.replayssm_rawv,
+                k_residual_cache=layer_cache.replayssm_rawk,
+                ssm_state_indices=cache_indices,
+                replay_indices=replay_indices,
+                cache_base=mamba_pool.replayssm_cache_base,
+                num_draft_tokens=draft_token_num,
+                scale=K**-0.5,
+            )
+            return out.reshape(value.shape)
         out = q.new_empty(seq_len, HV, V)
         gdn_replayssm_spec_decode(
             q=q,
