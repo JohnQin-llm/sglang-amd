@@ -68,6 +68,7 @@ def _group_max_kernel(
     temperatures_ptr,
     rows_per_request,
     group_max_ptr,
+    counts_ptr,
     VOCAB_SIZE: tl.constexpr,
     SEGMENT: tl.constexpr,
     GROUPS: tl.constexpr,
@@ -77,6 +78,8 @@ def _group_max_kernel(
         logits_ptr, stride_row, temperatures_ptr, rows_per_request
     )
     segment = tl.program_id(1)
+    if segment == 0:
+        tl.store(counts_ptr + row, 0)
     acc = tl.full((BLOCK,), _INT32_MIN, tl.int32)
     for start in range(segment * SEGMENT, (segment + 1) * SEGMENT, BLOCK):
         keys = _scaled_keys(
@@ -270,12 +273,13 @@ def verify_head_top_k(
     segment = triton.cdiv(triton.cdiv(vocab, segments), _BLOCK) * _BLOCK
     temperatures = temperatures.reshape(-1).to(torch.float32)
     group_max = torch.empty((rows, _GROUPS_PER_ROW), dtype=torch.int32, device=device)
-    counts = torch.zeros((rows,), dtype=torch.int32, device=device)
+    counts = torch.empty((rows,), dtype=torch.int32, device=device)
     candidates = torch.empty((rows, cap), dtype=torch.int64, device=device)
     row_args = (logits, logits.stride(0), temperatures, rows_per_request)
     _group_max_kernel[(rows, segments)](
         *row_args,
         group_max,
+        counts,
         VOCAB_SIZE=vocab,
         SEGMENT=segment,
         GROUPS=_GROUPS_PER_ROW // segments,

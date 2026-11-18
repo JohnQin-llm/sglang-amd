@@ -9,6 +9,10 @@ import torch
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
+from sglang.kernels.ops.speculative.sparse_reject_sampling import (
+    chain_speculative_sampling_sparse_triton,
+)
+from sglang.kernels.ops.speculative.verify_head_topk import verify_head_top_k
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     accept_draft_tokens,
@@ -382,5 +386,129 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
     assert (token_correct_len[sampled] == 0).any()
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__]))
+def _sparse_support_case(batch, slots, vocab, k, seed):
+    """Target supports with at most one token per 4096-token vocabulary block, where the
+    sparse sums are bitwise the dense kernel's; drafts follow q over 16 candidates."""
+    gen = torch.Generator(device=DEVICE).manual_seed(seed)
+    blocks = torch.rand(batch * slots, vocab // 4096, device=DEVICE, generator=gen)
+    ids = blocks.topk(k, dim=-1).indices * 4096 + torch.randint(
+        0, 4096, (batch * slots, k), device=DEVICE, generator=gen
+    )
+    logits = torch.randn(batch * slots, k, device=DEVICE, generator=gen) * 2
+    probs = torch.softmax(logits.sort(dim=-1, descending=True).values, dim=-1)
+    # Zero the tail as top-p does.
+    probs = torch.where(probs.cumsum(-1) - probs < 0.95, probs, 0.0)
+    probs = probs / probs.sum(-1, keepdim=True)
+    t_ids = ids.view(batch, slots, k)
+    t_probs = probs.view(batch, slots, k)
+    take = (
+        (
+            logits.view(batch, slots, k)[:, :-1]
+            + torch.rand(batch, slots - 1, k, device=DEVICE, generator=gen)
+        )
+        .topk(16, dim=-1)
+        .indices
+    )
+    d_ids = t_ids[:, :-1].gather(-1, take)
+    d_probs = torch.softmax(
+        torch.randn(batch, slots - 1, 16, device=DEVICE, generator=gen), dim=-1
+    )
+    pick = torch.multinomial(d_probs.flatten(0, 1), 1, generator=gen)
+    drafts = d_ids.gather(-1, pick.view(batch, slots - 1, 1)).squeeze(-1)
+    candidates = torch.cat([drafts[:, :1], drafts], dim=1)
+    coins = torch.rand(batch, slots - 1, device=DEVICE, generator=gen)
+    final_coins = torch.rand(batch, device=DEVICE, generator=gen)
+    return t_ids, t_probs, d_ids, d_probs, candidates, coins, final_coins
+
+
+def _run_chain(fn, candidates, coins, final_coins, **kwargs):
+    batch, slots = candidates.shape
+    index = torch.arange(batch * slots, device=DEVICE).view(batch, slots)
+    predicts = torch.full((batch * slots,), -1, dtype=torch.int32, device=DEVICE)
+    accepted = torch.full((batch, slots), -1, dtype=torch.int32, device=DEVICE)
+    lengths = torch.full((batch,), -1, dtype=torch.int32, device=DEVICE)
+    fn(
+        predicts=predicts,
+        accept_index=accepted,
+        accept_token_num=lengths,
+        candidates=candidates,
+        retrive_index=index,
+        uniform_samples=coins,
+        uniform_samples_for_final_sampling=final_coins,
+        **kwargs,
+    )
+    return lengths, accepted, predicts
+
+
+@pytest.mark.parametrize("block_verification", [False, True])
+@pytest.mark.parametrize("slots,vocab,k", [(8, 248320, 20), (16, 202048, 40)])
+def test_sparse_matches_dense(slots, vocab, k, block_verification):
+    """With at most one support token per vocabulary block, the sparse kernel makes the
+    dense kernel's decisions and draws on the same coins."""
+    for seed in range(4):
+        t_ids, t_probs, d_ids, d_probs, candidates, coins, final_coins = (
+            _sparse_support_case(16, slots, vocab, k, seed)
+        )
+        dense_target = torch.zeros(16, slots, vocab, device=DEVICE).scatter_(
+            -1, t_ids, t_probs
+        )
+        dense_draft = torch.zeros(16, slots - 1, vocab, device=DEVICE).scatter_(
+            -1, d_ids, d_probs
+        )
+        expected = _run_chain(
+            chain_speculative_sampling_triton,
+            candidates,
+            coins,
+            final_coins,
+            retrive_next_token=None,
+            retrive_next_sibling=None,
+            target_probs=dense_target,
+            draft_probs=dense_draft,
+            threshold_single=1.0,
+            threshold_acc=1.0,
+            deterministic=True,
+            block_verification=block_verification,
+        )
+        actual = _run_chain(
+            chain_speculative_sampling_sparse_triton,
+            candidates,
+            coins,
+            final_coins,
+            target_token_ids=t_ids,
+            target_probs=t_probs,
+            draft_token_ids=d_ids,
+            draft_probs=d_probs,
+            vocab_size=vocab,
+            block_verification=block_verification,
+        )
+        for want, got in zip(expected, actual):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("kind", ["bf16", "ties", "constant", "signed_zeros"])
+@pytest.mark.parametrize("vocab,k", [(248320, 20), (32000, 256)])
+def test_verify_head_top_k_matches_torch(vocab, k, kind):
+    """Same tokens and the same sorted values as torch.topk(logits / t), ties at the k-th
+    value included (they keep the lowest token ids), also when ties overflow the candidates."""
+    gen = torch.Generator(device=DEVICE).manual_seed(0)
+    logits = torch.randn(16, vocab, device=DEVICE, generator=gen) * 3
+    if kind == "bf16":
+        logits = logits.to(torch.bfloat16).float()
+    elif kind == "ties":
+        logits = (logits * 2).round() / 2
+    elif kind == "constant":
+        logits = torch.full_like(logits, 2.0)
+    else:
+        logits = torch.where(logits > 0, 0.0, -0.0)
+    temperatures = torch.tensor([[1.0], [0.7], [1.3], [0.25]], device=DEVICE)
+    expected_values, expected_ids = torch.topk(
+        logits / temperatures.repeat_interleave(4, dim=0), k, dim=-1
+    )
+    values, ids = verify_head_top_k(
+        logits=logits, temperatures=temperatures, rows_per_request=4, k=k
+    )
+    assert torch.equal(values.view(torch.int32), expected_values.view(torch.int32))
+    assert torch.equal(ids.sort(dim=-1).values, expected_ids.sort(dim=-1).values)
+
+
+if __name

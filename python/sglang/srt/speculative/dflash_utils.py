@@ -1134,6 +1134,13 @@ class SparseVerifyTargetProbs(msgspec.Struct, frozen=True):
     probs: torch.Tensor
 
 
+def _repeated_top_ks(
+    sampling_info: Any, draft_token_num: int, vocab_size: int
+) -> torch.Tensor:
+    top_ks = torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0)
+    return top_ks.to(dtype=torch.int64).clamp_(min=1, max=vocab_size)
+
+
 def _top_k_first_target_probs(
     *,
     next_token_logits: torch.Tensor,
@@ -1148,12 +1155,10 @@ def _top_k_first_target_probs(
     their token ids, ``[rows, k]`` each; None when k covers the vocabulary."""
     device = next_token_logits.device
     vocab_size = int(next_token_logits.shape[-1])
-    repeated_top_ks = torch.repeat_interleave(
-        sampling_info.top_ks, draft_token_num, dim=0
-    ).to(dtype=torch.int64)
-    repeated_top_ks.clamp_(min=1, max=vocab_size)
     if max_top_k is None:
-        max_top_k = int(repeated_top_ks.max().item())
+        max_top_k = int(
+            _repeated_top_ks(sampling_info, draft_token_num, vocab_size).max().item()
+        )
     max_top_k = min(max(int(max_top_k), 1), vocab_size)
     if max_top_k >= vocab_size:
         return None
@@ -1179,8 +1184,9 @@ def _top_k_first_target_probs(
         scaled_logits = next_token_logits / expanded_temperature
         topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
     if not uniform:
+        top_ks = _repeated_top_ks(sampling_info, draft_token_num, vocab_size)
         ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[None, :]
-        valid = ranks < repeated_top_ks.unsqueeze(1)
+        valid = ranks < top_ks.unsqueeze(1)
         topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
 
     topk_probs = F.softmax(topk_logits, dim=-1)

@@ -17,6 +17,9 @@ import torch
 import triton
 import triton.language as tl
 
+# A draw target no running sum of probabilities reaches: the walk then only sums.
+_SUM_ONLY = tl.constexpr(2.0)
+
 
 @triton.jit
 def _row_support(ids_ptr, vals_ptr, row_offset, K: tl.constexpr, K_PAD: tl.constexpr):
@@ -159,7 +162,7 @@ def _sparse_chain_speculative_sampling_kernel(
                         q_next = _lookup_many(d_ids, d_vals, t_ids)
                         residual = tl.maximum(prefix_prob * t_vals - q_next, 0.0)
                         residual_mass, _ = _walk_in_token_order(
-                            t_ids, residual, 2.0, VOCAB_SIZE, BLOCK_REDUCE
+                            t_ids, residual, _SUM_ONLY, VOCAB_SIZE, BLOCK_REDUCE
                         )
                         accept_prob = residual_mass / (
                             residual_mass + 1.0 - prefix_prob
@@ -221,7 +224,7 @@ def _sparse_chain_speculative_sampling_kernel(
         diff = residual_scale * t_vals - q_vals
         vals = tl.where(diff > 0.0, diff, 0.0)
     if norm_sum < 0.0:
-        norm_sum, _ = _walk_in_token_order(t_ids, vals, 2.0, VOCAB_SIZE, BLOCK_V)
+        norm_sum, _ = _walk_in_token_order(t_ids, vals, _SUM_ONLY, VOCAB_SIZE, BLOCK_V)
     _, final_token = _walk_in_token_order(
         t_ids, vals, coin_final * norm_sum, VOCAB_SIZE, BLOCK_V
     )
