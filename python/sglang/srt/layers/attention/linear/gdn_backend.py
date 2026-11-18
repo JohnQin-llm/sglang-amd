@@ -1364,24 +1364,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # ReplaySSM verify protocols: fold-every-commit (ring-write during
             # verify, fold on commit), circular ring, or the snapshotting
             # fallback when neither ring is allocated.
-            draft_token_num = forward_batch.spec_info.draft_token_num
-            # A chain verified in a tree-folding pool (no tree links: the adaptive
-            # tree width's chain member) takes the recurrent kernel, which writes the
-            # same raw ring by request: 29 us vs 38 us per layer for the tree kernel
-            # on Qwen3.8 at batch size 8.
-            chain_in_tree_pool = (
-                use_replayssm_fold
-                and mamba_pool.replayssm_tree_fold
-                and retrieve_parent_token is None
-                and not self._replayssm_fold_uses_cutedsl(
-                    ssm_states.dtype, draft_token_num
-                )
-            )
-            if (
-                use_replayssm_fold
-                and mamba_pool.replayssm_tree_fold
-                and not chain_in_tree_pool
-            ):
+            if use_replayssm_fold and mamba_pool.replayssm_tree_fold:
                 core_attn_out = self._replayssm_tree_target_verify(
                     layer=layer,
                     query=query,
@@ -1408,9 +1391,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     ssm_states=ssm_states,
                     cache_indices=cache_indices,
                     query_start_loc=query_start_loc,
-                    ring_indices=(
-                        intermediate_state_indices if chain_in_tree_pool else None
-                    ),
                 )
             elif use_replayssm_spec:
                 core_attn_out = self._replayssm_target_verify(
@@ -1665,14 +1645,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
-        ring_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Ring-writing verify; the commit fold replays the accepted prefix
         into ``temporal``. Uses the vendored CuTe DSL MTP kernel when the
         dispatcher selected the FlashInfer bf16-state verify, else the Triton
-        recurrent kernel (both store the same raw window). ``ring_indices``
-        puts the ring rows on these slots instead of the mamba slots (Triton
-        kernel only)."""
+        recurrent kernel (both store the same raw window)."""
         from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
             fused_sigmoid_gating_delta_rule_update,
         )
@@ -1727,7 +1704,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
             replayssm_rawk=layer_cache.replayssm_rawk,
             replayssm_g=layer_cache.replayssm_g,
             replayssm_beta=layer_cache.replayssm_beta,
-            ring_indices=ring_indices,
         )
 
     def _replayssm_tree_target_verify(
