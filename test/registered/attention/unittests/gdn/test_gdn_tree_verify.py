@@ -231,6 +231,52 @@ class TestGdnTreeVerify(CustomTestCase):
                     temperature=temperature,
                 )
 
+    def test_chain_recurrent_verify_writes_the_tree_ring(self):
+        """A chain verified in a tree-folding pool (the adaptive width's chain member)
+        runs the recurrent kernel; its output and request-indexed ring must be the
+        tree kernel's on the same chain, so the accepted-path commit fold is unchanged."""
+        num_nodes, batch_size = 8, 5
+        parents = torch.arange(-1, num_nodes - 1).repeat(batch_size, 1)
+        inputs = _inputs(batch_size, num_nodes, 9)
+        num_slots = batch_size + 2
+        state = torch.randn(num_slots, HV, V, K, device=DEVICE)
+        slots = torch.randperm(num_slots, device=DEVICE)[:batch_size].int()
+        ring_rows = torch.randperm(batch_size, device=DEVICE).int()
+        tree_rings = _rings(batch_size, num_nodes)
+        ref = _tree_verify(
+            inputs, state, slots, parents, tree_rings, ring_rows, num_nodes
+        )
+        chain_rings = _rings(batch_size, num_nodes)
+        out = fused_sigmoid_gating_delta_rule_update(
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            initial_state_source=state,
+            initial_state_indices=slots,
+            cu_seqlens=torch.arange(
+                0,
+                batch_size * num_nodes + 1,
+                num_nodes,
+                dtype=torch.int32,
+                device=DEVICE,
+            ),
+            use_qk_l2norm_in_kernel=True,
+            is_kda=False,
+            disable_state_update=True,
+            cache_ring=True,
+            replayssm_rawv=chain_rings["rawv"][0],
+            replayssm_rawk=chain_rings["rawk"][0],
+            replayssm_g=chain_rings["g"][0],
+            replayssm_beta=chain_rings["beta"][0],
+            ring_indices=ring_rows,
+            **{name: inputs[name] for name in ("q", "k", "v")},
+            **{name: inputs[name] for name in ("A_log", "dt_bias", "a", "b")},
+        )
+        torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+        for name in ("rawv", "rawk", "g", "beta"):
+            self.assertTrue(
+                torch.equal(chain_rings[name], tree_rings[name]), f"ring {name}"
+            )
+
     def test_garbage_links_stay_in_bounds(self):
         """CUDA-graph pad rows carry stale tree links; they must not stall the
         kernel or leave real rows unwritten."""
