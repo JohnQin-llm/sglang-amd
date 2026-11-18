@@ -454,11 +454,17 @@ _MEMBER_SCALE_PRIOR = 1000.0
 # Decisions read an exponential average of the per-step predictions, weight per step.
 # Sampled: per-step choices on one request's noisy prediction picked the chain on steps
 # that looked easy, trained the chain's calibration on them, and lost 5-6% at C1 to the
-# best fixed tree on Glimmer and Qwen. Greedy: replaying a forced-32 Qwen greedy sweep's
-# calibration dump, per-step choices lost 1.9% at bs 1-3 and 0.2% at bs 12-15 to the
-# best fixed width, the averaged ones were within 0.1% of it at every batch size. The
-# window length is otherwise arbitrary.
+# best fixed tree on Glimmer and Qwen. The window length is otherwise arbitrary.
 _PREDICTION_AVERAGE = 1.0 / 32
+# Greedy, replaying forced-32 greedy sweeps' calibration dumps on the combined stack
+# (explore/combined/replay_greedy.py, choices one step late): per-step choices on the
+# calibrated predictions lost 2.2% to the best fixed width at bs 1-3 on Qwen (32 picked
+# too often). Averaged over 32 steps they were within 0.2% of it on Qwen but lost 2% at
+# bs 24-32 on Glimmer, where per-step content choices gained 4-9%. Measured levels times
+# the content factor, averaged over about two steps, were within 0.2% on Qwen and kept
+# +4% / +8% at bs 24 / 32 on Glimmer.
+_GREEDY_PREDICTION_AVERAGE = 1.0 / 32
+_GREEDY_LEVELS_AVERAGE = 1.0 / 2
 # With measured member accept lengths, a member's prediction is its measured length
 # times (its per-node estimate / that estimate's long-run average) ** content_weight:
 # the per-node model only says how this content differs from the average, since its
@@ -769,7 +775,12 @@ class AdaptiveVerifyWidth:
         if self._greedy_average is None:
             self._greedy_average = mean
         else:
-            self._greedy_average.lerp_(mean, _PREDICTION_AVERAGE)
+            self._greedy_average.lerp_(
+                mean,
+                _GREEDY_PREDICTION_AVERAGE
+                if self._accept_len is None
+                else _GREEDY_LEVELS_AVERAGE,
+            )
         self._stats.push(self._greedy_average)
 
     def choose_sampled_member(self, *, bs: int) -> int:
