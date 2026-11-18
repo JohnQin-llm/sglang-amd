@@ -11,13 +11,19 @@ import torch
 
 from sglang.srt.speculative.dflash_adaptive_width import (
     CHAIN,
+    RAGGED,
     AdaptiveVerifyWidth,
     AdaptiveWidthConfig,
     StaleDeviceStats,
     VerifyWidthPolicy,
     interpolate_cost,
+    load_cost_table,
     member_label,
     read_adaptive_width_config,
+)
+from sglang.srt.speculative.dflash_ragged_chain import (
+    RaggedChainPolicy,
+    RaggedChainTable,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -303,7 +309,7 @@ class TestMeasuredMemberLevels(CustomTestCase):
             sampled_cost_ms={CHAIN: {16: 25.64}, 8: {16: 20.53}},
             force_width=None,
             calibration_dump=None,
-            sampled_accept_len={CHAIN: 5.35, 8: 4.62},
+            sampled_accept_len={CHAIN: {1: 5.35}, 8: {1: 4.62}},
         )
         width = AdaptiveVerifyWidth(
             config=config, num_depths=15, chain_rows=16, device=torch.device("cpu")
@@ -336,6 +342,141 @@ class TestMeasuredMemberLevels(CustomTestCase):
         # No exploration steps: every pick is the policy's.
         picks = {width.choose_sampled_member(bs=16) for _ in range(64)}
         self.assertEqual(picks, {CHAIN})
+
+
+def _ragged_policy(rows_per_request):
+    """Block 16, one collision-mass bin, and the given [largest bs, rows] pairs."""
+    table = RaggedChainTable(
+        block=16,
+        bin_edges=[],
+        accept_lens=[[1.0 + 0.3 * k for k in range(16)]],
+        rows_per_request=rows_per_request,
+    )
+    return RaggedChainPolicy(table=table, device=torch.device("cpu"))
+
+
+class TestRaggedMember(CustomTestCase):
+    def _config(self, **overrides):
+        values = dict(
+            widths=(16,),
+            sampled_members=(RAGGED, CHAIN, 8),
+            cost_ms={},
+            # Shaped like Glimmer T=1: the ragged chain verifies 8 rows per request at
+            # bs 16 and the whole block at bs 1.
+            sampled_cost_ms={
+                RAGGED: {1: 15.8, 16: 20.6},
+                CHAIN: {1: 15.8, 16: 25.6},
+                8: {1: 15.4, 16: 20.5},
+            },
+            force_width=None,
+            calibration_dump=None,
+            sampled_accept_len={
+                RAGGED: {1: 5.36, 16: 4.95},
+                CHAIN: {1: 5.36},
+                8: {1: 4.62},
+            },
+        )
+        values.update(overrides)
+        return AdaptiveWidthConfig(**values)
+
+    def _width(self, **overrides):
+        width = AdaptiveVerifyWidth(
+            config=self._config(**overrides),
+            num_depths=15,
+            chain_rows=16,
+            device=torch.device("cpu"),
+            ragged=_ragged_policy([[2, 16], [12, 10], [4096, 8]]),
+        )
+        if width._sampled_stats is not None:
+            width._sampled_stats._events = [_FakeEvent() for _ in range(4)]
+        return width
+
+    def test_parse_and_label(self):
+        self.assertEqual(member_label(RAGGED), "ragged")
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_DFLASH_TREE_SAMPLED_WIDTHS": "32,chain,ragged",
+                "SGLANG_DFLASH_TREE_FORCE_WIDTH": "ragged",
+            },
+        ):
+            config = read_adaptive_width_config(32)
+        self.assertEqual(config.sampled_members, (RAGGED, CHAIN, 32))
+        self.assertEqual(config.force_width, RAGGED)
+        with patch.dict(os.environ, {"SGLANG_DFLASH_TREE_WIDTHS": "ragged,32"}):
+            with self.assertRaises(ValueError):
+                read_adaptive_width_config(32)
+
+    def test_table_reads_per_batch_size_levels(self):
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(
+            {
+                "cost_ms": {"32": {"1": 16.0}},
+                "sampled_member_accept_len": {
+                    "ragged": {"1": 5.4, "16": 4.9},
+                    "chain": 5.36,
+                },
+            },
+            f,
+        )
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        _, _, accept_len = load_cost_table(f.name)
+        self.assertEqual(accept_len, {RAGGED: {1: 5.4, 16: 4.9}, CHAIN: {1: 5.36}})
+
+    def test_needs_the_table_exactly_with_the_member(self):
+        with self.assertRaises(ValueError):
+            AdaptiveVerifyWidth(
+                config=self._config(),
+                num_depths=15,
+                chain_rows=16,
+                device=torch.device("cpu"),
+            )
+        with self.assertRaises(ValueError):
+            AdaptiveVerifyWidth(
+                config=self._config(sampled_members=(CHAIN, 8)),
+                num_depths=15,
+                chain_rows=16,
+                device=torch.device("cpu"),
+                ragged=_ragged_policy([[4096, 8]]),
+            )
+
+    def test_ragged_rows_share_the_chain_verify_states(self):
+        width = self._width()
+        # Rows per request 16 (the block: the chain's state), 10 and 8; then tree 8.
+        self.assertEqual(width._captured_keys(), [-10, -8, CHAIN, 8])
+        self.assertEqual(width.ragged_key(16), CHAIN)
+        self.assertEqual(width.ragged_key(8), -8)
+        forced = self._width(force_width=RAGGED)
+        self.assertEqual(forced._captured_keys(), [-10, -8, CHAIN])
+
+    def test_ragged_column_is_the_full_chain(self):
+        width = self._width()
+        tree = SimpleNamespace(prefix_accept_len=torch.arange(1.0, 33.0).view(1, 32))
+        chain = SimpleNamespace(prefix_accept_len=torch.arange(1.0, 17.0).view(1, 16))
+        out = width.predict_sampled(tree_survival=tree, chain_survival=chain, bs=1)
+        # Raw columns in member order: ragged (the chain's 16), chain, tree 8.
+        torch.testing.assert_close(out[0, 3:], torch.tensor([16.0, 16.0, 8.0]))
+
+    def test_policy_takes_the_ragged_chain_at_high_load(self):
+        width = self._width()
+        tree = SimpleNamespace(prefix_accept_len=torch.full((16, 32), 5.0))
+        chain = SimpleNamespace(prefix_accept_len=torch.full((16, 16), 5.0))
+        width.predict_sampled(tree_survival=tree, chain_survival=chain, bs=16)
+        for event in width._sampled_stats._events:
+            event.done = True
+        # bs 1: equal levels and costs, the tie goes to the ragged chain (first);
+        # bs 16: ragged 4.95 / 20.6 beats tree 8's 4.62 / 20.5 and the chain's
+        # 5.36 / 25.6.
+        self.assertEqual(width.choose_sampled_member(bs=16), RAGGED)
+        cheap_tree = self._width(
+            sampled_cost_ms={
+                RAGGED: {1: 15.8, 16: 20.6},
+                CHAIN: {1: 15.8, 16: 25.6},
+                8: {1: 15.4, 16: 18.0},
+            }
+        )
+        self.assertEqual(cheap_tree.choose_sampled_member(bs=16), 8)
 
 
 class TestStaleDeviceStats(CustomTestCase):

@@ -112,6 +112,7 @@ from sglang.srt.speculative.dflash_ragged_chain import (
     read_ragged_chain_table,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 from sglang.srt.utils import get_bool_env_var
 
@@ -3746,9 +3747,14 @@ class AiterAttnBackend(AttentionBackend):
         token_reqs_out: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Ragged chain rows of a verify of ``bs`` requests and ``draft_num`` rows
-        per request in all; a capture or a verify without them gets uniform rows."""
+        per request in all; a capture or a verify without them gets uniform rows (a
+        tree server's chain members verify as EAGLE trees of one path)."""
+        ragged = (
+            spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
+        )
         fill_padded_chain_rows(
-            rows=spec_info.ragged_chain_rows if spec_info is not None else None,
+            rows=spec_info.ragged_chain_rows if ragged else None,
             bs=bs,
             rows_per_request=draft_num,
             qo_indptr_out=qo_indptr_out,

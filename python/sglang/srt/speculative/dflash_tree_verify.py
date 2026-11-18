@@ -138,6 +138,7 @@ class SampledVerifyPlan(msgspec.Struct, frozen=True):
 def propose_adaptive_sampled_tree(
     *,
     adaptive: AdaptiveVerifyWidth,
+    member: int,
     candidate_ids: torch.Tensor,
     scores: torch.Tensor,
     temperatures: torch.Tensor,
@@ -147,11 +148,10 @@ def propose_adaptive_sampled_tree(
     accept_prior: tuple[float, float] | torch.Tensor | None,
     bs: int,
 ) -> SampledVerifyPlan:
-    """Choose the member from earlier steps, then build the sampled tree at ``num_nodes``
-    and, when the chain is a member, the chain from the same q; their survival
-    estimates feed later steps. Each member verifies its own build, which keeps every
-    node's first draws in draw order, so it stays lossless."""
-    member = adaptive.choose_sampled_member(bs=bs)
+    """Build the sampled tree at ``num_nodes`` and, when the chain is a member, the
+    chain from the same q; their survival estimates feed later steps. ``member``
+    (``adaptive.choose_sampled_member``, from earlier steps only) verifies its own
+    build, which keeps every node's first draws in draw order, so it stays lossless."""
     lattice = sampled_lattice(
         candidate_ids=candidate_ids,
         scores=scores,

@@ -607,6 +607,61 @@ def test_sparse_matches_dense(slots, vocab, k, block_verification):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("block_verification", [False, True])
+def test_sparse_ragged_lengths_match_dense(block_verification):
+    """Per-request lengths on packed sparse target rows make the dense ragged kernel's
+    decisions and draws."""
+    slots, vocab, k = 16, 202048, 40
+    verify_lens = torch.tensor(
+        [1, 2, 16, 3, 8, 5, 16, 1, 9, 4, 12, 7, 16, 6, 2, 10], device=DEVICE
+    )
+    starts = (torch.cumsum(verify_lens, 0) - verify_lens).to(torch.int32)
+    for seed in range(4):
+        t_ids, t_probs, d_ids, d_probs, candidates, coins, final_coins = (
+            _sparse_support_case(16, slots, vocab, k, seed)
+        )
+        rows_ids = torch.cat([t_ids[i, :n] for i, n in enumerate(verify_lens)])
+        rows_probs = torch.cat([t_probs[i, :n] for i, n in enumerate(verify_lens)])
+        dense_rows = torch.zeros(rows_ids.shape[0], vocab, device=DEVICE).scatter_(
+            -1, rows_ids, rows_probs
+        )
+        dense_draft = torch.zeros(16, slots - 1, vocab, device=DEVICE).scatter_(
+            -1, d_ids, d_probs
+        )
+        ragged = dict(verify_lens=verify_lens.to(torch.int32), target_row_starts=starts)
+        expected = _run_chain(
+            chain_speculative_sampling_triton,
+            candidates,
+            coins,
+            final_coins,
+            retrive_next_token=None,
+            retrive_next_sibling=None,
+            target_probs=dense_rows,
+            draft_probs=dense_draft,
+            threshold_single=1.0,
+            threshold_acc=1.0,
+            deterministic=True,
+            block_verification=block_verification,
+            **ragged,
+        )
+        actual = _run_chain(
+            chain_speculative_sampling_sparse_triton,
+            candidates,
+            coins,
+            final_coins,
+            target_token_ids=rows_ids,
+            target_probs=rows_probs,
+            draft_token_ids=d_ids,
+            draft_probs=d_probs,
+            vocab_size=vocab,
+            block_verification=block_verification,
+            **ragged,
+        )
+        assert (actual[0] <= verify_lens - 1).all()
+        for want, got in zip(expected, actual):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("kind", ["bf16", "ties", "constant", "signed_zeros"])
 @pytest.mark.parametrize("vocab,k", [(248320, 20), (32000, 256)])
 def test_verify_head_top_k_matches_torch(vocab, k, kind):

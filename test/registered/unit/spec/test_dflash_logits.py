@@ -253,6 +253,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         draft_model=SimpleNamespace(lm_head=None),
         device="cpu",
         _selector_sampling_enabled=True,
+        _ragged_chain=None,
         _target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=quant_head))
         ),
@@ -317,6 +318,7 @@ def test_disabled_selector_sampling_forces_greedy_draft():
         block_size=2,
         _selector_sampling_enabled=False,
         _selector_sample=None,
+        _ragged_chain=None,
     )
     draft_logits_output = SimpleNamespace(hidden_states=torch.zeros((2, 4)))
 

@@ -13,7 +13,10 @@ chain (every node's first draw, as deep as the draft block) from the same q. The
 survival estimates are calibrated online per (depth, draw class, drawn-q bin) and may
 depend on the draws, so the member is chosen from earlier steps' estimates only. The
 chain under traversal verification is block verification, so the policy can fall back
-to the DFlash chain with block verification wherever it is predicted best.
+to the DFlash chain with block verification wherever it is predicted best. The ragged
+chain member verifies each request's own prefix of a chain draft, at lengths the ragged
+chain table sets from the selector lattice (dflash_ragged_chain.py), on the chain verify
+path.
 """
 
 from __future__ import annotations
@@ -27,6 +30,11 @@ from typing import Optional
 
 import msgspec
 import torch
+
+from sglang.srt.speculative.dflash_ragged_chain import (
+    RaggedChainPolicy,
+    read_ragged_chain_table,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,13 +94,22 @@ def make_step_timer() -> Optional[StepTimer]:
 # deep as the draft block, whose traversal verification is block verification. A
 # shorter chain, the first k nodes of that path ("chain<k>"), is -k.
 CHAIN = 0
+# Member id of the ragged chain ("ragged"): a selector chain draft of which request i
+# verifies its first k_i rows, the k_i set by the ragged chain table before any draw
+# and summing to the table's rows per request times the batch size. Below every chain
+# id, so it sorts first.
+RAGGED = -(1 << 16)
 
 
 def is_chain(member: int) -> bool:
-    return member <= CHAIN
+    """A chain member verified as a tree (traversal verification); not the ragged
+    chain, which verifies on the chain path."""
+    return RAGGED < member <= CHAIN
 
 
 def member_label(member: int) -> str:
+    if member == RAGGED:
+        return "ragged"
     if member == CHAIN:
         return "chain"
     return f"chain{-member}" if member < 0 else str(member)
@@ -100,6 +117,8 @@ def member_label(member: int) -> str:
 
 def _parse_member(value: str) -> int:
     value = value.strip()
+    if value == "ragged":
+        return RAGGED
     if value == "chain":
         return CHAIN
     if value.startswith("chain"):
@@ -111,8 +130,8 @@ def _parse_member(value: str) -> int:
 
 
 def _parse_members(value: str) -> tuple[int, ...]:
-    """ "chain,chain10,16,32" -> (-10, CHAIN, 16, 32): the chains first, then widths
-    ascending."""
+    """ "chain,chain10,16,32" -> (-10, CHAIN, 16, 32): the ragged chain, then the
+    chains, then widths ascending."""
     return tuple(sorted({_parse_member(x) for x in value.split(",")}))
 
 
@@ -172,7 +191,10 @@ class AdaptiveWidthConfig(msgspec.Struct, frozen=True):
     batches with sampling rows; the largest tree width must be
     --speculative-num-draft-tokens. SGLANG_DFLASH_TREE_COST_TABLE is a JSON of
     ``{"cost_ms": {"<Q>": {"<bs>": ms}}, "sampled_cost_ms": {"chain" | "<Q>": ...}}``
-    (sampled batches fall back to ``cost_ms``). SGLANG_DFLASH_TREE_FORCE_WIDTH verifies
+    (sampled batches fall back to ``cost_ms``); a sampled member's measured accept
+    length (``sampled_member_accept_len``) is one number, or ``{"<bs>": AL}`` for the
+    ragged chain, whose rows per request change with the batch size.
+    SGLANG_DFLASH_TREE_FORCE_WIDTH verifies
     at this member every step where it is one (for measurements), and
     SGLANG_DFLASH_TREE_CALIBRATION_DUMP appends per-step predicted and actual accept
     lengths (one host sync every few dozen steps). SGLANG_DFLASH_TREE_RANK=depth ranks
@@ -186,7 +208,7 @@ class AdaptiveWidthConfig(msgspec.Struct, frozen=True):
     force_width: Optional[int]
     calibration_dump: Optional[str]
     rank_by_depth: bool = False
-    sampled_accept_len: dict[int, float] = {}
+    sampled_accept_len: dict[int, dict[int, float]] = {}
     content_weight: float = 0.5
 
 
@@ -199,9 +221,11 @@ def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
         return None
     widths = _parse_members(value) if value else (max_width,)
     sampled_members = _parse_members(sampled_value) if sampled_value else widths
-    if any(is_chain(m) for m in widths):
-        raise ValueError("the chain member is for sampled batches only")
-    trees = sorted(m for m in set(widths) | set(sampled_members) if not is_chain(m))
+    if any(is_chain(m) or m == RAGGED for m in widths):
+        raise ValueError("chain members are for sampled batches only")
+    trees = sorted(
+        m for m in set(widths) | set(sampled_members) if not is_chain(m) and m != RAGGED
+    )
     if not trees or trees[-1] != max_width:
         raise ValueError(
             f"the largest tree width of {widths} and {sampled_members} must be "
@@ -245,11 +269,16 @@ def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
 
 def load_cost_table(
     path: str,
-) -> tuple[dict[int, dict[int, float]], dict[int, dict[int, float]], dict[int, float]]:
+) -> tuple[
+    dict[int, dict[int, float]],
+    dict[int, dict[int, float]],
+    dict[int, dict[int, float]],
+]:
     """The greedy and sampled step-cost tables, ``{member: {bs: ms}}`` (the sampled one
     is the greedy one where the file has no ``sampled_cost_ms``), and the sampled
-    members' measured accept lengths, ``{member: AL}`` from ``sampled_member_accept_len``
-    (empty when absent)."""
+    members' measured accept lengths, ``{member: {bs: AL}}`` from
+    ``sampled_member_accept_len`` (a single number is the same at every batch size;
+    empty when absent)."""
     with open(path) as f:
         raw = json.load(f)
 
@@ -262,14 +291,19 @@ def load_cost_table(
     greedy = table(raw["cost_ms"])
     sampled = table(raw["sampled_cost_ms"]) if "sampled_cost_ms" in raw else greedy
     accept_len = {
-        _parse_members(q)[0]: float(al)
+        _parse_members(q)[0]: (
+            {int(b): float(x) for b, x in al.items()}
+            if isinstance(al, dict)
+            else {1: float(al)}
+        )
         for q, al in raw.get("sampled_member_accept_len", {}).items()
     }
     return greedy, sampled, accept_len
 
 
 def interpolate_cost(row: dict[int, float], bs: int) -> float:
-    """Step cost at ``bs``, linear between measured batch sizes, flat outside them."""
+    """Step cost (or accept length) at ``bs``, linear between measured batch sizes,
+    flat outside them."""
     sizes = sorted(row)
     if bs <= sizes[0]:
         return row[sizes[0]]
@@ -434,9 +468,11 @@ class AdaptiveVerifyWidth:
         device: torch.device,
         sync_lag: Optional[int] = None,
         share=None,
+        ragged: Optional[RaggedChainPolicy] = None,
     ):
         """``sync_lag`` and ``share`` (``StaleDeviceStats``) keep the choices of a
-        tensor-parallel group equal on every rank."""
+        tensor-parallel group equal on every rank. ``ragged`` plans the ragged chain
+        member's rows; it is needed exactly when that member is configured."""
         from sglang.kernels.ops.speculative.dflash_tree import (
             NUM_CALIBRATION_BINS,
             NUM_DRAW_CLASSES,
@@ -448,12 +484,28 @@ class AdaptiveVerifyWidth:
         self.max_width = max(config.widths + config.sampled_members)
         self.chain_rows = chain_rows
         self.has_chain = any(is_chain(m) for m in config.sampled_members)
+        self.has_ragged = RAGGED in config.sampled_members
+        if self.has_ragged != (ragged is not None):
+            raise ValueError(
+                "the sampled member 'ragged' needs SGLANG_DFLASH_RAGGED_CHAIN_TABLE, "
+                "and the table needs that member"
+            )
+        if ragged is not None and ragged.block != chain_rows:
+            raise ValueError(
+                f"SGLANG_DFLASH_RAGGED_CHAIN_TABLE is for block {ragged.block}, the "
+                f"drafter's block is {chain_rows}"
+            )
+        self.ragged = ragged
         if self.has_chain and chain_rows > self.max_width:
             raise ValueError(
                 f"the chain verifies {chain_rows} rows, more than the server width "
                 f"{self.max_width}"
             )
-        short = [m for m in config.sampled_members if m < CHAIN and -m >= chain_rows]
+        short = [
+            m
+            for m in config.sampled_members
+            if is_chain(m) and m < CHAIN and -m >= chain_rows
+        ]
         if short:
             raise ValueError(
                 f"chain members {[member_label(m) for m in short]} need fewer rows than "
@@ -480,11 +532,12 @@ class AdaptiveVerifyWidth:
             [width - 1 for width in config.widths], dtype=torch.long, device=device
         )
         self._sampled_tree_columns = torch.tensor(
-            [m - 1 for m in config.sampled_members if not is_chain(m)],
+            [m - 1 for m in config.sampled_members if m > CHAIN],
             dtype=torch.long,
             device=device,
         )
-        # Chain members sort before the trees in sampled_members, so their columns lead.
+        # The ragged chain, then the chain members sort before the trees in
+        # sampled_members, so their columns lead.
         self._sampled_chain_columns = torch.tensor(
             [self.member_rows(m) - 1 for m in config.sampled_members if is_chain(m)],
             dtype=torch.long,
@@ -506,15 +559,14 @@ class AdaptiveVerifyWidth:
         self._sampled_policy = self._sampled_stats = None
         self._sampled_average: Optional[torch.Tensor] = None
         self._raw_average: Optional[torch.Tensor] = None
-        self._static_accept_len = None
+        # Host-side {bs: AL} per sampled member, when the table measured every one.
+        self._static_accept_len: Optional[list[dict[int, float]]] = None
         if config.sampled_accept_len and all(
             m in config.sampled_accept_len for m in config.sampled_members
         ):
-            self._static_accept_len = torch.tensor(
-                [config.sampled_accept_len[m] for m in config.sampled_members],
-                dtype=torch.float32,
-                device=device,
-            )
+            self._static_accept_len = [
+                config.sampled_accept_len[m] for m in config.sampled_members
+            ]
         self._sampled_steps = 0
         # Decayed sums of actual and predicted (per-node model) accept length over each
         # member's verifies; their ratio rescales the member's prediction.
@@ -522,6 +574,11 @@ class AdaptiveVerifyWidth:
             (2, len(config.sampled_members)), dtype=torch.float32, device=device
         )
         if len(config.sampled_members) > 1 and force not in config.sampled_members:
+            if self.has_ragged and self._static_accept_len is None:
+                raise ValueError(
+                    "choosing the ragged chain member needs measured accept lengths "
+                    "(sampled_member_accept_len) for every sampled member"
+                )
             self._sampled_policy = VerifyWidthPolicy(
                 widths=config.sampled_members, cost_ms=config.sampled_cost_ms
             )
@@ -554,6 +611,11 @@ class AdaptiveVerifyWidth:
         config = read_adaptive_width_config(max_width)
         if config is None:
             return None
+        ragged = None
+        if RAGGED in config.sampled_members:
+            table = read_ragged_chain_table()
+            if table is not None:
+                ragged = RaggedChainPolicy(table=table, device=device)
         return cls(
             config=config,
             num_depths=num_depths,
@@ -561,6 +623,7 @@ class AdaptiveVerifyWidth:
             device=device,
             sync_lag=sync_lag,
             share=share,
+            ragged=ragged,
         )
 
     def member_rows(self, member: int) -> int:
@@ -568,15 +631,24 @@ class AdaptiveVerifyWidth:
             return self.chain_rows
         return -member if member < 0 else member
 
+    def ragged_key(self, rows: int) -> int:
+        """The chain member whose verify state (backend and graphs) serves a ragged
+        chain of ``rows`` rows per request in all."""
+        return CHAIN if rows == self.chain_rows else -rows
+
     def _captured_keys(self) -> list[int]:
         """Verify states to build besides the startup one (the largest width): the
-        chain members, then tree widths by row count."""
+        chain members (with those serving the ragged chain's rows per request), then
+        tree widths by row count."""
         force = self._config.force_width
         greedy = (force,) if force in self.widths else self.widths
         sampled = (force,) if force in self.sampled_members else self.sampled_members
-        rows = {m for m in greedy + sampled if not is_chain(m)}
+        rows = {m for m in greedy + sampled if m > CHAIN}
         keys = sorted(rows - {self.max_width})
-        return sorted(m for m in sampled if is_chain(m)) + keys
+        chains = {m for m in sampled if is_chain(m)}
+        if RAGGED in sampled:
+            chains |= {self.ragged_key(r) for r in self.ragged.widths}
+        return sorted(chains) + keys
 
     def capture(self, model_runner) -> None:
         """Build a target verify backend and graph set per verify state below the
@@ -654,9 +726,14 @@ class AdaptiveVerifyWidth:
             return force
         if self._sampled_policy is None:
             return self.sampled_members[-1]
-        ranked = self._sampled_policy.rank(
-            bs=bs, expected_accept_lens=self._sampled_stats.latest()
-        )
+        expected = self._sampled_stats.latest()
+        if self._static_accept_len is not None:
+            # The pushed values are content factors on the measured levels.
+            expected = [
+                interpolate_cost(level, bs) * factor
+                for level, factor in zip(self._static_accept_len, expected)
+            ]
+        ranked = self._sampled_policy.rank(bs=bs, expected_accept_lens=expected)
         self._sampled_steps += 1
         # Measured member levels need no exploration to stay calibrated.
         if self._static_accept_len is not None or self._sampled_steps % _EXPLORE_EVERY:
@@ -671,11 +748,21 @@ class AdaptiveVerifyWidth:
     ) -> Optional[torch.Tensor]:
         """Expected accept length of every sampled member, ``[bs, 2 * members]``: the
         per-node model's rescaled by the member's measured ratio, then unscaled. The
-        running average of the rescaled batch mean is pushed for later steps'
-        decisions. None when neither a policy nor the dump reads it."""
+        running average of the rescaled batch mean (with measured member levels, of
+        the content factors) is pushed for later steps' decisions. None when neither a
+        policy nor the dump reads it. The ragged chain has no per-node model of its
+        own: it takes the full chain's, or 1 without the chain member."""
         if self._sampled_policy is None and self._dump is None:
             return None
         columns = []
+        if self.has_ragged:
+            columns.append(
+                chain_survival.prefix_accept_len[
+                    :bs, self.chain_rows - 1 : self.chain_rows
+                ]
+                if self.has_chain
+                else torch.ones((bs, 1), device=self._device)
+            )
         if self.has_chain:
             columns.append(
                 chain_survival.prefix_accept_len[:bs, self._sampled_chain_columns]
@@ -701,12 +788,14 @@ class AdaptiveVerifyWidth:
         return torch.cat([predicted, raw], dim=1)
 
     def _content_scaled(self, mean_raw: torch.Tensor) -> torch.Tensor:
+        """Each member's content factor: its per-node estimate over that estimate's
+        long-run average, to the power content_weight."""
         if self._raw_average is None:
             self._raw_average = mean_raw.clone()
         else:
             self._raw_average.lerp_(mean_raw, _RAW_AVERAGE)
         content = (mean_raw / self._raw_average.clamp(min=1e-3)).clamp(min=1e-3)
-        return self._static_accept_len * content.pow(self._config.content_weight)
+        return content.pow(self._config.content_weight)
 
     def activate(self, key: int, model_runner) -> None:
         """Switch the target to the verify state of ``key``: a tree width, or a chain
@@ -787,6 +876,17 @@ class AdaptiveVerifyWidth:
             num_nodes=self.member_rows(member),
             topk=topk,
         )
+
+    def after_ragged_verify(
+        self, *, accept_lens: torch.Tensor, verify_lens: torch.Tensor
+    ) -> None:
+        """A ragged chain verify updates no calibration (it verifies no tree build);
+        the dump gets each request's accept length and verified rows."""
+        if self._dump is not None:
+            self._queue_dump(
+                {"kind": "sampled", "member": member_label(RAGGED)},
+                torch.stack([accept_lens.float(), verify_lens.float()], dim=1),
+            )
 
     def refresh_rank_table(self, log_priors: torch.Tensor) -> None:
         """Recompute the sampled trees' ranking from their calibration statistics; the

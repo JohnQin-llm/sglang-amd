@@ -1,4 +1,6 @@
 import contextlib
+import copy
+import functools
 import logging
 import math
 import os
@@ -84,6 +86,7 @@ from sglang.srt.speculative.dflash_ragged_chain import (
     unpack_greedy_rows,
 )
 from sglang.srt.speculative.dflash_adaptive_width import (
+    RAGGED,
     AdaptiveVerifyWidth,
     is_chain,
     make_step_timer,
@@ -654,6 +657,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                         "SGLANG_DFLASH_TREE_ACCEPT_PRIOR=online"
                     )
                 self._adaptive_width.refresh_rank_table(self._tree_accept_prior)
+            if (
+                self._adaptive_width is not None
+                and self._adaptive_width.has_ragged
+                and mambaish_config(self._target_worker.model_runner.model_config)
+                is not None
+            ):
+                raise NotImplementedError(
+                    "the ragged chain member of the DFLASH adaptive width does not "
+                    "commit linear-attention state yet"
+                )
             self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
         if self._is_domino and self.block_size <= 1:
             raise ValueError(
@@ -2618,6 +2631,73 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         return torch.where(greedy[:bs], 1.0, temperatures)
 
+    def _verify_ragged_member(
+        self,
+        *,
+        batch: ScheduleBatch,
+        bs: int,
+        candidate_ids: torch.Tensor,
+        scores: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+        positions: torch.Tensor,
+        verify_chain,
+    ) -> GenerationBatchResult:
+        """The adaptive width's ragged chain member: draw a chain from the selector
+        lattice as the DFLASH chain path does, set each request's verify rows from the
+        lattice alone, and verify those rows on the chain path."""
+        adaptive = self._adaptive_width
+        sampling_info = batch.sampling_info
+        check_ragged_chain_batch(
+            sampling_info=sampling_info,
+            has_grammar=batch.has_grammar,
+            return_logprob=batch.return_logprob,
+        )
+        num_pred = candidate_ids.shape[1]
+        temperatures = sampling_info.temperatures.view(-1)[:bs].float().clamp_min(1e-5)
+        greedy_mask = resolve_greedy_mask(
+            bs=bs, sampling_info=sampling_info, device=self.device
+        )[:bs]
+        tokens, q_rows = self.selector.sample_path(
+            candidate_ids=candidate_ids,
+            scores=scores,
+            uniforms=torch.rand(bs, num_pred, dtype=torch.float32, device=self.device),
+            temperatures=temperatures,
+            greedy_mask=greedy_mask,
+        )
+        self._selector_sample = (candidate_ids, q_rows)
+        draft_tokens = self._draft_block_tokens_buf[:bs]
+        draft_tokens[:, 0].copy_(bonus_tokens)
+        draft_tokens[:, 1:].copy_(tokens.view(bs, num_pred))
+        policy = adaptive.ragged
+        rows, verify_input_ids, verify_positions = policy.plan(
+            collision_mass=selector_collision_mass(
+                scores=scores,
+                temperatures=_lattice_temperatures(temperatures, greedy_mask),
+            ),
+            rows_per_request=policy.rows_per_request(bs),
+            draft_tokens=draft_tokens,
+            positions=positions,
+        )
+        adaptive.activate(
+            adaptive.ragged_key(rows.rows_per_request), self.target_worker.model_runner
+        )
+        if self._step_timer is not None:
+            self._step_timer.set_member(member_label(RAGGED))
+        if self._phases is not None:
+            self._phases.mark("propose")
+        # A copy, as the tree verify leaves the scheduler's batch as it is.
+        result = verify_chain(
+            batch=copy.copy(batch),
+            draft_tokens=draft_tokens,
+            ragged_rows=rows,
+            verify_input_ids=verify_input_ids,
+            verify_positions=verify_positions,
+        )
+        adaptive.after_ragged_verify(
+            accept_lens=result.accept_lens, verify_lens=rows.verify_lens
+        )
+        return result
+
     def _forward_decode_tree(
         self,
         *,
@@ -2632,11 +2712,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         on_publish,
         host_seq_lens_bound: torch.Tensor | None,
         host_seq_lens_bound_sum: int | None,
+        verify_chain=None,
     ) -> GenerationBatchResult:
         """Build a tree from the selector lattice, verify it, then feed the accepted
         path's target features to the drafter like the chain path does.
         ``verify_window`` is ``[bs, tree_num_nodes]``, each request's KV slots from
-        its committed length, read at the start of the step."""
+        its committed length, read at the start of the step. ``verify_chain``
+        (``_verify_chain`` bound to this step) verifies the ragged chain member."""
         if self.draft_model.lm_head is None:
             self.draft_model.lm_head = lm_head
         draft_hidden = draft_logits_output.hidden_states
@@ -2680,8 +2762,20 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_prior=self._tree_accept_prior,
             )
         elif adaptive is not None:
+            member = adaptive.choose_sampled_member(bs=bs)
+            if member == RAGGED:
+                return self._verify_ragged_member(
+                    batch=batch,
+                    bs=bs,
+                    candidate_ids=candidate_ids,
+                    scores=scores,
+                    bonus_tokens=bonus_tokens,
+                    positions=positions_2d.reshape(-1),
+                    verify_chain=verify_chain,
+                )
             sampled_plan = propose_adaptive_sampled_tree(
                 adaptive=adaptive,
+                member=member,
                 candidate_ids=candidate_ids,
                 scores=scores,
                 temperatures=self._tree_temperatures(batch.sampling_info, bs),
@@ -3193,6 +3287,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._phases.mark("draft")
 
         if self.tree_mode:
+            verify_chain = None
+            if self._adaptive_width is not None and self._adaptive_width.has_ragged:
+                verify_chain = functools.partial(
+                    self._verify_chain,
+                    bs=bs,
+                    draft_input=draft_input,
+                    positions=positions,
+                    prefix_lens=prefix_lens,
+                    iteration_ids=iteration_ids,
+                    verify_out_cache_loc=verify_out_cache_loc,
+                    verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                    grammar_tree=None,
+                    on_publish=on_publish,
+                    grammar_barrier=grammar_barrier,
+                )
             return self._forward_decode_tree(
                 batch=batch,
                 bs=bs,
@@ -3205,6 +3314,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 on_publish=on_publish,
                 host_seq_lens_bound=draft_input.nxt_kv_lens_cpu,
                 host_seq_lens_bound_sum=draft_input.nxt_kv_lens_sum,
+                verify_chain=verify_chain,
             )
 
         if (
@@ -3338,9 +3448,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._phases is not None:
             self._phases.mark("sample_path")
         # --- 2) Target verify.
-        # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
-        custom_mask = None
-
         ragged_rows, verify_input_ids, verify_positions = self._plan_ragged_chain(
             batch=batch,
             bs=bs,
@@ -3348,6 +3455,50 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tokens=draft_tokens,
             positions=positions,
         )
+        return self._verify_chain(
+            batch=batch,
+            bs=bs,
+            draft_input=draft_input,
+            draft_tokens=draft_tokens,
+            positions=positions,
+            prefix_lens=prefix_lens,
+            iteration_ids=iteration_ids,
+            verify_out_cache_loc=verify_out_cache_loc,
+            verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+            ragged_rows=ragged_rows,
+            verify_input_ids=verify_input_ids,
+            verify_positions=verify_positions,
+            grammar_tree=grammar_tree,
+            on_publish=on_publish,
+            grammar_barrier=grammar_barrier,
+        )
+
+    def _verify_chain(
+        self,
+        *,
+        batch: ScheduleBatch,
+        bs: int,
+        draft_input,
+        draft_tokens: torch.Tensor,
+        positions: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        iteration_ids: IterationIds,
+        verify_out_cache_loc: torch.Tensor,
+        verify_out_cache_loc_2d: torch.Tensor,
+        ragged_rows: Optional[RaggedChainRows],
+        verify_input_ids: torch.Tensor,
+        verify_positions: torch.Tensor,
+        grammar_tree,
+        on_publish,
+        grammar_barrier,
+    ) -> GenerationBatchResult:
+        """Verify the drafted ``[bs, block]`` chain (with ``ragged_rows``, each
+        request's first rows of it, packed as ``verify_input_ids`` and
+        ``verify_positions``), accept, and feed the verified rows' target features to
+        the drafter."""
+        block_size = int(self.block_size)
+        # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
+        custom_mask = None
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
             positions=verify_positions,
