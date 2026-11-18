@@ -78,6 +78,7 @@ from sglang.srt.speculative.dflash_adaptive_width import (
     AdaptiveVerifyWidth,
     make_step_timer,
     member_label,
+    set_debug_rank,
     step_phases,
 )
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
@@ -471,7 +472,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
+        self._target_tp_size = get_parallel().tp_size
+        self._share_with_tp = None
+        if self._target_tp_size > 1:
+            from sglang.srt.distributed import get_tp_group
+
+            # Adaptive-width choices read rank 0's statistics on every target TP rank.
+            tp_group = get_tp_group()
+            self._share_with_tp = lambda t: tp_group.broadcast(t, src=0)
         self.tree_mode = int(get_spec().speculative_eagle_topk or 1) > 1
+        set_debug_rank(self._target_tp_rank)
         self._step_timer = make_step_timer()
         self._phases = step_phases()
         self._adaptive_width: Optional[AdaptiveVerifyWidth] = None
@@ -591,6 +601,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 num_depths=int(self.block_size) - 1,
                 chain_rows=int(self.block_size),
                 device=torch.device(self.device),
+                # Every rank must pick the same width each step.
+                sync_lag=2 if self._target_tp_size > 1 else None,
+                share=self._share_with_tp,
             )
             if (
                 self._adaptive_width is not None

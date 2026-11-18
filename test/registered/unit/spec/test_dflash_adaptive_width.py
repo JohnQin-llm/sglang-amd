@@ -39,6 +39,9 @@ class _FakeEvent:
     def query(self):
         return self.done
 
+    def synchronize(self):
+        self.done = True
+
 
 class TestInterpolateCost(CustomTestCase):
     def test_measured_points_and_linear_between(self):
@@ -330,6 +333,42 @@ class TestStaleDeviceStats(CustomTestCase):
         for event in stats._events:
             event.done = True
         self.assertEqual(stats.latest(), [3.0])
+
+    def test_lag_reads_the_same_step_whatever_has_landed(self):
+        stats = StaleDeviceStats(
+            initial=[0.0],
+            device=torch.device("cpu"),
+            slots=4,
+            event_factory=_FakeEvent,
+            lag=2,
+        )
+        stats.push(torch.tensor([1.0]))
+        stats.push(torch.tensor([2.0]))
+        self.assertEqual(stats.latest(), [0.0])
+        stats.push(torch.tensor([3.0]))
+        # Push 1 is two before the newest, whether or not later copies have landed.
+        self.assertEqual(stats.latest(), [1.0])
+        for event in stats._events:
+            event.done = True
+        self.assertEqual(stats.latest(), [1.0])
+        stats.push(torch.tensor([4.0]))
+        self.assertEqual(stats.latest(), [2.0])
+
+    def test_share_runs_before_the_copy(self):
+        # Stands in for a broadcast from TP rank 0, in place.
+        stats = StaleDeviceStats(
+            initial=[0.0],
+            device=torch.device("cpu"),
+            slots=4,
+            event_factory=_FakeEvent,
+            lag=1,
+            share=lambda values: values.fill_(7.0),
+        )
+        pushed = torch.tensor([1.0])
+        stats.push(pushed)
+        stats.push(torch.tensor([2.0]))
+        self.assertEqual(stats.latest(), [7.0])
+        self.assertEqual(pushed.tolist(), [1.0])
 
 
 if __name__ == "__main__":

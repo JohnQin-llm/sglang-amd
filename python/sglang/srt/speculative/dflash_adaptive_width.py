@@ -67,9 +67,19 @@ class StepTimer:
             self._prev[3] = member
 
 
+# Tensor-parallel rank of this process; the debug files are written by rank 0 only, since
+# every rank of a TP group shares their paths.
+_DEBUG_RANK = 0
+
+
+def set_debug_rank(rank: int) -> None:
+    global _DEBUG_RANK
+    _DEBUG_RANK = rank
+
+
 def make_step_timer() -> Optional[StepTimer]:
     path = os.environ.get("SGLANG_DFLASH_STEP_TIMES")
-    return StepTimer(path) if path else None
+    return StepTimer(path) if path and _DEBUG_RANK == 0 else None
 
 
 # Member id of the chain in a sampled width set: every node's first draw, one path as
@@ -132,7 +142,7 @@ def step_phases() -> Optional[StepPhases]:
     """The process's StepPhases when SGLANG_DFLASH_STEP_PHASES names a file, else None."""
     global _STEP_PHASES
     path = os.environ.get("SGLANG_DFLASH_STEP_PHASES")
-    if path and _STEP_PHASES is None:
+    if path and _STEP_PHASES is None and _DEBUG_RANK == 0:
         _STEP_PHASES = StepPhases(path)
     return _STEP_PHASES
 
@@ -291,7 +301,15 @@ class StaleDeviceStats:
 
     ``push`` copies a small device vector into a pinned slot on the current stream and
     records an event; ``latest`` returns the newest pushed vector whose copy has
-    finished, or the initial value before any has."""
+    finished, or the initial value before any has. With ``lag``, ``latest`` instead
+    returns the vector pushed exactly ``lag`` pushes before the newest one (the initial
+    value before there is one), waiting for its copy. The copy of a step ``lag`` back
+    has normally landed, as the host runs about one step ahead of the device.
+
+    A tensor-parallel group must make the same choice on every rank: ``share`` (e.g. a
+    broadcast from rank 0, in place) makes the pushed vectors bitwise equal, since the
+    calibration sums use float atomics, and ``lag`` makes every rank read the same push,
+    where the newest finished copy depends on each rank's timing."""
 
     def __init__(
         self,
@@ -300,7 +318,15 @@ class StaleDeviceStats:
         device: torch.device,
         slots: int = 4,
         event_factory=None,
+        lag: Optional[int] = None,
+        share=None,
     ):
+        if lag is not None and not 0 < lag < slots:
+            raise ValueError(f"lag {lag} must be in [1, slots={slots})")
+        self._lag = lag
+        self._share = share
+        self._pushes = 0
+        self._lagged: Optional[tuple[int, list[float]]] = None
         host = torch.zeros((slots, len(initial)), dtype=torch.float32)
         self._host = host if device.type == "cpu" else host.pin_memory()
         if event_factory is None:
@@ -315,11 +341,24 @@ class StaleDeviceStats:
         self._next = (slot + 1) % len(self._events)
         if slot in self._pending:
             self._pending.remove(slot)
+        if self._share is not None:
+            values = values.float().contiguous().clone()
+            self._share(values)
         self._host[slot].copy_(values, non_blocking=True)
         self._events[slot].record()
         self._pending.append(slot)
+        self._pushes += 1
 
     def latest(self) -> list[float]:
+        if self._lag is not None:
+            push = self._pushes - 1 - self._lag
+            if push < 0:
+                return self._latest
+            if self._lagged is None or self._lagged[0] != push:
+                slot = push % len(self._events)
+                self._events[slot].synchronize()
+                self._lagged = (push, self._host[slot].tolist())
+            return self._lagged[1]
         while self._pending and self._events[self._pending[0]].query():
             self._latest = self._host[self._pending.pop(0)].tolist()
         return self._latest
@@ -374,7 +413,11 @@ class AdaptiveVerifyWidth:
         num_depths: int,
         chain_rows: int,
         device: torch.device,
+        sync_lag: Optional[int] = None,
+        share=None,
     ):
+        """``sync_lag`` and ``share`` (``StaleDeviceStats``) keep the choices of a
+        tensor-parallel group equal on every rank."""
         from sglang.kernels.ops.speculative.dflash_tree import (
             NUM_CALIBRATION_BINS,
             NUM_DRAW_CLASSES,
@@ -424,7 +467,10 @@ class AdaptiveVerifyWidth:
             )
             # Before the first copy lands, rank widths by cost alone.
             self._stats = StaleDeviceStats(
-                initial=[1.0] * len(config.widths), device=device
+                initial=[1.0] * len(config.widths),
+                device=device,
+                lag=sync_lag,
+                share=share,
             )
         self._sampled_policy = self._sampled_stats = None
         self._sampled_average: Optional[torch.Tensor] = None
@@ -449,13 +495,16 @@ class AdaptiveVerifyWidth:
                 widths=config.sampled_members, cost_ms=config.sampled_cost_ms
             )
             self._sampled_stats = StaleDeviceStats(
-                initial=[1.0] * len(config.sampled_members), device=device
+                initial=[1.0] * len(config.sampled_members),
+                device=device,
+                lag=sync_lag,
+                share=share,
             )
         self._states: dict[int, VerifyWidthState] = {}
         self._active: Optional[int] = None
         self._dump = (
             open(config.calibration_dump, "a", buffering=1)
-            if config.calibration_dump
+            if config.calibration_dump and _DEBUG_RANK == 0
             else None
         )
         self._dump_queue: list[tuple[dict, torch.Tensor]] = []
@@ -468,12 +517,19 @@ class AdaptiveVerifyWidth:
         num_depths: int,
         chain_rows: int,
         device: torch.device,
+        sync_lag: Optional[int] = None,
+        share=None,
     ) -> Optional["AdaptiveVerifyWidth"]:
         config = read_adaptive_width_config(max_width)
         if config is None:
             return None
         return cls(
-            config=config, num_depths=num_depths, chain_rows=chain_rows, device=device
+            config=config,
+            num_depths=num_depths,
+            chain_rows=chain_rows,
+            device=device,
+            sync_lag=sync_lag,
+            share=share,
         )
 
     def member_rows(self, member: int) -> int:
