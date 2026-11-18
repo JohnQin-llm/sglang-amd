@@ -180,9 +180,9 @@ class TestReadConfig(CustomTestCase):
         )
         self.assertEqual(width.choose_sampled_member(bs=4), CHAIN)
         self.assertEqual(width.member_rows(CHAIN), 8)
-        # Greedy batches keep the server width; only the chain's 8 rows need graphs.
+        # Greedy batches keep the server width; only the chain needs its own graphs.
         self.assertEqual(width.select_width(survival=None, bs=4), 32)
-        self.assertEqual(width._captured_rows(), [8])
+        self.assertEqual(width._captured_keys(), [CHAIN])
 
 
 class TestChainMember(CustomTestCase):

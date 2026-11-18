@@ -2550,7 +2550,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     # order, and the width never depends on this step's draws.
                     node_draft_tokens = node_draft_tokens[:, :width].contiguous()
                     node_draft_probs = node_draft_probs[:, :width].contiguous()
-            adaptive.activate(width, self.target_worker.model_runner)
+            chain = sampled_plan is not None and sampled_plan.member == CHAIN
+            adaptive.activate(
+                CHAIN if chain else width, self.target_worker.model_runner
+            )
             if self._step_timer is not None:
                 self._step_timer.set_member(
                     str(width)

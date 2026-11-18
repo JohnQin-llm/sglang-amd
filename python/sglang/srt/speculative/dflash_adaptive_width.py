@@ -447,16 +447,22 @@ class AdaptiveVerifyWidth:
     def member_rows(self, member: int) -> int:
         return self.chain_rows if member == CHAIN else member
 
-    def _captured_rows(self) -> list[int]:
+    def _captured_keys(self) -> list[int]:
+        """Verify states to build besides the startup one (the largest width): tree
+        widths by row count, and CHAIN for the chain member."""
         force = self._config.force_width
         greedy = (force,) if force in self.widths else self.widths
         sampled = (force,) if force in self.sampled_members else self.sampled_members
-        rows = {self.member_rows(m) for m in greedy + sampled}
-        return sorted(rows - {self.max_width})
+        rows = {m for m in greedy + sampled if m != CHAIN}
+        keys = sorted(rows - {self.max_width})
+        return [CHAIN] + keys if CHAIN in sampled else keys
 
     def capture(self, model_runner) -> None:
-        """Build a target verify backend and graph set per row count below the startup
-        one, whose backend and graphs serve the largest width."""
+        """Build a target verify backend and graph set per verify state below the
+        startup one, whose backend and graphs serve the largest width. The chain's
+        are built as a chain (EAGLE topk 1), so linear-attention layers skip the tree
+        links and full attention runs the causal kernel: verifying the same rows as a
+        tree cost Qwen3.8 0.2 ms more per step at batch size 8 in the conv update."""
         from sglang.srt.runtime_context import get_spec
 
         self._states[self.max_width] = VerifyWidthState(
@@ -470,8 +476,12 @@ class AdaptiveVerifyWidth:
             default_runner is not None
             and default_runner is not model_runner.eager_runner
         )
-        for width in self._captured_rows():
-            with get_spec().override(speculative_num_draft_tokens=width):
+        for key in self._captured_keys():
+            width = self.member_rows(key)
+            override = dict(speculative_num_draft_tokens=width)
+            if key == CHAIN:
+                override["speculative_eagle_topk"] = 1
+            with get_spec().override(**override):
                 saved_flag = model_runner.init_new_workspace
                 try:
                     attn_backend = model_runner._get_attention_backend(
@@ -486,16 +496,16 @@ class AdaptiveVerifyWidth:
                         attn_backend=attn_backend,
                         speculative_num_draft_tokens=width,
                     )
-            self._states[width] = VerifyWidthState(
+            self._states[key] = VerifyWidthState(
                 attn_backend=attn_backend, graph_runner=graph_runner
             )
         free_after, _ = torch.cuda.mem_get_info(self._device)
         logger.info(
-            "DFLASH adaptive tree width: greedy %s, sampled %s, verify rows %s; extra "
-            "verify backends and graphs took %.2f s and %.2f GB",
+            "DFLASH adaptive tree width: greedy %s, sampled %s, verify states %s; "
+            "extra verify backends and graphs took %.2f s and %.2f GB",
             list(self.widths),
             [member_label(m) for m in self.sampled_members],
-            sorted(self._states),
+            [member_label(k) for k in sorted(self._states)],
             time.perf_counter() - tic,
             (free_before - free_after) / (1 << 30),
         )
@@ -568,13 +578,14 @@ class AdaptiveVerifyWidth:
             self._sampled_stats.push(self._sampled_average)
         return torch.cat([predicted, raw], dim=1)
 
-    def activate(self, width: int, model_runner) -> None:
-        if width == self._active:
+    def activate(self, key: int, model_runner) -> None:
+        """Switch the target to the verify state of ``key``: a tree width, or CHAIN."""
+        if key == self._active:
             return
-        state = self._states[width]
+        state = self._states[key]
         model_runner.attn_backend = state.attn_backend
         model_runner.decode_cuda_graph_runner = state.graph_runner
-        self._active = width
+        self._active = key
 
     def after_verify(
         self,
