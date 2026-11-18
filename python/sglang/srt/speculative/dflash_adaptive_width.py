@@ -32,12 +32,14 @@ logger = logging.getLogger(__name__)
 
 
 class StepTimer:
-    """Debug instrumentation: appends ``bs member interval_s`` for consecutive decode steps.
+    """Debug instrumentation: appends ``bs member interval_s boottime_ns`` for consecutive
+    decode steps.
 
     With overlap scheduling the host-side interval between consecutive decode calls is
     the pipeline period, i.e. the step cost, whether the GPU or the host is the bound.
     ``member`` is the verify width per request, "chain" for the chain member of a tree
-    worker, and 0 for the DFLASH chain path."""
+    worker, and 0 for the DFLASH chain path; ``boottime_ns`` (CLOCK_BOOTTIME, the clock of
+    rocprofv3 timestamps) is when the step began."""
 
     def __init__(self, path: str):
         self._file = open(path, "a", buffering=1 << 16)
@@ -48,11 +50,17 @@ class StepTimer:
         now = time.perf_counter()
         prev = self._prev
         if prev is not None and prev[1] and is_decode:
-            self._file.write(f"{prev[2]} {prev[3]} {now - prev[0]:.6f}\n")
+            self._file.write(f"{prev[2]} {prev[3]} {now - prev[0]:.6f} {prev[4]}\n")
             self._lines += 1
             if self._lines % 32 == 0:
                 self._file.flush()
-        self._prev = [now, is_decode, bs, member]
+        self._prev = [
+            now,
+            is_decode,
+            bs,
+            member,
+            time.clock_gettime_ns(time.CLOCK_BOOTTIME),
+        ]
 
     def set_member(self, member: str) -> None:
         if self._prev is not None:
@@ -268,6 +276,11 @@ _EXPLORE_EVERY = 32
 # scale by 25% on Glimmer at T=1; otherwise arbitrary.
 _MEMBER_SCALE_DECAY = 0.995
 _MEMBER_SCALE_PRIOR = 1000.0
+# Sampled decisions read an exponential average of the per-step predictions, weight per
+# step. Per-step choices on one request's noisy prediction picked the chain on steps
+# that looked easy, trained the chain's calibration on them, and lost 5-6% at C1 to the
+# best fixed tree on Glimmer and Qwen; the window length is otherwise arbitrary.
+_PREDICTION_AVERAGE = 1.0 / 32
 
 
 class AdaptiveVerifyWidth:
@@ -336,6 +349,7 @@ class AdaptiveVerifyWidth:
                 initial=[1.0] * len(config.widths), device=device
             )
         self._sampled_policy = self._sampled_stats = None
+        self._sampled_average: Optional[torch.Tensor] = None
         self._sampled_steps = 0
         # Decayed sums of actual and predicted (per-node model) accept length over each
         # member's verifies; their ratio rescales the member's prediction.
@@ -467,8 +481,8 @@ class AdaptiveVerifyWidth:
     ) -> Optional[torch.Tensor]:
         """Expected accept length of every sampled member, ``[bs, 2 * members]``: the
         per-node model's rescaled by the member's measured ratio, then unscaled. The
-        rescaled batch mean is pushed for later steps' decisions. None when neither a
-        policy nor the dump reads it."""
+        running average of the rescaled batch mean is pushed for later steps'
+        decisions. None when neither a policy nor the dump reads it."""
         if self._sampled_policy is None and self._dump is None:
             return None
         columns = []
@@ -488,7 +502,12 @@ class AdaptiveVerifyWidth:
         )
         predicted = raw * scale
         if self._sampled_policy is not None:
-            self._sampled_stats.push(predicted.mean(dim=0))
+            mean = predicted.mean(dim=0)
+            if self._sampled_average is None:
+                self._sampled_average = mean
+            else:
+                self._sampled_average.lerp_(mean, _PREDICTION_AVERAGE)
+            self._sampled_stats.push(self._sampled_average)
         return torch.cat([predicted, raw], dim=1)
 
     def activate(self, width: int, model_runner) -> None:
