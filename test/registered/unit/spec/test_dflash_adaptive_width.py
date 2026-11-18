@@ -516,12 +516,12 @@ class TestRaggedMember(CustomTestCase):
 
 
 class TestGreedyPolicy(CustomTestCase):
-    def _width(self, accept_len=None, widths=(8, 16)):
+    def _width(self, accept_len=None, widths=(8, 16), cost8=20.0):
         config = AdaptiveWidthConfig(
             widths=widths,
             sampled_members=(16,),
             # Shaped like Qwen at bs 16: 16 nodes cost 21% more than 8.
-            cost_ms={RAGGED: {16: 19.0}, 8: {16: 20.0}, 16: {16: 24.2}},
+            cost_ms={RAGGED: {16: 19.0}, 8: {16: cost8}, 16: {16: 24.2}},
             sampled_cost_ms={},
             force_width=None,
             calibration_dump=None,
@@ -574,6 +574,24 @@ class TestGreedyPolicy(CustomTestCase):
         )
         self.assertEqual(width.choose_width(bs=16), RAGGED)
         self.assertEqual(width._captured_keys(), [-8, 8])
+        # A step whose trees look weak picks the ragged chain; ragged steps build no
+        # tree, and their relaxing content factors hand the choice back to the levels.
+        cheap_tree = self._width(
+            accept_len={RAGGED: {16: 4.5}, 8: {1: 4.6}, 16: {1: 5.06}},
+            widths=(RAGGED, 8, 16),
+            cost8=19.3,
+        )
+        self._push(cheap_tree, 4.4, 4.9)
+        self.assertEqual(cheap_tree.choose_width(bs=16), 8)
+        self._push(cheap_tree, 3.5, 3.9)
+        self.assertEqual(cheap_tree.choose_width(bs=16), RAGGED)
+        for _ in range(8):
+            cheap_tree.after_ragged_verify(
+                accept_lens=torch.ones(16), verify_lens=torch.ones(16), greedy=True
+            )
+            for event in cheap_tree._stats._events:
+                event.done = True
+        self.assertEqual(cheap_tree.choose_width(bs=16), 8)
         self._push(width, 4.4, 4.9)
         torch.testing.assert_close(
             width._greedy_average, torch.ones(3), rtol=1e-6, atol=1e-6

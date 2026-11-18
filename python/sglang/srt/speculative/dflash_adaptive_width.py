@@ -947,7 +947,25 @@ class AdaptiveVerifyWidth:
         self, *, accept_lens: torch.Tensor, verify_lens: torch.Tensor, greedy: bool
     ) -> None:
         """A ragged chain verify updates no calibration (it verifies no tree build);
-        the dump gets each request's accept length and verified rows."""
+        the dump gets each request's accept length and verified rows. Without a tree
+        there is no content estimate either, so the averaged content factors relax
+        toward 1, the measured levels alone: held at their last value, one step whose
+        trees looked weak kept Glimmer greedy batches on the ragged chain for good."""
+        if greedy:
+            average, stats, weight = (
+                self._greedy_average,
+                self._stats,
+                _GREEDY_LEVELS_AVERAGE,
+            )
+        else:
+            average, stats, weight = (
+                self._sampled_average,
+                self._sampled_stats,
+                _PREDICTION_AVERAGE,
+            )
+        if average is not None and stats is not None:
+            average.lerp_(torch.ones_like(average), weight)
+            stats.push(average)
         if self._dump is not None:
             self._queue_dump(
                 {
