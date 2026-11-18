@@ -1,6 +1,7 @@
 """DFLASH tree builders: best-first prefixes under predecessor-conditional scores, sampled
 trees that verify losslessly, and batches mixing greedy and sampling rows."""
 
+import collections
 import heapq
 import math
 import os
@@ -21,6 +22,7 @@ from sglang.kernels.ops.speculative.dflash_tree import (
     tree_prefix,
     update_draw_acceptance,
     update_rank_table,
+    sampled_node_drafts,
     update_tree_calibration,
 )
 from sglang.kernels.ops.speculative.multi_draft_sampling import (
@@ -812,6 +814,234 @@ def test_calibrated_sampled_survival_matches_reference(chain):
     torch.testing.assert_close(
         survival.prefix_accept_len.cpu(), expected, rtol=1e-4, atol=1e-4
     )
+
+
+def _path_log_q(log_q, path, k):
+    """Sum of q's log-probs along ``path`` (tokens from the root); candidate ids are
+    arange, so token t sits at lattice depth t // k, rank t % k."""
+    return sum(
+        log_q[d, 0 if d == 0 else path[d - 1] % k, path[d] % k].item()
+        for d in range(len(path))
+    )
+
+
+def _node_q(log_q, path, k, log_tau):
+    """float64 q over the vocabulary of the children of the node at ``path``, truncated
+    to the candidates whose path log q clears ``log_tau`` (if any) and renormalized."""
+    num_depths = log_q.shape[0]
+    depth = len(path)
+    q = torch.zeros(num_depths * k, dtype=torch.float64)
+    if depth == num_depths:
+        return q
+    row = log_q[depth, 0 if depth == 0 else path[-1] % k]
+    keep = torch.ones(k, dtype=torch.bool)
+    if log_tau is not None:
+        keep = _path_log_q(log_q, path, k) + row >= log_tau
+    q[depth * k : (depth + 1) * k] = torch.where(keep, row.exp(), 0.0)
+    return q / q.sum() if q.sum() > 0 else q
+
+
+def _traversal_exact(children, tokens, node_q, target):
+    """Traversal Verification's output distribution on one tree, in float64: committed
+    sequence -> probability. Node n's children were drawn from ``node_q[n]``."""
+    out = collections.defaultdict(float)
+    undecided = [1.0]
+
+    def visit(node, p_node, path):
+        r = p_node * target(path)
+        q = node_q[node].clone()
+        for child in children[node]:
+            t = tokens[child]
+            p_child = min(1.0, (r[t] / q[t]).item()) if q[t] > 0 else 0.0
+            visit(child, p_child, path + (t,))
+            norm = max(1.0 - torch.minimum(r, q).sum().item(), 1e-300)
+            r = (r - q).clamp(min=0) / norm
+            q[t] = 0.0
+            q = q / q.sum() if q.sum() > 0 else q
+        accept = 1.0 if node == 0 else r.sum().item()
+        if accept > 0:
+            for y in torch.nonzero(r > 0).flatten().tolist():
+                out[path + (y,)] += undecided[0] * accept * (r[y] / r.sum()).item()
+        undecided[0] *= 1.0 - accept
+
+    visit(0, 1.0, ())
+    return out
+
+
+def _extend(dist, target, length):
+    """Each sequence continued by target draws to ``length`` tokens."""
+    full = collections.defaultdict(float)
+    stack = list(dist.items())
+    while stack:
+        seq, prob = stack.pop()
+        if len(seq) == length:
+            full[seq] += prob
+            continue
+        nxt = target(seq)
+        stack.extend((seq + (y,), prob * nxt[y].item()) for y in range(len(nxt)))
+    return full
+
+
+@pytest.mark.parametrize(
+    "seed, log_tau, padded", [(7, -3.0, False), (9, -5.0, False), (5, -2.0, True)]
+)
+def test_truncated_sampled_tree_is_exact(seed, log_tau, padded):
+    """Every node draws its children from q truncated to the candidates whose path log q
+    clears tau (q'); Traversal Verification with q' commits exactly the target. The
+    builder's trees over a million rows are every tree there is (their q' draw
+    probabilities sum to one), each appears at that probability, padding comes only
+    once no node has support left, and verifying them with the untruncated q fails.
+    Padding depends on the lattice alone: whether fewer paths clear tau than slots."""
+    num_depths, k, max_nodes, rows = 2, 4, 5, 1 << 20
+    vocab = num_depths * k
+    gen = torch.Generator().manual_seed(seed)
+    scores = torch.randn(num_depths, k, k, generator=gen)
+    scores[0] = scores[0, :1]
+    log_q = torch.log_softmax(scores, dim=-1)
+    log_q64 = log_q.double()
+    # No path within rounding of tau, so float32 (kernel) and float64 supports agree.
+    margins = [
+        abs(_path_log_q(log_q64, path, k) - log_tau)
+        for path in [(a,) for a in range(k)]
+        + [(a, k + b) for a in range(k) for b in range(k)]
+    ]
+    assert min(margins) > 1e-3
+    favored = torch.zeros(vocab + 1, vocab)
+    for prev in range(vocab + 1):
+        depth = 0 if prev == vocab else min(prev // k + 1, num_depths - 1)
+        favored[prev, depth * k : (depth + 1) * k] = 2.0
+    next_target = torch.softmax(
+        torch.randn(vocab + 1, vocab, generator=gen).double() + favored, -1
+    )
+
+    def target(path):
+        return next_target[path[-1] if path else vocab]
+
+    torch.manual_seed(6)
+    candidate_ids = torch.arange(vocab).view(1, num_depths, k).repeat(rows, 1, 1)
+    lattice = (candidate_ids.cuda(), log_q.repeat(rows, 1, 1, 1).cuda())
+    tree = build_dflash_sampled_tree(
+        *lattice, max_nodes=max_nodes, accept_prior=(0.7, 0.3), log_tau=log_tau
+    )
+    node_probs = sampled_node_drafts(*lattice, tree, max_nodes)[1][:256].cpu()
+    keys = torch.cat(
+        [
+            tree.proposal.top_scores_index.cpu() // k,
+            tree.proposal.draft_tokens.cpu(),
+            tree.proposal.node_count.cpu()[:, None].long(),
+        ],
+        dim=1,
+    )
+    trees, counts = torch.unique(keys, dim=0, return_counts=True)
+    first_row = {
+        tuple(key): row for row, key in reversed(list(enumerate(keys[:256].tolist())))
+    }
+
+    output = collections.defaultdict(float)
+    control = collections.defaultdict(float)
+    total, z_max, padded_rows = 0.0, 0.0, 0
+    for key, count in zip(trees.tolist(), counts.tolist()):
+        parents = key[: max_nodes - 1]
+        tokens = [0] + key[max_nodes - 1 : 2 * (max_nodes - 1)]
+        num_real = key[-1]
+        children = {node: [] for node in range(max_nodes)}
+        paths, node_q, prob = [()], [_node_q(log_q64, (), k, log_tau)], 1.0
+        drawn_mass = collections.defaultdict(float)
+        for node in range(1, max_nodes):
+            parent, token = parents[node - 1], tokens[node]
+            children[parent].append(node)
+            paths.append(paths[parent] + (token,))
+            if node < num_real:
+                q = node_q[parent]
+                prob *= q[token].item() / (1.0 - drawn_mass[parent])
+                drawn_mass[parent] += q[token].item()
+                node_q.append(_node_q(log_q64, paths[node], k, log_tau))
+            else:
+                node_q.append(torch.zeros(vocab, dtype=torch.float64))
+        if num_real < max_nodes:
+            padded_rows += count
+            for node in range(num_real):
+                left = node_q[node].clone()
+                left[[tokens[c] for c in children[node] if c < num_real]] = 0.0
+                assert left.sum().item() == 0.0, key
+        if tuple(key) in first_row:
+            row = first_row[tuple(key)]
+            kernel_q = node_probs[row].double()
+            kernel_q = kernel_q / kernel_q.sum(-1, keepdim=True).clamp(min=1e-30)
+            for node in range(max_nodes):
+                depth = len(paths[node])
+                if depth < num_depths:
+                    expected = node_q[node][depth * k : (depth + 1) * k]
+                    assert torch.allclose(kernel_q[node], expected, atol=1e-6)
+        total += prob
+        sigma = math.sqrt(rows * prob * (1 - prob))
+        z_max = max(z_max, abs(count - rows * prob) / sigma)
+        for dist, qs in (
+            (output, node_q),
+            (control, [_node_q(log_q64, path, k, None) for path in paths]),
+        ):
+            for seq, p in _extend(
+                _traversal_exact(children, tokens, qs, target), target, num_depths + 1
+            ).items():
+                dist[seq] += prob * p
+    reference = _extend({(): 1.0}, target, num_depths + 1)
+    error = max(abs(output[seq] - p) for seq, p in reference.items())
+    control_error = max(abs(control[seq] - p) for seq, p in reference.items())
+    assert abs(total - 1.0) < 1e-9
+    assert z_max < 5.5
+    assert padded_rows == (rows if padded else 0)
+    assert error < 1e-12
+    assert control_error > 1e-3
+
+
+@pytest.mark.parametrize("accept_prior", [None, (0.7, 0.3), "tensor"])
+def test_truncation_at_minus_infinity_is_bitwise(accept_prior):
+    """A threshold of -inf keeps every candidate: the tree and its drafts are bit for bit
+    those of the untruncated builder. (Where q underflows to zero on every undrawn
+    candidate, the untruncated builder still adds nodes, with no q mass, where the
+    truncated one pads; ``_lattice``'s peaked rows are left out for that.)"""
+    candidate_ids, log_q = _lattice(72, 15, 16, 151000, seed=31)
+    peaked = torch.arange(72) % 3 == 0
+    candidate_ids, log_q = candidate_ids[~peaked], log_q[~peaked]
+    if accept_prior == "tensor":
+        accept_prior = torch.tensor(log_draw_priors((0.8, 0.2))).cuda()
+    outputs = []
+    for log_tau in (None, -math.inf):
+        torch.manual_seed(32)
+        proposal, node_tokens, node_probs = build_dflash_sampled_tree_proposal(
+            candidate_ids.cuda(),
+            log_q.cuda(),
+            max_nodes=32,
+            accept_prior=accept_prior,
+            log_tau=log_tau,
+        )
+        fields = [proposal.draft_tokens, proposal.top_scores_index]
+        # Parent-list entries past the nodes are never written nor read.
+        fields += [proposal.parent_list[:, :32], node_tokens, node_probs]
+        if proposal.survival is not None:
+            fields += [proposal.survival.node_log_survival]
+            fields += [proposal.survival.prefix_accept_len]
+        outputs.append([field.clone() for field in fields])
+    for plain, truncated in zip(*outputs):
+        assert torch.equal(plain, truncated)
+
+
+def test_draw_acceptance_skips_padding():
+    # Root draws node 1; nodes 2 and 3 are padding under the root, then nothing is
+    # accepted: one first draw rejected, no later draws.
+    q, k = 4, 4
+    stats, log_priors = torch.zeros(4), torch.zeros(4)
+    update_draw_acceptance(
+        stats=stats,
+        log_priors=log_priors,
+        top_scores_index=torch.tensor([[0, k - 1, k - 1]]),
+        accept_index=torch.tensor([[0, -1, -1]]),
+        accept_lens=torch.tensor([1]),
+        num_nodes=q,
+        topk=k,
+        node_count=torch.tensor([2], dtype=torch.int32),
+    )
+    assert stats.tolist() == [0.0, 1.0, 0.0, 0.0]
 
 
 if __name__ == "__main__":

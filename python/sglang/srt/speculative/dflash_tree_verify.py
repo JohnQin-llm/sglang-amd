@@ -9,6 +9,7 @@ exactly where the chain path leaves it.
 
 from __future__ import annotations
 
+import bisect
 import copy
 import dataclasses
 import os
@@ -78,9 +79,11 @@ def propose_dflash_sampled_tree(
     num_nodes: int,
     workspace: dict[str, torch.Tensor],
     accept_prior: tuple[float, float] | torch.Tensor | None = None,
+    log_tau: float | None = None,
 ) -> tuple[DFlashTreeProposal, torch.Tensor, torch.Tensor]:
     """Tree drawn from the selector's q at each request's temperature, for lossless
-    multi-draft verification; also returns each node's child candidates and their q."""
+    multi-draft verification; also returns each node's child candidates and their q.
+    ``log_tau`` draws from q truncated to paths whose log q clears it instead (q')."""
     lattice = sampled_lattice(
         candidate_ids=candidate_ids,
         scores=scores,
@@ -93,6 +96,35 @@ def propose_dflash_sampled_tree(
         max_nodes=num_nodes,
         workspace=workspace,
         accept_prior=accept_prior,
+        log_tau=log_tau,
+    )
+
+
+class QThresholdTable(msgspec.Struct, frozen=True):
+    """Path log q thresholds of q-truncated sampled trees by batch size: a batch takes
+    the entry of the largest listed size not above its own (the first entry below)."""
+
+    batch_sizes: tuple[int, ...]
+    log_taus: tuple[float, ...]
+
+    def log_tau(self, bs: int) -> float:
+        index = bisect.bisect_right(self.batch_sizes, bs) - 1
+        return self.log_taus[max(index, 0)]
+
+
+def parse_q_threshold_table(value: str | None) -> QThresholdTable | None:
+    """``"-6"`` for every batch size, or ``"1:-8,8:-6.5,16:-6"`` per batch size."""
+    if not value:
+        return None
+    if ":" not in value:
+        return QThresholdTable(batch_sizes=(1,), log_taus=(float(value),))
+    entries = sorted(
+        (int(bs), float(tau))
+        for bs, tau in (entry.split(":") for entry in value.split(","))
+    )
+    return QThresholdTable(
+        batch_sizes=tuple(bs for bs, _ in entries),
+        log_taus=tuple(tau for _, tau in entries),
     )
 
 
@@ -209,6 +241,7 @@ def propose_dflash_mixed_tree(
     num_nodes: int,
     workspace: dict[str, torch.Tensor],
     accept_prior: tuple[float, float] | torch.Tensor | None = None,
+    log_tau: float | None = None,
 ) -> tuple[DFlashTreeProposal, torch.Tensor, torch.Tensor]:
     """``propose_dflash_sampled_tree`` for a batch that mixes greedy and sampling requests:
     rows where ``greedy_rows`` holds take the best-first tree instead. Their target is
@@ -222,6 +255,7 @@ def propose_dflash_mixed_tree(
         num_nodes=num_nodes,
         workspace=workspace,
         accept_prior=accept_prior,
+        log_tau=log_tau,
     )
     greedy = build_dflash_greedy_tree_proposal(
         candidate_ids[:, :, :topk].contiguous(),

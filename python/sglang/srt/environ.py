@@ -1718,6 +1718,9 @@ class Envs:
     # JSON table that turns on ragged per-request DFLASH chain verify lengths
     # (speculative/dflash_ragged_chain.py); unset keeps one block per request.
     SGLANG_DFLASH_RAGGED_CHAIN_TABLE = EnvStr(None)
+    # Path log q threshold of T>0 DFLASH sampled trees ("-6", or "1:-8,16:-6" by batch
+    # size): each node draws from q truncated to the paths that clear it (lossless).
+    SGLANG_DFLASH_TREE_Q_THRESHOLD = EnvStr(None)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
