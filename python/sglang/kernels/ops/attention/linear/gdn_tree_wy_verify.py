@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GDN tree verify in the chunked (UT/WY) form.
+"""GDN tree and chain verify in the chunked (UT/WY) form.
 
 One program covers every node of one request's draft tree for one value head
 and V block, so the committed state is read once per request instead of once
@@ -12,10 +12,16 @@ and the strictly-lower causal mask becomes the strict-ancestor mask:
     o_t = e^{G_t} S q_t + sum_{j in anc(t) + t} e^{G_t - G_j} (k_j.q_t) u_j
 
 Parents precede children, so the u system is lower-triangular in node order.
-The ring takes each node's raw inputs exactly as ``gdn_tree_verify`` stores
-them, so the accepted-path commit fold (``gdn_replayssm_spec_fold``) and the
-committed state are unchanged; only the verify outputs differ, by fp32
-rounding.
+
+Two ring protocols, so the commit kernels stay unchanged:
+  * tree (``gdn_tree_wy_verify``): each node's raw inputs at its node index,
+    bitwise as ``gdn_tree_verify`` stores them, for the accepted-path fold
+    (``gdn_replayssm_spec_fold``); the committed state is unchanged.
+  * chain (``gdn_chain_wy_verify``): the compact (u, normalized k, g) records
+    of ``gdn_replayssm_spec_circular_kernel`` at the request's circular ring
+    positions, for its compact commit. Only valid while every commit folds the
+    ring, so each verify starts from the checkpoint with no history.
+Outputs differ from the replay kernels by fp32 rounding only.
 """
 
 from __future__ import annotations
@@ -68,11 +74,14 @@ def _gdn_tree_wy_verify_kernel(
     h0_source,
     h0_indices,
     ancestors,
-    rawv_ring,
-    rawk_ring,
+    v_ring,
+    k_ring,
     g_ring,
     beta_ring,
+    v_low_ring,
+    k_low_ring,
     ring_indices,
+    ring_base,
     scale,
     softplus_beta,
     softplus_threshold,
@@ -83,10 +92,10 @@ def _gdn_tree_wy_verify_kernel(
     stride_v,
     stride_a,
     stride_b,
-    stride_rawv_slot,
-    stride_rawk_slot,
-    stride_g_slot,
-    stride_beta_slot,
+    stride_v_ring,
+    stride_k_ring,
+    stride_g_ring,
+    stride_beta_ring,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -96,7 +105,9 @@ def _gdn_tree_wy_verify_kernel(
     BKT: tl.constexpr,
     MAX_CACHE_LEN: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
-    CACHE_RING: tl.constexpr,
+    IS_CHAIN: tl.constexpr,
+    RAW_RING: tl.constexpr,
+    COMPACT_RING: tl.constexpr,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -127,8 +138,11 @@ def _gdn_tree_wy_verify_kernel(
     b_beta = tl.where(mask_s, 1.0 / (1.0 + tl.exp(-b_b)), 0.0)
 
     # on_path[t, j]: node j is t or an ancestor of t.
-    b_anc = tl.load(ancestors + i_n * T + o_s, mask=mask_s, other=0)
-    on_path = ((b_anc[:, None] >> o_s[None, :].to(tl.int64)) & 1) != 0
+    if IS_CHAIN:
+        on_path = (o_s[None, :] <= o_s[:, None]) & mask_s[:, None] & mask_s[None, :]
+    else:
+        b_anc = tl.load(ancestors + i_n * T + o_s, mask=mask_s, other=0)
+        on_path = ((b_anc[:, None] >> o_s[None, :].to(tl.int64)) & 1) != 0
     strict_anc = on_path & (o_s[:, None] != o_s[None, :])
     # fp64 prefix sums: on deep paths |G| reaches ~20, and its fp32 rounding
     # alone gave 7-10x path replay's output error on 24-32 node chains.
@@ -137,9 +151,15 @@ def _gdn_tree_wy_verify_kernel(
     exp_G = tl.exp(b_G).to(tl.float32)
 
     state_idx = tl.load(h0_indices + i_n).to(tl.int64)
-    if CACHE_RING:
-        ring_slot = tl.load(ring_indices + i_n).to(tl.int64)
-        write_k = (ring_slot >= 0) & (i_v == 0) & (i_hv % (HV // H) == 0)
+    if RAW_RING or COMPACT_RING:
+        ring_row = tl.load(ring_indices + i_n).to(tl.int64)
+        # A compact ring row is the request's own; pad rows (no state slot) may
+        # alias a live request's row, so they must not write it.
+        if COMPACT_RING:
+            ring_live = state_idx >= 0
+        else:
+            ring_live = ring_row >= 0
+        write_k = ring_live & (i_v == 0) & (i_hv % (HV // H) == 0)
 
     # Raw (pre-norm) dot products; the L2 norms are row scales applied after
     # the K loop, so q and k are read once.
@@ -157,14 +177,14 @@ def _gdn_tree_wy_verify_kernel(
         b_k = tl.load(k + tok[:, None] * stride_k + i_h * K + o_k[None, :]).to(
             tl.float32
         )
-        if CACHE_RING:
+        if RAW_RING:
             if write_k:
                 tl.store(
-                    rawk_ring
-                    + ring_slot * stride_rawk_slot
+                    k_ring
+                    + ring_row * stride_k_ring
                     + (i_h * MAX_CACHE_LEN + o_s[:, None]) * K
                     + o_k[None, :],
-                    b_k.to(rawk_ring.dtype.element_ty),
+                    b_k.to(k_ring.dtype.element_ty),
                     mask=mask_s[:, None],
                 )
         q_sq += tl.sum(b_q * b_q, axis=1)
@@ -221,33 +241,121 @@ def _gdn_tree_wy_verify_kernel(
         mask=mask_v[:, None] & mask_s[None, :],
     )
 
-    if CACHE_RING:
-        if ring_slot >= 0:
+    if RAW_RING:
+        if ring_live:
+            _store_node_records(
+                v_ring + ring_row * stride_v_ring,
+                g_ring + ring_row * stride_g_ring,
+                beta_ring + ring_row * stride_beta_ring,
+                b_v,
+                b_g,
+                b_beta,
+                o_s,
+                o_s,
+                o_v,
+                i_v,
+                i_hv,
+                mask_v,
+                mask_s,
+                V,
+                MAX_CACHE_LEN,
+                True,
+            )
+    if COMPACT_RING:
+        if ring_live:
+            pos = (tl.load(ring_base + ring_row) + o_s) & (MAX_CACHE_LEN - 1)
+            u_hi = u.to(v_ring.dtype.element_ty)
             tl.store(
-                rawv_ring
-                + ring_slot * stride_rawv_slot
-                + (i_hv * MAX_CACHE_LEN + o_s[None, :]) * V
+                v_low_ring
+                + ring_row * stride_v_ring
+                + (i_hv * MAX_CACHE_LEN + pos[None, :]) * V
                 + o_v[:, None],
-                b_v.to(rawv_ring.dtype.element_ty),
+                (u - u_hi.to(tl.float32)).to(v_low_ring.dtype.element_ty),
                 mask=mask_v[:, None] & mask_s[None, :],
             )
-            if i_v == 0:
-                ring_pos = i_hv * MAX_CACHE_LEN + o_s
-                tl.store(
-                    g_ring + ring_slot * stride_g_slot + ring_pos, b_g, mask=mask_s
-                )
-                tl.store(
-                    beta_ring + ring_slot * stride_beta_slot + ring_pos,
-                    b_beta,
-                    mask=mask_s,
-                )
+            _store_node_records(
+                v_ring + ring_row * stride_v_ring,
+                g_ring + ring_row * stride_g_ring,
+                beta_ring,
+                u_hi,
+                b_g,
+                b_beta,
+                o_s,
+                pos,
+                o_v,
+                i_v,
+                i_hv,
+                mask_v,
+                mask_s,
+                V,
+                MAX_CACHE_LEN,
+                False,
+            )
+            if write_k:
+                # Normalized keys need the full-K norm, so the key-writing
+                # programs read k a second time (from L2).
+                for i_k in tl.static_range(K // BKT):
+                    o_k = i_k * BKT + tl.arange(0, BKT)
+                    b_k = tl.load(
+                        k + tok[:, None] * stride_k + i_h * K + o_k[None, :]
+                    ).to(tl.float32)
+                    k_norm = b_k * k_scale[:, None]
+                    k_hi = k_norm.to(k_ring.dtype.element_ty)
+                    p_k = (
+                        ring_row * stride_k_ring
+                        + (i_h * MAX_CACHE_LEN + pos[:, None]) * K
+                        + o_k[None, :]
+                    )
+                    tl.store(k_ring + p_k, k_hi, mask=mask_s[:, None])
+                    tl.store(
+                        k_low_ring + p_k,
+                        (k_norm - k_hi.to(tl.float32)).to(k_low_ring.dtype.element_ty),
+                        mask=mask_s[:, None],
+                    )
 
 
-def _default_block_v(num_programs_per_block: int, V: int) -> int:
-    # Measured on MI355X at Qwen3.8 shapes: grids past ~1024 one-warp programs
-    # ran up to 1.7x slower, so V is split only while the grid stays under that.
+@triton.jit
+def _store_node_records(
+    p_v,
+    p_g,
+    p_beta,
+    b_v,
+    b_g,
+    b_beta,
+    o_s,
+    pos,
+    o_v,
+    i_v,
+    i_hv,
+    mask_v,
+    mask_s,
+    V: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+    STORE_BETA: tl.constexpr,
+):
+    """One request row's [BV, BS] value-side records and per-node gates at ring
+    positions ``pos``."""
+    tl.store(
+        p_v + (i_hv * MAX_CACHE_LEN + pos[None, :]) * V + o_v[:, None],
+        b_v.to(p_v.dtype.element_ty),
+        mask=mask_v[:, None] & mask_s[None, :],
+    )
+    if i_v == 0:
+        tl.store(p_g + i_hv * MAX_CACHE_LEN + pos, b_g, mask=mask_s)
+        if STORE_BETA:
+            tl.store(p_beta + i_hv * MAX_CACHE_LEN + pos, b_beta, mask=mask_s)
+
+
+# Measured on MI355X at Qwen3.8 shapes: grids past these one-warp program counts
+# ran up to 1.7x slower (16-node trees tolerate more programs than 8 or 32).
+_MAX_PROGRAMS = {16: 1536}
+_DEFAULT_MAX_PROGRAMS = 1024
+
+
+def _default_block_v(num_programs_per_block: int, V: int, BS: int) -> int:
+    max_programs = _MAX_PROGRAMS.get(BS, _DEFAULT_MAX_PROGRAMS)
     for block_v in (32, 64):
-        if num_programs_per_block * triton.cdiv(V, block_v) <= 1024:
+        if num_programs_per_block * triton.cdiv(V, block_v) <= max_programs:
             return block_v
     return triton.next_power_of_2(V)
 
@@ -273,6 +381,117 @@ def gdn_tree_ancestors(
         num_warps=1,
     )
     return ancestors
+
+
+def _launch_wy_verify(
+    *,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    h0_source: torch.Tensor,
+    h0_indices: torch.Tensor,
+    num_draft_tokens: int,
+    ancestors: Optional[torch.Tensor],
+    rings: tuple,
+    raw_ring: bool,
+    compact_ring: bool,
+    scale: Optional[float],
+    use_qk_l2norm_in_kernel: bool,
+    softplus_beta: float,
+    softplus_threshold: float,
+    block_v: Optional[int],
+    block_k: int,
+    num_warps: int,
+) -> torch.Tensor:
+    """``rings``: (v, k, g, beta, v_low, k_low, ring_indices, ring_base); unused
+    entries may be any tensor."""
+    H, K = k.shape[-2:]
+    HV, V = v.shape[-2:]
+    num_tokens = k.shape[-3]
+    T = num_draft_tokens
+    N = num_tokens // T
+    assert N * T == num_tokens, f"{num_tokens=} is not a multiple of {T=}"
+    for name, x, heads, dim in (("q", q, H, K), ("k", k, H, K), ("v", v, HV, V)):
+        assert x.stride(-1) == 1 and x.stride(-2) == dim, f"{name} heads not packed"
+        assert x.shape[-2] == heads, name
+    assert a.stride(-1) == 1 and b.stride(-1) == 1
+    assert h0_source.stride(-1) == 1
+    assert K % block_k == 0, f"{K=} is not a multiple of {block_k=}"
+    # tl.dot needs at least 4 rows on gfx950 and sm80+.
+    BS = max(4, triton.next_power_of_2(T))
+    if block_v is None:
+        block_v = _default_block_v(N * HV, V, BS)
+    BV = min(triton.next_power_of_2(V), block_v)
+    if scale is None:
+        scale = K**-0.5
+
+    v_ring, k_ring, g_ring, beta_ring, v_low, k_low, ring_indices, ring_base = rings
+    if raw_ring or compact_ring:
+        max_cache_len = v_ring.shape[-2]
+        assert max_cache_len >= T, f"ring holds {max_cache_len} < {T} nodes"
+        ring_strides = (
+            v_ring.stride(0),
+            k_ring.stride(0),
+            g_ring.stride(0),
+            beta_ring.stride(0),
+        )
+    else:
+        max_cache_len = 0
+        ring_strides = (0, 0, 0, 0)
+
+    o = q.new_empty(1, num_tokens, HV, V)
+    grid = (triton.cdiv(V, BV), N, HV)
+    _gdn_tree_wy_verify_kernel[grid](
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b,
+        o,
+        h0_source,
+        h0_indices,
+        ancestors,
+        v_ring,
+        k_ring,
+        g_ring,
+        beta_ring,
+        v_low,
+        k_low,
+        ring_indices,
+        ring_base,
+        scale,
+        softplus_beta,
+        softplus_threshold,
+        T,
+        h0_source.stride(0),
+        q.stride(-3),
+        k.stride(-3),
+        v.stride(-3),
+        a.stride(-2),
+        b.stride(-2),
+        *ring_strides,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BV=BV,
+        BS=BS,
+        BKT=block_k,
+        MAX_CACHE_LEN=max_cache_len,
+        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        IS_CHAIN=ancestors is None,
+        RAW_RING=raw_ring,
+        COMPACT_RING=compact_ring,
+        num_warps=num_warps,
+        num_stages=1,
+    )
+    return o
 
 
 def gdn_tree_wy_verify(
@@ -306,87 +525,98 @@ def gdn_tree_wy_verify(
     ``[1, num_tokens, HV, V]``). ``tree_ancestors`` is
     ``gdn_tree_ancestors(retrieve_parent_token, num_draft_tokens)``, built here
     when not given."""
-    H, K = k.shape[-2:]
-    HV, V = v.shape[-2:]
-    num_tokens = k.shape[-3]
-    T = num_draft_tokens
-    N = num_tokens // T
-    assert N * T == num_tokens, f"{num_tokens=} is not a multiple of {T=}"
-    for name, x, heads, dim in (("q", q, H, K), ("k", k, H, K), ("v", v, HV, V)):
-        assert x.stride(-1) == 1 and x.stride(-2) == dim, f"{name} heads not packed"
-        assert x.shape[-2] == heads, name
-    assert a.stride(-1) == 1 and b.stride(-1) == 1
-    assert initial_state_source.stride(-1) == 1
-    assert K % block_k == 0, f"{K=} is not a multiple of {block_k=}"
-    if block_v is None:
-        block_v = _default_block_v(N * HV, V)
-    BV = min(triton.next_power_of_2(V), block_v)
-    # tl.dot needs at least 4 rows on gfx950 and sm80+.
-    BS = max(4, triton.next_power_of_2(T))
-    if scale is None:
-        scale = K**-0.5
-
-    cache_ring = rawv_ring is not None
-    if cache_ring:
+    raw_ring = rawv_ring is not None
+    if raw_ring:
         assert ring_indices is not None
         assert rawv_ring.dim() == 4 and rawk_ring.dim() == 4
         assert g_ring.dim() == 3 and beta_ring.dim() == 3
-        max_cache_len = rawv_ring.shape[-2]
-        assert max_cache_len >= T, f"ring holds {max_cache_len} < {T} nodes"
-        ring_strides = (
-            rawv_ring.stride(0),
-            rawk_ring.stride(0),
-            g_ring.stride(0),
-            beta_ring.stride(0),
-        )
-    else:
-        max_cache_len = 0
-        ring_strides = (0, 0, 0, 0)
-
     if tree_ancestors is None:
-        tree_ancestors = gdn_tree_ancestors(retrieve_parent_token, T)
-
-    o = q.new_empty(1, num_tokens, HV, V)
-    grid = (triton.cdiv(V, BV), N, HV)
-    _gdn_tree_wy_verify_kernel[grid](
-        A_log,
-        a,
-        dt_bias,
-        q,
-        k,
-        v,
-        b,
-        o,
-        initial_state_source,
-        initial_state_indices,
-        tree_ancestors,
-        rawv_ring,
-        rawk_ring,
-        g_ring,
-        beta_ring,
-        ring_indices,
-        scale,
-        softplus_beta,
-        softplus_threshold,
-        T,
-        initial_state_source.stride(0),
-        q.stride(-3),
-        k.stride(-3),
-        v.stride(-3),
-        a.stride(-2),
-        b.stride(-2),
-        *ring_strides,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BV=BV,
-        BS=BS,
-        BKT=block_k,
-        MAX_CACHE_LEN=max_cache_len,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        CACHE_RING=cache_ring,
+        tree_ancestors = gdn_tree_ancestors(retrieve_parent_token, num_draft_tokens)
+    return _launch_wy_verify(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        h0_source=initial_state_source,
+        h0_indices=initial_state_indices,
+        num_draft_tokens=num_draft_tokens,
+        ancestors=tree_ancestors,
+        rings=(rawv_ring, rawk_ring, g_ring, beta_ring, None, None, ring_indices, None),
+        raw_ring=raw_ring,
+        compact_ring=False,
+        scale=scale,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        block_v=block_v,
+        block_k=block_k,
         num_warps=num_warps,
-        num_stages=1,
     )
-    return o
+
+
+def gdn_chain_wy_verify(
+    *,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    checkpoint_state: torch.Tensor,
+    d_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    g_cache: torch.Tensor,
+    d_residual_cache: torch.Tensor,
+    k_residual_cache: torch.Tensor,
+    ssm_state_indices: torch.Tensor,
+    replay_indices: torch.Tensor,
+    cache_base: torch.Tensor,
+    num_draft_tokens: int,
+    scale: Optional[float] = None,
+    block_v: Optional[int] = None,
+) -> torch.Tensor:
+    """Linear-chain verify for ``gdn_replayssm_spec_decode`` callers whose ring
+    is empty at every verify (each commit folds it). Writes the same compact
+    records at the same circular positions (``cache_base`` of the request's
+    ``replay_indices`` row), so ``commit_gdn_replayssm_compact_after_verify``
+    commits it unchanged. Output ``[1, num_tokens, HV, V]``."""
+    L = d_cache.shape[-2]
+    assert L & (L - 1) == 0, "circular cache requires power-of-two length"
+    for low, hi in ((d_residual_cache, d_cache), (k_residual_cache, k_cache)):
+        assert low.shape == hi.shape and low.stride() == hi.stride()
+    return _launch_wy_verify(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        h0_source=checkpoint_state,
+        h0_indices=ssm_state_indices,
+        num_draft_tokens=num_draft_tokens,
+        ancestors=None,
+        rings=(
+            d_cache,
+            k_cache,
+            g_cache,
+            g_cache,
+            d_residual_cache,
+            k_residual_cache,
+            replay_indices,
+            cache_base,
+        ),
+        raw_ring=False,
+        compact_ring=True,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        block_v=block_v,
+        block_k=64,
+        num_warps=1,
+    )

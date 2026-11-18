@@ -1,16 +1,24 @@
-"""Chunked (UT/WY) GDN tree verify against per-path replay.
+"""Chunked (UT/WY) GDN tree and chain verify against the replay kernels.
 
 The chunked form reorders the fp32 arithmetic, so its outputs must stay within
-fp32 rounding of an fp64 path replay on every tree shape, and its ring records
-must be bitwise those of ``gdn_tree_verify`` so the commit fold is unchanged.
+fp32 rounding of an fp64 path replay on every tree shape. Its tree ring records
+must be bitwise those of ``gdn_tree_verify`` (the commit fold is unchanged), and
+its chain ring records those of ``gdn_replayssm_spec_decode`` up to fp32
+rounding, at the same circular positions (the compact commit is unchanged).
 """
 
 import unittest
 
 import torch
 
+from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+    gdn_replayssm_spec_decode,
+)
 from sglang.kernels.ops.attention.linear.gdn_tree_verify import gdn_tree_verify
-from sglang.kernels.ops.attention.linear.gdn_tree_wy_verify import gdn_tree_wy_verify
+from sglang.kernels.ops.attention.linear.gdn_tree_wy_verify import (
+    gdn_chain_wy_verify,
+    gdn_tree_wy_verify,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -21,6 +29,8 @@ H, HV, K, V = 16, 48, 128, 128
 DEVICE = "cuda"
 # fp32 path replay sits near 2e-7 of max |output|; the chunked form near 6e-7.
 MAX_RELATIVE_ERROR = 2e-6
+# Compact records are bf16 high + low parts, about 16 mantissa bits each way.
+MAX_RECORD_DIFFERENCE = 2 * 2**-16
 
 
 def _tree(shape, num_nodes, gen):
@@ -144,6 +154,109 @@ class TestGdnTreeWyVerify(CustomTestCase):
                 self.assertLess(error.item(), MAX_RELATIVE_ERROR, tag)
                 for name, ring in path_rings.items():
                     self.assertTrue(torch.equal(wy_rings[name], ring), f"{name} {tag}")
+
+    def test_chain_matches_circular_kernel(self):
+        """From an empty ring at a nonzero circular base, as every commit leaves
+        it when the ring folds each step."""
+        batch_size, num_nodes, ring_len, num_rows = 3, 8, 16, 5
+        gen = torch.Generator(device=DEVICE).manual_seed(7)
+        inputs = _inputs(batch_size, num_nodes, gen)
+        state = 0.3 * torch.randn(
+            batch_size + 2, HV, V, K, device=DEVICE, generator=gen
+        )
+        # The last request is a pad row whose request row aliases request 0's.
+        slots = torch.tensor([2, 0, -1], dtype=torch.int32, device=DEVICE)
+        rows = torch.tensor([3, 1, 3], dtype=torch.int32, device=DEVICE)
+        cache_base = torch.tensor([0, 13, 0, 6, 0], dtype=torch.int32, device=DEVICE)
+
+        def rings():
+            return {
+                "d_cache": torch.zeros(
+                    num_rows, HV, ring_len, V, device=DEVICE
+                ).bfloat16(),
+                "k_cache": torch.zeros(
+                    num_rows, H, ring_len, K, device=DEVICE
+                ).bfloat16(),
+                "g_cache": torch.zeros(num_rows, HV, ring_len, device=DEVICE),
+                "d_residual_cache": torch.zeros(
+                    num_rows, HV, ring_len, V, device=DEVICE
+                ).bfloat16(),
+                "k_residual_cache": torch.zeros(
+                    num_rows, H, ring_len, K, device=DEVICE
+                ).bfloat16(),
+            }
+
+        num_tokens = batch_size * num_nodes
+        flat = {
+            "q": inputs["q"].view(num_tokens, H, K),
+            "k": inputs["k"].view(num_tokens, H, K),
+            "v": inputs["v"].view(num_tokens, HV, V),
+        }
+        ref_rings = rings()
+        ref_out = torch.empty(num_tokens, HV, V, device=DEVICE)
+        gdn_replayssm_spec_decode(
+            a=inputs["a"],
+            b=inputs["b"],
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"],
+            checkpoint_state=state,
+            rawv_cache=ref_rings["d_residual_cache"],
+            rawk_cache=ref_rings["k_residual_cache"],
+            beta_cache=None,
+            d_cache=ref_rings["d_cache"],
+            k_cache=ref_rings["k_cache"],
+            g_cache=ref_rings["g_cache"],
+            out=ref_out,
+            query_start_loc=torch.arange(
+                0, num_tokens + 1, num_nodes, dtype=torch.int32, device=DEVICE
+            ),
+            ssm_state_indices=slots,
+            replay_indices=rows,
+            write_pos=torch.zeros(num_rows, dtype=torch.int32, device=DEVICE),
+            cache_base=cache_base,
+            is_flush=torch.zeros(num_rows, dtype=torch.int8, device=DEVICE),
+            max_cache_len=ring_len,
+            max_spec_len=num_nodes,
+            null_block_id=-1,
+            launch_mode="verify",
+            **flat,
+        )
+        wy_rings = rings()
+        out = gdn_chain_wy_verify(
+            A_log=inputs["A_log"],
+            dt_bias=inputs["dt_bias"],
+            a=inputs["a"],
+            b=inputs["b"],
+            checkpoint_state=state,
+            ssm_state_indices=slots,
+            replay_indices=rows,
+            cache_base=cache_base,
+            num_draft_tokens=num_nodes,
+            **wy_rings,
+            **flat,
+        )
+
+        real = slice(0, 2 * num_nodes)
+        ref = _fp64_path_replay(
+            inputs,
+            state,
+            slots,
+            [list(range(-1, num_nodes - 1))] * batch_size,
+            num_nodes,
+        )
+        error = (out[0, real].double() - ref[0, real]).abs().max() / ref.abs().max()
+        self.assertLess(error.item(), MAX_RELATIVE_ERROR)
+        for hi, low in (
+            ("d_cache", "d_residual_cache"),
+            ("k_cache", "k_residual_cache"),
+        ):
+            want = ref_rings[hi].float() + ref_rings[low].float()
+            got = wy_rings[hi].float() + wy_rings[low].float()
+            error = (got - want).abs().max() / want.abs().max()
+            self.assertLess(error.item(), MAX_RECORD_DIFFERENCE, hi)
+        self.assertTrue(
+            torch.allclose(wy_rings["g_cache"], ref_rings["g_cache"], rtol=1e-6, atol=0)
+        )
 
 
 if __name__ == "__main__":
