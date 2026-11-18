@@ -72,6 +72,7 @@ from sglang.srt.speculative.dflash_tree_verify import (
     propose_dflash_sampled_tree,
     propose_dflash_tree,
     read_accept_prior_setting,
+    read_tree_verify_window,
     verify_dflash_tree,
 )
 from sglang.srt.speculative.dflash_adaptive_width import (
@@ -2507,12 +2508,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head,
         positions_2d: torch.Tensor,
         iteration_ids: IterationIds,
+        verify_window: torch.Tensor,
         on_publish,
         host_seq_lens_bound: torch.Tensor | None,
         host_seq_lens_bound_sum: int | None,
     ) -> GenerationBatchResult:
         """Build a tree from the selector lattice, verify it, then feed the accepted
-        path's target features to the drafter like the chain path does."""
+        path's target features to the drafter like the chain path does.
+        ``verify_window`` is ``[bs, tree_num_nodes]``, each request's KV slots from
+        its committed length, read at the start of the step."""
         if self.draft_model.lm_head is None:
             self.draft_model.lm_head = lm_head
         draft_hidden = draft_logits_output.hidden_states
@@ -2613,6 +2617,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             topk=self.tree_topk,
             depth=tree_depth(proposal, width, topk=self.tree_topk),
             num_nodes=width,
+            out_cache_loc=verify_window[:, :width].reshape(-1),
             device=self.device,
             node_draft_tokens=node_draft_tokens,
             node_draft_probs=node_draft_probs,
@@ -2936,6 +2941,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
+        tree_verify_window = None
+        if self.tree_mode:
+            tree_verify_window = read_tree_verify_window(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                seq_lens=prefix_lens,
+                num_nodes=self.tree_num_nodes,
+            )
+
         if self._full_embed_gpu is not None:
             # A borrowed embedding may use target-wide collectives, while
             # other DP replicas are idle or looking up different token IDs.
@@ -3067,6 +3081,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 lm_head=lm_head,
                 positions_2d=positions_2d,
                 iteration_ids=iteration_ids,
+                verify_window=tree_verify_window,
                 on_publish=on_publish,
                 host_seq_lens_bound=draft_input.nxt_kv_lens_cpu,
                 host_seq_lens_bound_sum=draft_input.nxt_kv_lens_sum,

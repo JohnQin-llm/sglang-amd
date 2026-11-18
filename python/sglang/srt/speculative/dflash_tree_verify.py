@@ -17,6 +17,9 @@ from typing import Any
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs_uniform_func,
+)
 from sglang.kernels.ops.speculative.dflash_tree import (
     DFlashTreeProposal,
     build_dflash_greedy_tree_proposal,
@@ -263,6 +266,28 @@ _SCORE_TEMP = float(os.environ.get("SGLANG_DFLASH_TREE_SCORE_TEMP") or 1.0)
 _Q_TEMP = float(os.environ.get("SGLANG_DFLASH_TREE_Q_TEMP") or 1.0)
 
 
+def read_tree_verify_window(
+    *,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_nodes: int,
+) -> torch.Tensor:
+    """``[bs, num_nodes]``: each request's KV slots from its committed length, the
+    tree verify's write window. Read it when the step starts, as the chain reads its
+    block: without a WAR barrier (HIP) the scheduler can hand a finished request's row
+    to a new request, with its cached prefix, before this step's verify runs."""
+    bs = req_pool_indices.shape[0]
+    return assign_extend_cache_locs_uniform_func(
+        req_pool_indices=req_pool_indices,
+        req_to_token=req_to_token,
+        start_offset=seq_lens,
+        batch_size=bs,
+        draft_token_num=num_nodes,
+        device=req_to_token.device,
+    ).view(bs, num_nodes)
+
+
 def verify_dflash_tree(
     *,
     batch: ScheduleBatch,
@@ -274,6 +299,7 @@ def verify_dflash_tree(
     topk: int,
     depth: int,
     num_nodes: int,
+    out_cache_loc: torch.Tensor,
     device: str,
     node_draft_tokens: torch.Tensor | None = None,
     node_draft_probs: torch.Tensor | None = None,
@@ -284,6 +310,8 @@ def verify_dflash_tree(
 ) -> GenerationBatchResult:
     """Verify the tree rooted at each request's bonus token, which sits at the committed
     length and has no KV yet, so the verify batch keeps ``batch.seq_lens`` as is.
+    ``out_cache_loc`` is the nodes' KV slots, ``num_nodes`` per request, from
+    ``read_tree_verify_window`` at the start of the step.
     With ``node_draft_*`` set (a sampled tree), sampling rows verify by recursive
     rejection sampling against each node's q. ``target_logits`` is the target's
     LogitsProcessor when it defers the verify vocab gather (see ``run_eagle_verify``)."""
@@ -307,12 +335,12 @@ def verify_dflash_tree(
         tree_mask_mode=default_tree_mask_mode(),
         device=device,
     )
-    if node_draft_probs is not None:
-        verify_input = dataclasses.replace(
-            verify_input,
-            tree_draft_tokens=node_draft_tokens,
-            tree_draft_probs=node_draft_probs,
-        )
+    verify_input = dataclasses.replace(
+        verify_input,
+        prepared_out_cache_loc=out_cache_loc,
+        tree_draft_tokens=node_draft_tokens,
+        tree_draft_probs=node_draft_probs,
+    )
     verify_batch.spec_info = verify_input
     model_runner = target_worker.model_runner
     return run_eagle_verify(

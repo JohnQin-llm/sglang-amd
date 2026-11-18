@@ -2,18 +2,31 @@
 
 import math
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sglang.kernels.ops.speculative.dflash_tree import (
     build_dflash_sampled_tree_proposal,
+    log_draw_priors,
 )
 from sglang.kernels.ops.speculative.traversal_verify import (
     tree_speculative_sampling_traversal,
     tree_speculative_sampling_traversal_reference,
 )
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dflash_tree_verify import (
+    ONLINE_PRIOR_START,
+    propose_dflash_sampled_tree,
+)
+from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    _seeded_verify_coins,
+    build_tree_kernel_efficient,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -180,6 +193,136 @@ def test_sampled_tree_traversal_commits_the_target(chain, max_nodes):
     first_freq = freq.view(vocab, vocab).sum(-1)
     first_sigma = (root_target * (1 - root_target) / rows).sqrt().double()
     assert ((first_freq - root_target.double()).abs() / first_sigma).max().item() < 5
+
+
+def _truncated(logits, temperature, top_k, top_p):
+    """The T>0 target in float64: softmax at ``temperature``, top-k, then top-p."""
+    probs = torch.softmax(logits.double() / temperature, dim=-1)
+    sorted_probs, order = probs.sort(descending=True)
+    sorted_probs[top_k:] = 0
+    sorted_probs /= sorted_probs.sum()
+    before = sorted_probs.cumsum(0) - sorted_probs
+    kept = before[sorted_probs > 0]
+    # No kept token sits at the top-p edge, where float32 could flip it.
+    assert ((kept - top_p).abs() > 1e-3).all()
+    sorted_probs[before > top_p] = 0
+    return torch.zeros_like(probs).scatter(0, order, sorted_probs / sorted_probs.sum())
+
+
+@pytest.fixture
+def runtime_context():
+    """The served top-p renorm reads the published exec config."""
+    publish(ServerArgs(model_path="dummy"), role="test")
+    try:
+        yield
+    finally:
+        reset_context()
+
+
+def test_served_tree_rows_commit_each_requests_truncated_target(runtime_context):
+    """Served T>0 tree verify: a request's tree is drawn from the selector q at its
+    temperature with the online draw prior, its tree rows take its temperature, top-k
+    and top-p, and Traversal Verification with seeded coins commits exactly that
+    truncated target. Three settings in one batch catch rows taking another request's
+    settings."""
+    settings = [(1.0, 5, 0.8), (0.7, 8, 0.9), (1.3, 3, 1.0)]  # T, top-k, top-p
+    per_setting, num_depths, k, max_nodes = 60000, 3, 4, 6
+    rows = per_setting * len(settings)
+    vocab = num_depths * k
+    gen = torch.Generator().manual_seed(21)
+    # Bigram target favoring the next depth's candidates; row ``vocab`` is the root's.
+    favored = torch.zeros(vocab + 1, vocab)
+    for prev in range(vocab + 1):
+        depth = 0 if prev == vocab else min(prev // k + 1, num_depths - 1)
+        favored[prev, depth * k : (depth + 1) * k] = 3.0
+    next_logits = torch.randn(vocab + 1, vocab, generator=gen) * 1.5 + favored
+    scores = torch.randn(num_depths, k, k, generator=gen) * 2.0
+    scores[0] = scores[0, :1]
+    temperatures = torch.tensor([t for t, _, _ in settings]).repeat_interleave(
+        per_setting
+    )
+    top_ks = torch.tensor([c for _, c, _ in settings]).repeat_interleave(per_setting)
+    top_ps = torch.tensor([p for _, _, p in settings]).repeat_interleave(per_setting)
+
+    candidate_ids = torch.arange(vocab).view(1, num_depths, k).repeat(rows, 1, 1)
+    proposal, node_tokens, node_probs = propose_dflash_sampled_tree(
+        candidate_ids=candidate_ids.cuda(),
+        scores=scores.repeat(rows, 1, 1, 1).cuda(),
+        temperatures=temperatures.cuda(),
+        topk=k,
+        num_nodes=max_nodes,
+        workspace={},
+        accept_prior=torch.tensor(log_draw_priors(ONLINE_PRIOR_START)).cuda(),
+    )
+    seq_lens = torch.full((rows,), 10, dtype=torch.long, device="cuda")
+    _, _, retrive_index, next_token, next_sibling, tokens = build_tree_kernel_efficient(
+        bonus_tokens=torch.zeros(rows, dtype=torch.long, device="cuda"),
+        parent_list=proposal.parent_list,
+        top_scores_index=proposal.top_scores_index,
+        draft_tokens=proposal.draft_tokens,
+        seq_lens=seq_lens,
+        seq_lens_sum=int(seq_lens.sum()),
+        topk=k,
+        spec_steps=num_depths,
+        num_verify_tokens=max_nodes,
+        tree_mask_mode=TreeMaskMode.FULL_MASK,
+    )
+    tree = dict(
+        candidates=tokens.view(rows, max_nodes),
+        retrive_index=retrive_index.view(rows, max_nodes),
+        retrive_next_token=next_token.view(rows, max_nodes),
+        retrive_next_sibling=next_sibling.view(rows, max_nodes),
+        node_draft_tokens=node_tokens,
+        node_draft_probs=node_probs,
+    )
+    # The target after a node depends on the node's token; the root row on the root's.
+    logits = next_logits.cuda()[tree["candidates"]]
+    logits[:, 0] = next_logits[vocab].cuda()
+    target_probs = build_speculative_verify_target_probs(
+        next_token_logits=logits.view(rows * max_nodes, vocab),
+        sampling_info=SimpleNamespace(
+            temperatures=temperatures.view(-1, 1).cuda(),
+            top_ks=top_ks.to(torch.int32).cuda(),
+            top_ps=top_ps.cuda(),
+            need_top_k_sampling=True,
+            need_top_p_sampling=True,
+        ),
+        draft_token_num=max_nodes,
+        bs=rows,
+        max_top_k=max(c for _, c, _ in settings),
+    )
+    coins, final_coins = _seeded_verify_coins(
+        sampling_seed=torch.arange(rows, device="cuda") * 7919 + 3,
+        seq_lens=seq_lens,
+        draft_token_num=max_nodes,
+        device="cuda",
+    )
+    predicts, accept_index, accept_num, _ = _verify(
+        tree_speculative_sampling_traversal,
+        tree,
+        target_probs=target_probs,
+        coins=coins,
+        final_coins=final_coins,
+        num_depths=num_depths,
+    )
+    first, second = _committed(predicts, accept_index, accept_num, 2).cpu().unbind(-1)
+    assert (accept_num >= 2).float().mean() > 0.05
+    for index, (temperature, top_k, top_p) in enumerate(settings):
+        mine = slice(index * per_setting, (index + 1) * per_setting)
+        root = _truncated(next_logits[vocab], temperature, top_k, top_p)
+        after = torch.stack(
+            [_truncated(row, temperature, top_k, top_p) for row in next_logits[:vocab]]
+        )
+        # A round that commits one token is extended by a target draw.
+        extension = torch.multinomial(after[first[mine]].float(), 1, generator=gen)
+        pair = torch.where(second[mine] >= 0, second[mine], extension.squeeze(-1))
+        joint = torch.bincount(first[mine] * vocab + pair, minlength=vocab * vocab)
+        freq = joint.double() / per_setting
+        expected = (root[:, None] * after).flatten()
+        sigma = (expected * (1 - expected) / per_setting).sqrt().clamp(min=1e-12)
+        # Tokens outside a request's top-k / top-p are never committed.
+        assert freq[expected == 0].sum().item() == 0
+        assert ((freq - expected).abs() / sigma).max().item() < 5
 
 
 def _block_verification(target, draft, tokens, coins, final_coins):
