@@ -14,6 +14,8 @@ def speculative_sampling_classic_kernel(
     UniformSamplesFinal,
     TargetProbs,
     DraftProbs,
+    VerifyLens,
+    TargetRowStarts,
     # Strides
     stride_cand_b,
     stride_cand_s,
@@ -36,6 +38,16 @@ def speculative_sampling_classic_kernel(
 ):
     pid = tl.program_id(0)
     cur_prob_row = 0
+    # A ragged chain verifies its first num_slots - 1 drafts, with its target rows
+    # packed from TargetRowStarts[pid]; otherwise every request has NUM_SLOTS rows.
+    if VerifyLens is None:
+        num_slots = NUM_SLOTS
+        tp_req_base = TargetProbs + pid * stride_tp_b
+    else:
+        num_slots = tl.load(VerifyLens + pid)
+        tp_req_base = (
+            TargetProbs + tl.load(TargetRowStarts + pid).to(tl.int64) * stride_tp_s
+        )
 
     cand_ptr_base = Candidates + pid * stride_cand_b
     idx_ptr_base = RetriveIndex + pid * stride_idx_b
@@ -56,11 +68,11 @@ def speculative_sampling_classic_kernel(
         prefix_probs = ()
         for step in tl.static_range(1, NUM_SLOTS):
             draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
+            in_chain = step < num_slots
             p = tl.load(
-                TargetProbs
-                + pid * stride_tp_b
-                + (step - 1) * stride_tp_s
-                + draft_token * stride_tp_v
+                tp_req_base + (step - 1) * stride_tp_s + draft_token * stride_tp_v,
+                mask=in_chain,
+                other=0.0,
             )
             q = tl.load(
                 DraftProbs
@@ -68,7 +80,7 @@ def speculative_sampling_classic_kernel(
                 + (step - 1) * stride_dp_s
                 + draft_token * stride_dp_v
             )
-            q_is_prob = (q > 0.0) & (q <= 1.0)
+            q_is_prob = (q > 0.0) & (q <= 1.0) & in_chain
             prefix_prob = tl.where(q_is_prob, tl.minimum(prefix_prob * p / q, 1.0), 0.0)
             prefix_probs += (prefix_prob,)
 
@@ -81,7 +93,7 @@ def speculative_sampling_classic_kernel(
                     accept_prob = prefix_prob
                     residual_mass = -1.0
                     if (
-                        (step < NUM_SLOTS - 1)
+                        (step < num_slots - 1)
                         & (prefix_prob > 0.0)
                         & (prefix_prob < 1.0)
                     ):
@@ -90,8 +102,7 @@ def speculative_sampling_classic_kernel(
                             v_offsets = v_start + tl.arange(0, BLOCK_REDUCE)
                             mask = v_offsets < VOCAB_SIZE
                             p_next = tl.load(
-                                TargetProbs
-                                + pid * stride_tp_b
+                                tp_req_base
                                 + step * stride_tp_s
                                 + v_offsets * stride_tp_v,
                                 mask=mask,
@@ -129,13 +140,10 @@ def speculative_sampling_classic_kernel(
         step = 1
         continue_verifying = 1
         # At each token-verification loop entry, cur_prob_row == num_accept == step - 1.
-        while (step < NUM_SLOTS) and (continue_verifying == 1):
+        while (step < num_slots) and (continue_verifying == 1):
             draft_token = tl.load(cand_ptr_base + step * stride_cand_s)
             p = tl.load(
-                TargetProbs
-                + pid * stride_tp_b
-                + cur_prob_row * stride_tp_s
-                + draft_token * stride_tp_v
+                tp_req_base + cur_prob_row * stride_tp_s + draft_token * stride_tp_v
             )
             q = tl.load(
                 DraftProbs
@@ -162,10 +170,10 @@ def speculative_sampling_classic_kernel(
     tl.store(AcceptTokenNum + pid, num_accept)
 
     # Final Sampling
-    all_drafts_accepted = num_accept == NUM_SLOTS - 1
+    all_drafts_accepted = num_accept == num_slots - 1
     coin_final = tl.load(UniformSamplesFinal + pid)
 
-    tp_base_ptr = TargetProbs + (pid * stride_tp_b) + (cur_prob_row * stride_tp_s)
+    tp_base_ptr = tp_req_base + cur_prob_row * stride_tp_s
     # DraftProbs has only num_steps rows (TargetProbs has num_steps + 1). When
     # all drafts are accepted cur_prob_row == num_steps is out of bounds for
     # DraftProbs, but the all-accepted branch samples pure target p and never
@@ -256,9 +264,19 @@ def chain_speculative_sampling_triton(
     deterministic,  # not used
     *,
     block_verification: bool = False,
+    verify_lens=None,
+    target_row_starts=None,
 ):
+    """verify_lens ([batch] int32, 1..num_slots) verifies each request's first
+    verify_lens - 1 drafts; target_probs is then [rows, vocab], request i's rows
+    starting at target_row_starts[i]."""
     batch_size, num_slots = candidates.shape
     vocab_size = target_probs.shape[-1]
+    if verify_lens is None:
+        tp_strides = target_probs.stride()
+    else:
+        assert target_probs.dim() == 2 and target_row_starts is not None
+        tp_strides = (0, target_probs.stride(0), target_probs.stride(1))
     # Keep CDF tiles small, and cap multi-tile reductions to avoid register spills.
     block_reduce = min(triton.next_power_of_2(vocab_size), 32768)
     num_warps = 8 if block_verification and block_reduce > 4096 else 4
@@ -274,15 +292,15 @@ def chain_speculative_sampling_triton(
         uniform_samples_for_final_sampling,
         target_probs,
         draft_probs,
+        verify_lens,
+        target_row_starts,
         candidates.stride(0),
         candidates.stride(1),
         retrive_index.stride(0),
         retrive_index.stride(1),
         uniform_samples.stride(0),
         uniform_samples.stride(1),
-        target_probs.stride(0),
-        target_probs.stride(1),
-        target_probs.stride(2),
+        *tp_strides,
         draft_probs.stride(0),
         draft_probs.stride(1),
         draft_probs.stride(2),

@@ -323,6 +323,71 @@ def selector_walk_triton(
 
 
 @triton.jit
+def _selector_collision_mass_kernel(
+    scores_ptr,
+    temperatures_ptr,
+    out_ptr,
+    slots: tl.constexpr,
+    top_k: tl.constexpr,
+):
+    """One program per request: the sum over depths of the chance that two
+    independent selector walks agree on the whole path to that depth."""
+    row = tl.program_id(0)
+    previous = tl.arange(0, top_k)
+    candidate = tl.arange(0, top_k)
+    temperature = tl.load(temperatures_ptr + row)
+    base = scores_ptr + row * slots * top_k * top_k
+    # Slot 0 follows the anchor, the lattice's row 0.
+    first = tl.load(base + candidate).to(tl.float32) / temperature
+    first = tl.exp(first - tl.max(first, axis=0))
+    first = first / tl.sum(first, axis=0)
+    agree = first * first
+    mass = tl.sum(agree, axis=0)
+    for slot in range(1, slots):
+        scaled = (
+            tl.load(
+                base
+                + slot * top_k * top_k
+                + previous[:, None] * top_k
+                + candidate[None, :]
+            ).to(tl.float32)
+            / temperature
+        )
+        exponentials = tl.exp(scaled - tl.max(scaled, axis=1)[:, None])
+        probabilities = exponentials / tl.sum(exponentials, axis=1)[:, None]
+        agree = tl.sum(agree[:, None] * probabilities * probabilities, axis=0)
+        mass += tl.sum(agree, axis=0)
+    tl.store(out_ptr + row, mass)
+
+
+def selector_collision_mass(*, scores, temperatures, out=None):
+    """Self-collision path mass of a selector lattice ``scores`` ([bs, slots, K, K]:
+    slot, previous candidate, candidate) at ``temperatures`` ([bs]): sum over
+    depths d of sum over paths of q(path to d)^2, from the lattice alone."""
+    batch, slots, top_k, _ = scores.shape
+    if out is None:
+        out = torch.empty((batch,), dtype=torch.float32, device=scores.device)
+    if not scores.is_cuda:
+        q = torch.softmax(scores.float() / temperatures.view(-1, 1, 1, 1), dim=-1)
+        squares = q * q
+        agree = squares[:, 0, 0]
+        mass = agree.sum(-1)
+        for slot in range(1, slots):
+            agree = torch.einsum("bp,bpc->bc", agree, squares[:, slot])
+            mass = mass + agree.sum(-1)
+        return out.copy_(mass)
+    _selector_collision_mass_kernel[(batch,)](
+        scores.contiguous(),
+        temperatures.contiguous(),
+        out,
+        slots=slots,
+        top_k=top_k,
+        num_warps=1,
+    )
+    return out
+
+
+@triton.jit
 def _fused_correct_drafts_and_bonus_kernel(
     candidates_ptr,
     target_predict_ptr,

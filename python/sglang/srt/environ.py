@@ -1708,6 +1708,9 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # JSON table that turns on ragged per-request DFLASH chain verify lengths
+    # (speculative/dflash_ragged_chain.py); unset keeps one block per request.
+    SGLANG_DFLASH_RAGGED_CHAIN_TABLE = EnvStr(None)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

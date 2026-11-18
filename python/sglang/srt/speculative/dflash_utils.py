@@ -1129,20 +1129,25 @@ def build_speculative_verify_target_probs(
     max_top_k: Optional[int] = None,
     uniform_top_k_value: Optional[int] = None,
     use_sparse_topk: bool = True,
+    row_requests: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """[bs, draft_token_num, vocab] target probabilities, or [rows, vocab] for
+    packed rows whose requests are ``row_requests``."""
     device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
-    expanded_temperature = torch.repeat_interleave(
-        sampling_info.temperatures, draft_token_num, dim=0
-    )
+
+    def per_row(values: torch.Tensor) -> torch.Tensor:
+        if row_requests is not None:
+            return values.index_select(0, row_requests)
+        return torch.repeat_interleave(values, draft_token_num, dim=0)
+
+    expanded_temperature = per_row(sampling_info.temperatures)
     scaled_logits = next_token_logits / expanded_temperature
     sparse_topk_applied = False
 
     if use_sparse_topk and need_top_k:
-        repeated_top_ks = torch.repeat_interleave(
-            sampling_info.top_ks, draft_token_num, dim=0
-        ).to(dtype=torch.int64)
+        repeated_top_ks = per_row(sampling_info.top_ks).to(dtype=torch.int64)
         vocab_size = int(scaled_logits.shape[-1])
         repeated_top_ks.clamp_(min=1, max=vocab_size)
         if max_top_k is None:
@@ -1166,9 +1171,7 @@ def build_speculative_verify_target_probs(
 
             topk_probs = F.softmax(topk_logits, dim=-1)
             if need_top_p:
-                repeated_top_ps = torch.repeat_interleave(
-                    sampling_info.top_ps, draft_token_num, dim=0
-                )
+                repeated_top_ps = per_row(sampling_info.top_ps)
                 topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
@@ -1179,14 +1182,14 @@ def build_speculative_verify_target_probs(
         target_probs = F.softmax(scaled_logits, dim=-1)
         if need_top_k:
             target_probs = _dflash_top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+                target_probs, per_row(sampling_info.top_ks)
             )
         if need_top_p:
             target_probs = _dflash_top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+                target_probs, per_row(sampling_info.top_ps)
             )
+    if row_requests is not None:
+        return target_probs.contiguous()
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 

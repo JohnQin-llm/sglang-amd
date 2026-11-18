@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
     compute_dflash_correct_drafts_and_bonus,
+    selector_collision_mass,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
@@ -72,6 +73,13 @@ from sglang.srt.speculative.dflash_tree_verify import (
     propose_dflash_tree,
     read_accept_prior_setting,
     verify_dflash_tree,
+)
+from sglang.srt.speculative.dflash_ragged_chain import (
+    RaggedChainRows,
+    RaggedChainVerify,
+    accept_ragged_chain_sampling,
+    check_ragged_chain_batch,
+    unpack_greedy_rows,
 )
 from sglang.srt.speculative.dflash_adaptive_width import (
     AdaptiveVerifyWidth,
@@ -279,6 +287,11 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
+def _lattice_temperatures(temperatures, greedy_mask):
+    # Greedy rows read the lattice at temperature 1, as the ragged chain table does.
+    return torch.where(greedy_mask, 1.0, temperatures)
+
+
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     # Flattened to [N, H] and viewed back because the radix top-k kernel is 2D.
     bs, num_pred = pred_hidden.shape[0], pred_hidden.shape[1]
@@ -302,7 +315,14 @@ class _SelectorDraftSampler:
     """
 
     def __init__(
-        self, *, draft_model, block_size, max_bs, device, sampling_enabled: bool
+        self,
+        *,
+        draft_model,
+        block_size,
+        max_bs,
+        device,
+        sampling_enabled: bool,
+        collision_mass: bool = False,
     ):
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
@@ -320,6 +340,12 @@ class _SelectorDraftSampler:
         )
         self.q_out = torch.empty(
             (max_bs, gamma, top_k), dtype=torch.float32, device=device
+        )
+        # Ragged chain lengths read it after the replay; None when they are off.
+        self.collision_mass_out = (
+            torch.zeros((max_bs,), dtype=torch.float32, device=device)
+            if collision_mass
+            else None
         )
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
@@ -356,6 +382,14 @@ class _SelectorDraftSampler:
         self.out[: tokens.numel()].copy_(tokens.reshape(-1))
         self.candidate_out[:bs].copy_(candidate_ids)
         self.q_out[:bs].copy_(q_rows)
+        if self.collision_mass_out is not None:
+            selector_collision_mass(
+                scores=scores,
+                temperatures=_lattice_temperatures(
+                    self.temperatures[:bs], self.greedy_mask[:bs]
+                ),
+                out=self.collision_mass_out[:bs],
+            )
 
 
 class _DominoDraftSampler:
@@ -621,6 +655,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH Domino requires speculative_num_draft_tokens > 1, "
                 f"got {self.block_size}."
             )
+        self._ragged_chain: Optional[RaggedChainVerify] = None
+        self._collision_mass: Optional[torch.Tensor] = None
+        if not self.tree_mode:
+            self._ragged_chain = RaggedChainVerify.maybe_create(
+                block_size=int(self.block_size), device=torch.device(self.device)
+            )
+            if self._ragged_chain is not None and self.selector is None:
+                raise ValueError(
+                    "DFLASH ragged chain lengths need a DFlash 2 draft with a "
+                    "candidate selector."
+                )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -843,6 +888,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._warm_eager_selector()
         if self._adaptive_width is not None:
             self._adaptive_width.capture(self.target_worker.model_runner)
+        if self._ragged_chain is not None:
+            self._ragged_chain.capture(self.target_worker.model_runner)
 
     def _warm_eager_selector(self) -> None:
         # Build selector kernels before serving rather than under the watchdog.
@@ -1014,6 +1061,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
                 device=self.device,
                 sampling_enabled=self._selector_sampling_enabled,
+                collision_mass=self._ragged_chain is not None,
             )
         if self.lilicorr is not None:
             if not head_supported:
@@ -1606,6 +1654,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             temperatures=temperatures,
             greedy_mask=greedy_mask,
         )
+        if self._ragged_chain is not None:
+            self._collision_mass = selector_collision_mass(
+                scores=scores,
+                temperatures=_lattice_temperatures(temperatures, greedy_mask),
+            )
         if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
             self._selector_sample = (candidate_ids, q_rows)
         return tokens.view(bs, num_pred)
@@ -1619,6 +1672,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         q_rows: torch.Tensor,
         sampling_info,
         draft_input,
+        ragged_rows: Optional[RaggedChainRows] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
         bs, block = candidates.shape
@@ -1635,17 +1689,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_probs = buffer[:bs]
         try:
             draft_probs.scatter_(-1, candidate_ids, q_rows.float())
-            accept_len, bonus, _ = accept_sampling(
-                candidates=candidates,
-                target_logits=next_token_logits,
-                draft_probs=draft_probs,
-                sampling_info=sampling_info,
-                draft_input=draft_input,
-                gamma=gamma,
-                verify_num_draft_tokens=block,
-                cutoff_verify_lens=None,
-                block_verification=self._block_verification,
-            )
+            if ragged_rows is None:
+                accept_len, bonus, _ = accept_sampling(
+                    candidates=candidates,
+                    target_logits=next_token_logits,
+                    draft_probs=draft_probs,
+                    sampling_info=sampling_info,
+                    draft_input=draft_input,
+                    gamma=gamma,
+                    verify_num_draft_tokens=block,
+                    cutoff_verify_lens=None,
+                    block_verification=self._block_verification,
+                )
+            else:
+                accept_len, bonus = accept_ragged_chain_sampling(
+                    candidates=candidates,
+                    target_logits=next_token_logits,
+                    draft_probs=draft_probs,
+                    sampling_info=sampling_info,
+                    draft_input=draft_input,
+                    rows=ragged_rows,
+                    block_verification=self._block_verification,
+                )
         finally:
             # Here, not before the next write: candidate_ids may be a view of a
             # buffer the next draft step overwrites. In finally because the next
@@ -2297,6 +2362,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._new_seq_lens_bufs[slot][:bs],
         )
 
+    def _plan_ragged_chain(
+        self, *, batch: ScheduleBatch, bs: int, draft_ran_graph: bool
+    ) -> Optional[RaggedChainRows]:
+        """This step's verify rows per request, from the draft's collision mass, and
+        the target verify state for their total; None without ragged chains."""
+        if self._ragged_chain is None:
+            return None
+        check_ragged_chain_batch(
+            sampling_info=batch.sampling_info,
+            has_grammar=batch.has_grammar,
+            return_logprob=batch.return_logprob,
+        )
+        if draft_ran_graph and self._draft_sampler is not None:
+            collision_mass = self._draft_sampler.collision_mass_out[:bs]
+        else:
+            collision_mass = self._collision_mass
+        rows = self._ragged_chain.plan(collision_mass=collision_mass)
+        self._ragged_chain.activate(
+            rows.rows_per_request, self.target_worker.model_runner
+        )
+        return rows
+
     def _accept_block(
         self,
         *,
@@ -2307,6 +2394,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         prefix_lens: torch.Tensor,
         bs: int,
         target_predict: Optional[torch.Tensor] = None,
+        ragged_rows: Optional[RaggedChainRows] = None,
     ):
         new_seq_lens = None
         if self._selector_sample is not None:
@@ -2318,12 +2406,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                 q_rows=selector_q_rows,
                 sampling_info=sampling_info,
                 draft_input=draft_input,
+                ragged_rows=ragged_rows,
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
-        elif target_predict is None and (
-            not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
+        elif (
+            target_predict is None
+            and ragged_rows is None
+            and (
+                not _is_all_greedy(sampling_info)
+                and is_dflash_sampling_verify_available()
+            )
         ):
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
@@ -2338,6 +2432,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         else:
             if target_predict is None:
                 target_predict = torch.argmax(next_token_logits, dim=-1)
+            if ragged_rows is not None:
+                candidates, target_predict = unpack_greedy_rows(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                    rows=ragged_rows,
+                )
             target_predict = target_predict.view(bs, int(self.block_size))
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             if self._use_triton_accept_bonus:
@@ -3180,14 +3280,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
+        ragged_rows = self._plan_ragged_chain(
+            batch=batch, bs=bs, draft_ran_graph=draft_out.can_run_graph
+        )
         verify_input_ids = draft_tokens.reshape(-1)
+        verify_positions = positions
+        if ragged_rows is not None:
+            verify_input_ids = verify_input_ids[ragged_rows.block_index]
+            verify_positions = positions[ragged_rows.block_index]
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
-            positions=positions,
-            draft_token_num=int(self.block_size),
+            positions=verify_positions,
+            draft_token_num=(
+                int(self.block_size)
+                if ragged_rows is None
+                else ragged_rows.rows_per_request
+            ),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             iteration_ids=iteration_ids,
+            iteration_cols=None if ragged_rows is None else ragged_rows.block_index,
+            ragged_chain_rows=ragged_rows,
         )
 
         batch.out_cache_loc = verify_out_cache_loc
@@ -3271,7 +3384,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 barrier=grammar_barrier,
             )
 
-        if sampling_info is not None and target_predict is None:
+        # A ragged batch has none to apply (check_ragged_chain_batch).
+        if sampling_info is not None and target_predict is None and ragged_rows is None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -3297,6 +3411,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             bs=bs,
             target_predict=target_predict,
+            ragged_rows=ragged_rows,
         )
         if self._phases is not None:
             self._phases.mark("accept")
@@ -3344,18 +3459,25 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
             )
-        hidden = hidden.view(bs, int(self.block_size), -1)
-
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         cache_loc = self._draft_write_ids(iteration_ids)
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=cache_loc,
-            cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
-            positions=positions,
-            commit_lens=commit_lens,
-        )
+        if ragged_rows is None:
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+                cache_loc=cache_loc,
+                cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
+                positions=positions,
+                commit_lens=commit_lens,
+            )
+        else:
+            # Every verified row is written; rows past a request's commit sit at
+            # positions its next draft block overwrites before any read.
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden,
+                cache_loc=cache_loc[ragged_rows.block_index],
+                positions=verify_positions,
+            )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
