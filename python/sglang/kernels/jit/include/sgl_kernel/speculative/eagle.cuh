@@ -32,6 +32,9 @@ typedef enum { FULL_MASK = 0, QLEN_ONLY = 1, QLEN_ONLY_BITPACKING = 2 } TreeMask
 // tree_mask [draft_token*(seq_len[0]+draft_token) | draft_token*(seq_len[1]+draft_token) | ..] =
 // [sum(verified_seq_len)*draft_token+bs*draft_token*draft_token] positions [bs * draft_token] retrive_index [b,
 // draft_token] retrive_next_token [b, draft_token] retrive_next_sibling [b, draft_token]
+// Most tree nodes build_tree_efficient takes (its block has one thread per node).
+constexpr int kMaxBuildTreeNodes = 1024;
+
 __global__ void build_tree_efficient(
     int64_t* parent_list,
     int64_t* selected_index,
@@ -45,12 +48,36 @@ __global__ void build_tree_efficient(
     int depth,
     int draft_token_num,
     int tree_mask_mode) {
+  // Node i's parent node (0 = the root; draft_token_num = not among the selected
+  // tokens, an invalid tree). Each thread searches for its own node's parent, in
+  // parallel: a serial search over every node by thread 0 took 59 us of a 16 ms
+  // decode step at 32 nodes (MI355X).
+  __shared__ int parent_node[kMaxBuildTreeNodes];
   int bid = blockIdx.x;
   int tid = threadIdx.x;
+  const int64_t* selected = selected_index + bid * (draft_token_num - 1);
+  const int64_t* parents = parent_list + bid * (topk * (depth - 1) + 1);
 
+  if (tid > 0 && tid < draft_token_num) {
+    int parent = 0;
+    int parent_tb_idx = selected[tid - 1] / topk;
+    if (parent_tb_idx > 0) {
+      int64_t parent_token_idx = parents[parent_tb_idx];
+      parent = draft_token_num;
+      for (int i = 0; i < draft_token_num - 1; ++i) {
+        if (selected[i] == parent_token_idx) {
+          parent = i + 1;
+          break;
+        }
+      }
+    }
+    parent_node[tid] = parent;
+  }
+  __syncthreads();
   if (tid >= draft_token_num) {
     return;
   }
+
   int seq_tree_idx = draft_token_num * draft_token_num * bid;
   for (int i = 0; i < bid; i++) {
     seq_tree_idx += verified_seq_len[i] * draft_token_num;
@@ -67,7 +94,6 @@ __global__ void build_tree_efficient(
     tree_mask[token_tree_idx + i] = false;
   }
 
-  int position = 0;
   if (tid == 0) {
     positions[bid * draft_token_num] = seq_len;
 
@@ -75,17 +101,7 @@ __global__ void build_tree_efficient(
     for (int i = draft_token_num - 1; i > 0; --i) {
       int current_token_idx = retrive_index_offset + i;
       retrive_index[bid * draft_token_num + i] = current_token_idx;
-      int parent_tb_idx = selected_index[bid * (draft_token_num - 1) + i - 1] / topk;
-      int parent_position = 0;
-      if (parent_tb_idx > 0) {
-        int parent_token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
-        for (; parent_position < draft_token_num; ++parent_position) {
-          if (selected_index[bid * (draft_token_num - 1) + parent_position] == parent_token_idx) {
-            ++parent_position;
-            break;
-          }
-        }
-      }
+      int parent_position = parent_node[i];
       if (parent_position == draft_token_num) {
         printf(
             "WARNING: invalid eagle tree!!! Detected a token with no parent token selected. "
@@ -103,21 +119,13 @@ __global__ void build_tree_efficient(
     }
     retrive_index[bid * draft_token_num] = bid * draft_token_num;
   } else {
-    int cur_position = tid - 1;
-    while (true) {
+    // Walk to the root, marking every ancestor visible.
+    int position = 0;
+    int node = tid;
+    while (node != 0 && node != draft_token_num) {
       position += 1;
-      tree_mask[token_tree_idx + cur_position] = true;
-      int parent_tb_idx = selected_index[bid * (draft_token_num - 1) + cur_position] / topk;
-      if (parent_tb_idx == 0) {
-        break;
-      }
-
-      int token_idx = parent_list[bid * (topk * (depth - 1) + 1) + parent_tb_idx];
-      for (cur_position = 0; cur_position < draft_token_num; ++cur_position) {
-        if (selected_index[bid * (draft_token_num - 1) + cur_position] == token_idx) {
-          break;
-        }
-      }
+      tree_mask[token_tree_idx + node - 1] = true;
+      node = parent_node[node];
     }
     positions[bid * draft_token_num + tid] = position + seq_len;
   }

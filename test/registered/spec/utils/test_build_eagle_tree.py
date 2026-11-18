@@ -314,6 +314,99 @@ class TestBuildEagleTree(unittest.TestCase):
             "Draft tokens tensor does not match expected values",
         )
 
+    def test_wide_trees_match_tree_definition(self):
+        """Wide trees (DFLASH best-first trees up to 64 nodes) against the tree's own
+        definition: node i's parent is the selected token its parent_list entry names;
+        its mask row is the root plus its ancestors and itself; its position adds its
+        depth; retrieve_next_token is a node's first child by index and
+        retrieve_next_sibling the next one. Every thread of the kernel resolves its own
+        node's parent; a mix-up between threads breaks the rows of the nodes involved."""
+        from sglang.kernels.ops.speculative.dflash_tree import tree_depth, tree_prefix
+        from sglang.srt.speculative.dflash_tree_verify import propose_dflash_tree
+        from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+
+        device = get_device()
+        topk, depths = 16, 15
+        torch.manual_seed(0)
+        for bs, max_nodes, num_nodes in (
+            (1, 32, 32),
+            (3, 32, 8),
+            (2, 64, 64),
+            (4, 64, 24),
+        ):
+            proposal = propose_dflash_tree(
+                candidate_ids=torch.randint(0, 1000, (bs, depths, topk), device=device),
+                scores=torch.randn(bs, depths, topk, topk, device=device) * 3,
+                topk=topk,
+                num_nodes=max_nodes,
+                workspace={},
+            )
+            tree = tree_prefix(proposal, num_nodes, topk=topk)
+            depth = tree_depth(proposal, num_nodes, topk=topk)
+            seq_lens = torch.randint(5, 50, (bs,), dtype=torch.int64, device=device)
+            for mode in (TreeMaskMode.QLEN_ONLY, TreeMaskMode.FULL_MASK):
+                tree_mask, positions, retrieve_index, next_token, next_sibling, _ = (
+                    build_tree_kernel_efficient(
+                        torch.zeros(bs, dtype=torch.int64, device=device),
+                        tree.parent_list,
+                        tree.top_scores_index,
+                        tree.draft_tokens,
+                        seq_lens,
+                        int(seq_lens.sum()),
+                        topk,
+                        depth,
+                        num_nodes,
+                        tree_mask_mode=mode,
+                    )
+                )
+                selected = tree.top_scores_index.tolist()
+                parent_lists = tree.parent_list.tolist()
+                offset = 0
+                for b, seq_len in enumerate(seq_lens.tolist()):
+                    parent = [0] * num_nodes
+                    for i in range(1, num_nodes):
+                        source = selected[b][i - 1] // topk
+                        if source > 0:
+                            parent[i] = selected[b].index(parent_lists[b][source]) + 1
+                    expect_mask = torch.zeros(num_nodes, num_nodes, dtype=torch.bool)
+                    expect_pos, expect_next, expect_sibling = (
+                        [],
+                        [-1] * num_nodes,
+                        [-1] * num_nodes,
+                    )
+                    for i in range(num_nodes):
+                        expect_mask[i, 0] = True
+                        node, level = i, 0
+                        while node != 0:
+                            expect_mask[i, node] = True
+                            node, level = parent[node], level + 1
+                        expect_pos.append(seq_len + level)
+                        children = [c for c in range(1, num_nodes) if parent[c] == i]
+                        if children:
+                            expect_next[i] = children[0]
+                        for c, later in zip(children, children[1:]):
+                            expect_sibling[c] = later
+                    if mode == TreeMaskMode.QLEN_ONLY:
+                        start = b * num_nodes * num_nodes
+                        rows = tree_mask[start : start + num_nodes * num_nodes]
+                        rows = rows.view(num_nodes, num_nodes)
+                    else:
+                        width = seq_len + num_nodes
+                        rows = tree_mask[offset : offset + num_nodes * width]
+                        rows = rows.view(num_nodes, width)[:, seq_len:]
+                        offset += num_nodes * width
+                    self.assertTrue(
+                        torch.equal(rows.cpu(), expect_mask), (bs, num_nodes, b)
+                    )
+                    span = slice(b * num_nodes, (b + 1) * num_nodes)
+                    self.assertEqual(positions[span].tolist(), expect_pos)
+                    self.assertEqual(
+                        retrieve_index[b].tolist(),
+                        list(range(b * num_nodes, (b + 1) * num_nodes)),
+                    )
+                    self.assertEqual(next_token[b].tolist(), expect_next)
+                    self.assertEqual(next_sibling[b].tolist(), expect_sibling)
+
     def test_skip_prefix_fill_preserves_tree_blocks(self):
         """fill_prefix_mask=False must leave every kernel-written cell intact.
 
