@@ -98,6 +98,7 @@ from sglang.srt.speculative.dflash_adaptive_width import (
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_join_trace import make_join_trace
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
@@ -524,6 +525,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.tree_mode = int(get_spec().speculative_eagle_topk or 1) > 1
         set_debug_rank(self._target_tp_rank)
         self._step_timer = make_step_timer()
+        self._join_trace = make_join_trace(self._target_tp_rank)
         self._phases = step_phases()
         self._adaptive_width: Optional[AdaptiveVerifyWidth] = None
         with (
@@ -2959,6 +2961,32 @@ class DFlashWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
+        trace = self._join_trace
+        if trace is not None and not batch.forward_mode.is_idle():
+            is_extend = batch.forward_mode.is_extend() or batch.is_extend_in_batch
+            trace.begin(
+                kind="extend" if is_extend else "decode",
+                bs=len(batch.seq_lens),
+                tokens=sum(batch.extend_lens) if is_extend else 0,
+                rids=tuple(req.rid for req in batch.reqs),
+            )
+        result = self._forward_batch_generation(
+            batch,
+            on_publish=on_publish,
+            grammar_barrier=grammar_barrier,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        if trace is not None:
+            trace.end()
+        return result
+
+    def _forward_batch_generation(
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors=None,
+    ) -> GenerationBatchResult:
         self._validate_phase1_sampling_support(batch)
         is_extend = batch.forward_mode.is_extend() or batch.is_extend_in_batch
         if self._step_timer is not None:
@@ -2978,6 +3006,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return_iteration_ids=True,
             )
             iteration_ids, batch_output.iteration_ids = batch_output.iteration_ids, None
+            if self._join_trace is not None:
+                self._join_trace.mark()
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,

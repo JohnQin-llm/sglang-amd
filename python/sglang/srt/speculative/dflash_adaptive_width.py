@@ -138,7 +138,8 @@ def _parse_members(value: str) -> tuple[int, ...]:
 class StepPhases:
     """Debug instrumentation: GPU time between named marks of each decode step, from
     timing events on the current stream, one JSON line per step (``{"bs": n, "<mark>":
-    ms since the previous mark}``), written with one host sync every 64 steps."""
+    ms since the previous mark, "cpu": {"<mark>": host ms since the previous mark}}``),
+    written with one host sync every 64 steps."""
 
     def __init__(self, path: str):
         self._file = open(path, "a", buffering=1)
@@ -154,7 +155,7 @@ class StepPhases:
             return
         event = torch.cuda.Event(enable_timing=True)
         event.record()
-        self._current[1].append((name, event))
+        self._current[1].append((name, event, time.perf_counter()))
 
     def end(self) -> None:
         if self._current is None:
@@ -166,9 +167,11 @@ class StepPhases:
             return
         self._done[-1][1][-1][1].synchronize()
         for bs, marks in self._done:
-            line = {"bs": bs}
-            for (_, prev), (name, event) in zip(marks, marks[1:]):
+            line, cpu = {"bs": bs}, {}
+            for (_, prev, prev_t), (name, event, t) in zip(marks, marks[1:]):
                 line[name] = round(prev.elapsed_time(event), 4)
+                cpu[name] = round((t - prev_t) * 1e3, 4)
+            line["cpu"] = cpu
             self._file.write(json.dumps(line) + "\n")
         self._done = []
 

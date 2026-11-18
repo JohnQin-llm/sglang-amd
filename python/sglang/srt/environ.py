@@ -1721,6 +1721,8 @@ class Envs:
     # Path log q threshold of T>0 DFLASH sampled trees ("-6", or "1:-8,16:-6" by batch
     # size): each node draws from q truncated to the paths that clear it (lossless).
     SGLANG_DFLASH_TREE_Q_THRESHOLD = EnvStr(None)
+    # Debug: file for the DFLASH forward-call CPU/GPU timeline (dflash_join_trace.py).
+    SGLANG_DFLASH_JOIN_TRACE = EnvStr(None)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

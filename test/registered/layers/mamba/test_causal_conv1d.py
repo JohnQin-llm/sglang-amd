@@ -596,6 +596,94 @@ def test_causal_conv1d_update_dedup_window_matches_per_token(
     torch.testing.assert_close(out_tile[real], out_ref[real], rtol=rtol, atol=atol)
 
 
+# 300 channels take the all-tokens path up to 32 tokens, 14000 (over 640 programs) the
+# token walk.
+@pytest.mark.parametrize("dim", [300, 14000])
+@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("num_nodes", [8, 32, 64])
+def test_causal_conv1d_update_tree_follows_ancestors(num_nodes, width, dim):
+    """Tree verify: token t convolves with its nearest width - 1 ancestors, and above
+    the root with the newest conv-state columns. The parents come from the
+    first-child / next-sibling links (DFLASH best-first trees: runs of up to 16
+    siblings), every token's window holds those inputs, and the parents are
+    written for the GDN verify. A wrong parent or ancestor shows up only in the
+    rows of the tokens below it."""
+    from sglang.kernels.ops.speculative.dflash_tree import tree_depth, tree_prefix
+    from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+    from sglang.srt.speculative.dflash_tree_verify import propose_dflash_tree
+    from sglang.srt.speculative.eagle_utils import build_tree_kernel_efficient
+
+    device = get_device()
+    torch.manual_seed(0)
+    batch, num_slots, topk, depths = 3, 8, 16, 15
+    proposal = propose_dflash_tree(
+        candidate_ids=torch.randint(0, 1000, (batch, depths, topk), device=device),
+        scores=torch.randn(batch, depths, topk, topk, device=device) * 3,
+        topk=topk,
+        num_nodes=max(num_nodes, 32),
+        workspace={},
+    )
+    tree = tree_prefix(proposal, num_nodes, topk=topk)
+    seq_lens = torch.full((batch,), 10, dtype=torch.int64, device=device)
+    _, _, _, next_token, next_sibling, _ = build_tree_kernel_efficient(
+        torch.zeros(batch, dtype=torch.int64, device=device),
+        tree.parent_list,
+        tree.top_scores_index,
+        tree.draft_tokens,
+        seq_lens,
+        int(seq_lens.sum()),
+        topk,
+        tree_depth(proposal, num_nodes, topk=topk),
+        num_nodes,
+        tree_mask_mode=TreeMaskMode.QLEN_ONLY,
+    )
+    x = torch.randn(batch, num_nodes, dim, device=device).transpose(1, 2)
+    weight = torch.randn(dim, width, device=device)
+    bias = torch.randn(dim, device=device)
+    conv_state = torch.randn(num_slots, dim, width - 1, device=device)
+    slots = torch.randperm(num_slots, device=device)[: 2 * batch].to(torch.int32)
+    window = torch.zeros(num_slots, num_nodes, dim, width - 1, device=device)
+    parents = torch.full_like(next_token, -7)
+    state = conv_state.clone()
+    out = causal_conv1d_update(
+        x,
+        state,
+        weight,
+        bias,
+        activation="silu",
+        conv_state_indices=slots[:batch],
+        intermediate_conv_window=window,
+        intermediate_state_indices=slots[batch:],
+        retrieve_next_token=next_token,
+        retrieve_next_sibling=next_sibling,
+        retrieve_parent_token=parents,
+    )
+
+    for b in range(batch):
+        nxt, sib = next_token[b].tolist(), next_sibling[b].tolist()
+        parent = [0] * num_nodes
+        for t in range(num_nodes):
+            child = nxt[t]
+            while child != -1:
+                parent[child] = t
+                child = sib[child]
+        assert parents[b].tolist() == parent
+        prior = conv_state[slots[b].long()]
+        for t in range(num_nodes):
+            path, node = [], t
+            for _ in range(width):
+                path.append(node)
+                node = parent[node] if node > 0 else node - 1
+            inputs = torch.stack(
+                [x[b, :, n] if n >= 0 else prior[:, width - 1 + n] for n in path], -1
+            )
+            # Window slot width - 2 holds the token itself, the slot below its parent.
+            saved = window[slots[batch + b].long(), t]
+            assert torch.equal(saved, inputs[:, : width - 1].flip(-1))
+            expect = F.silu(bias + (inputs * weight.flip(-1)).sum(-1))
+            torch.testing.assert_close(out[b, :, t], expect, rtol=1e-4, atol=1e-4)
+
+
 if __name__ == "__main__":
     import sys
 
