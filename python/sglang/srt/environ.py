@@ -1837,6 +1837,9 @@ class Envs:
     # Sequences a captured GDN extend bucket accepts (at most the request pool); a
     # larger prefill batch runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # Experimental: verify GDN draft trees (--enable-linear-replayssm-spec with a
+    # tree) with the chunked tree kernel (gdn_tree_wy_verify.py), not per-path replay.
+    SGLANG_ENABLE_GDN_TREE_WY_VERIFY = EnvBool(False)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls
