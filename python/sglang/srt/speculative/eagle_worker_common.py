@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.eagle import (
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.speculative.dflash_adaptive_width import step_phases
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -684,12 +685,17 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
+    phases = step_phases()
+    if phases is not None:
+        phases.mark("tree_prep")
     forward_batch_output = target_worker.forward_batch_generation(
         batch=None,
         forward_batch=verify_forward_batch,
         is_verify=True,
         pp_proxy_tensors=pp_proxy_tensors,
     )
+    if phases is not None:
+        phases.mark("target")
     logits_output = forward_batch_output.logits_output
     target_argmax = _finish_deferred_verify_logits(
         logits_output,
@@ -781,6 +787,8 @@ def run_eagle_verify(
     if target_argmax is not None:
         # Only the argmax left the shard; nothing downstream may read the logits.
         logits_output.next_token_logits = None
+    if phases is not None:
+        phases.mark("tree_sample")
     fused_commit_outputs = predict.is_cuda and not batch.forward_mode.is_idle()
     prepared_commit_steps = prepared_draft_inputs = None
     if fused_commit_outputs and topk == 1:

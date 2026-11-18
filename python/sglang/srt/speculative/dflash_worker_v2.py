@@ -78,6 +78,7 @@ from sglang.srt.speculative.dflash_adaptive_width import (
     AdaptiveVerifyWidth,
     make_step_timer,
     member_label,
+    step_phases,
 )
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -472,6 +473,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._target_tp_rank = get_parallel().tp_rank
         self.tree_mode = int(get_spec().speculative_eagle_topk or 1) > 1
         self._step_timer = make_step_timer()
+        self._phases = step_phases()
         self._adaptive_width: Optional[AdaptiveVerifyWidth] = None
         with (
             draft_pp_context(),
@@ -2482,6 +2484,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             candidate_ids, scores = _selector_lattice(
                 self.draft_model, draft_hidden[:, 1:, :], bonus_tokens
             )
+        if self._phases is not None:
+            self._phases.mark("lattice")
         node_draft_tokens = node_draft_probs = sampled_rows = sampled_plan = None
         adaptive = self._adaptive_width
         width = self.tree_num_nodes
@@ -2554,6 +2558,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     else member_label(sampled_plan.member)
                 )
         verify_proposal = tree_prefix(proposal, width, topk=self.tree_topk)
+        if self._phases is not None:
+            self._phases.mark("propose")
         result = verify_dflash_tree(
             batch=batch,
             bonus_tokens=bonus_tokens,
@@ -2575,6 +2581,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             host_seq_lens_bound=host_seq_lens_bound,
             host_seq_lens_bound_sum=host_seq_lens_bound_sum,
         )
+        if self._phases is not None:
+            self._phases.mark("verify")
         if on_publish is not None:
             on_publish(result.new_seq_lens)
         if adaptive is not None and greedy:
@@ -2636,6 +2644,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus_tokens=result.next_draft_input.bonus_tokens.to(torch.int64),
             new_seq_lens=result.new_seq_lens,
         )
+        if self._phases is not None:
+            self._phases.end()
         return result
 
     def forward_batch_generation(
@@ -2796,6 +2806,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+        if self._phases is not None:
+            self._phases.begin(bs)
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -3000,6 +3012,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
+        if self._phases is not None:
+            self._phases.mark("draft")
 
         if self.tree_mode:
             return self._forward_decode_tree(
@@ -3143,6 +3157,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
         )
 
+        if self._phases is not None:
+            self._phases.mark("sample_path")
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
@@ -3199,6 +3215,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
+        if self._phases is not None:
+            self._phases.mark("verify_prep")
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -3207,6 +3225,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 None if _is_npu or get_parallel().attn_dp_enabled else True
             ),
         )
+        if self._phases is not None:
+            self._phases.mark("target")
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
@@ -3261,6 +3281,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs=bs,
             target_predict=target_predict,
         )
+        if self._phases is not None:
+            self._phases.mark("accept")
 
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,
@@ -3325,6 +3347,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
         )
+        if self._phases is not None:
+            self._phases.end()
 
         return GenerationBatchResult(
             logits_output=logits_output,

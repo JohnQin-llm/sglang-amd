@@ -87,6 +87,56 @@ def _parse_members(value: str) -> tuple[int, ...]:
     return tuple(sorted(members))
 
 
+class StepPhases:
+    """Debug instrumentation: GPU time between named marks of each decode step, from
+    timing events on the current stream, one JSON line per step (``{"bs": n, "<mark>":
+    ms since the previous mark}``), written with one host sync every 64 steps."""
+
+    def __init__(self, path: str):
+        self._file = open(path, "a", buffering=1)
+        self._done: list[tuple[int, list]] = []
+        self._current: Optional[tuple[int, list]] = None
+
+    def begin(self, bs: int) -> None:
+        self._current = (bs, [])
+        self.mark("begin")
+
+    def mark(self, name: str) -> None:
+        if self._current is None:
+            return
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        self._current[1].append((name, event))
+
+    def end(self) -> None:
+        if self._current is None:
+            return
+        self.mark("end")
+        self._done.append(self._current)
+        self._current = None
+        if len(self._done) < 64:
+            return
+        self._done[-1][1][-1][1].synchronize()
+        for bs, marks in self._done:
+            line = {"bs": bs}
+            for (_, prev), (name, event) in zip(marks, marks[1:]):
+                line[name] = round(prev.elapsed_time(event), 4)
+            self._file.write(json.dumps(line) + "\n")
+        self._done = []
+
+
+_STEP_PHASES: Optional[StepPhases] = None
+
+
+def step_phases() -> Optional[StepPhases]:
+    """The process's StepPhases when SGLANG_DFLASH_STEP_PHASES names a file, else None."""
+    global _STEP_PHASES
+    path = os.environ.get("SGLANG_DFLASH_STEP_PHASES")
+    if path and _STEP_PHASES is None:
+        _STEP_PHASES = StepPhases(path)
+    return _STEP_PHASES
+
+
 class AdaptiveWidthConfig(msgspec.Struct, frozen=True):
     """Experiment knobs: SGLANG_DFLASH_TREE_WIDTHS ("16,32") for greedy batches and
     SGLANG_DFLASH_TREE_SAMPLED_WIDTHS ("chain,16,32"; default the greedy widths) for
