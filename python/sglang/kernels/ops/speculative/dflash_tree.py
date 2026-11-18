@@ -39,12 +39,15 @@ class DFlashTreeSurvival(msgspec.Struct, frozen=True):
 class DFlashTreeProposal(msgspec.Struct, frozen=True):
     """EAGLE's proposal ABI: for non-root node ``i``, ``top_scores_index[:, i - 1]`` is the
     edge ``parent_node * K + rank``, and ``parent_list`` maps a candidate row to its edge.
-    Nodes come best-first, so the first ``n`` nodes are a tree too (``tree_prefix``)."""
+    Nodes come best-first, so the first ``n`` nodes are a tree too (``tree_prefix``).
+    ``node_count`` (``[B]`` int32, a q-truncated sampled tree) counts each request's
+    nodes that are draws, root included; the nodes after them are padding."""
 
     draft_tokens: Tensor
     parent_list: Tensor
     top_scores_index: Tensor
     survival: DFlashTreeSurvival | None = None
+    node_count: Tensor | None = None
 
 
 def tree_depth(proposal: DFlashTreeProposal, num_nodes: int, *, topk: int) -> int:
@@ -71,6 +74,11 @@ def tree_prefix(
         parent_list=proposal.parent_list[:, :parent_width].contiguous(),
         top_scores_index=proposal.top_scores_index[:, : num_nodes - 1].contiguous(),
         survival=proposal.survival,
+        node_count=(
+            None
+            if proposal.node_count is None
+            else proposal.node_count.clamp(max=num_nodes)
+        ),
     )
 
 
@@ -427,6 +435,7 @@ def select_tree_rows(
         top_scores_index=torch.where(
             rows, first_proposal.top_scores_index, second_proposal.top_scores_index
         ),
+        node_count=_select_node_counts(take_first, first_proposal, second_proposal),
     )
     node_rows = take_first.view(-1, 1, 1)
     return (
@@ -434,6 +443,23 @@ def select_tree_rows(
         torch.where(node_rows, first_tokens, second_tokens),
         torch.where(node_rows, first_probs, second_probs),
     )
+
+
+def _select_node_counts(
+    take_first: Tensor, first: DFlashTreeProposal, second: DFlashTreeProposal
+) -> Tensor | None:
+    if first.node_count is None and second.node_count is None:
+        return None
+    num_nodes = first.draft_tokens.shape[1] + 1
+    counts = [
+        (
+            torch.full_like(take_first, num_nodes, dtype=torch.int32)
+            if proposal.node_count is None
+            else proposal.node_count
+        )
+        for proposal in (first, second)
+    ]
+    return torch.where(take_first, counts[0], counts[1])
 
 
 @triton.jit
@@ -460,6 +486,17 @@ def _max_undrawn_log_q(cond_log_q, base, drawn, K: tl.constexpr):
     log_q = tl.load(cond_log_q + base + ranks).to(tl.float32)
     avail = ((drawn >> ranks) & 1) == 0
     return tl.max(tl.where(avail, log_q, -float("inf")), axis=0)
+
+
+@triton.jit
+def _allowed_draws(cond_log_q, base, path_log_q, log_tau, K: tl.constexpr):
+    """Bit r of a node's draft support q' (q truncated to the candidates whose path log q,
+    ``path_log_q`` plus their own, is at least ``log_tau``) and log of q's mass on it."""
+    ranks = tl.arange(0, K)
+    log_q = tl.load(cond_log_q + base + ranks).to(tl.float32)
+    passing = path_log_q + log_q >= log_tau
+    bits = tl.sum(tl.where(passing, 1 << ranks, 0), axis=0)
+    return bits, tl.log(tl.sum(tl.where(passing, tl.exp(log_q), 0.0), axis=0))
 
 
 @triton.jit
@@ -518,7 +555,10 @@ def _build_dflash_sampled_tree_kernel(
     node_cal_slot,
     node_edge_prob,
     prefix_accept_len,
+    node_allowed,
+    node_count,
     cal_prior,
+    log_tau,
     CAND_BATCH_STRIDE: tl.constexpr,
     CAND_DEPTH_STRIDE: tl.constexpr,
     LQ_BATCH_STRIDE: tl.constexpr,
@@ -533,6 +573,7 @@ def _build_dflash_sampled_tree_kernel(
     RANK_TABLE: tl.constexpr,
     CHAIN: tl.constexpr,
     CALIBRATE: tl.constexpr,
+    TRUNCATE: tl.constexpr,
     NUM_BINS: tl.constexpr,
     NUM_CLASSES: tl.constexpr,
 ):
@@ -571,6 +612,20 @@ def _build_dflash_sampled_tree_kernel(
     taken = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     drawn = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
     no_draws = tl.full((), 0, tl.int32)
+    # With TRUNCATE a node draws from q', its q on the ``allowed`` candidates (whose
+    # path log q clears log_tau), renormalized by exp(log_norm). The support is fixed
+    # when the node enters the tree, so q' is the distribution its children come from.
+    path_log_q = tl.zeros((BLOCK_NODES,), dtype=tl.float32)
+    allowed = tl.zeros((BLOCK_NODES,), dtype=tl.int32)
+    log_norm = tl.zeros((BLOCK_NODES,), dtype=tl.float32)
+    num_real = tl.full((), 1, tl.int32)
+    if TRUNCATE:
+        root_allowed, root_log_norm = _allowed_draws(
+            cond_log_q, lq_row, 0.0, log_tau, K
+        )
+        allowed = tl.where(nodes == 0, root_allowed, 0)
+        log_norm = tl.where(nodes == 0, root_log_norm, 0.0)
+        tl.store(node_allowed + batch * Q, root_allowed)
     # log a, log(1 - a), log a', log(1 - a'); read only with ACCEPT_PRIOR.
     log_first = tl.load(log_priors + 0)
     log_miss_first = tl.load(log_priors + 1)
@@ -589,6 +644,10 @@ def _build_dflash_sampled_tree_kernel(
             NUM_CLASSES,
             RANK_TABLE,
         )
+        if TRUNCATE:
+            root_bound = tl.where(root_allowed != 0, root_bound, -float("inf"))
+    elif TRUNCATE:
+        root_bound = _max_undrawn_log_q(cond_log_q, lq_row, ~root_allowed, K)
     else:
         root_bound = _max_undrawn_log_q(cond_log_q, lq_row, no_draws, K)
     bound = tl.where(nodes == 0, root_bound, -float("inf"))
@@ -611,39 +670,78 @@ def _build_dflash_sampled_tree_kernel(
         parent_row = (
             lq_row + parent_depth * LQ_DEPTH_STRIDE + parent_rank * LQ_PARENT_STRIDE
         )
-        child_rank, child_log_q = _draw_child(
-            cond_log_q,
-            parent_row,
-            parent_drawn,
-            tl.load(u_row + parent * K + parent_taken),
-            K,
-        )
+        u = tl.load(u_row + parent * K + parent_taken)
+        # The k-th drawn child of a node is its k-th sibling, the order verification replays.
+        if TRUNCATE:
+            parent_allowed = tl.sum(tl.where(is_parent, allowed, 0), axis=0)
+            parent_path = tl.sum(tl.where(is_parent, path_log_q, 0.0), axis=0)
+            parent_log_norm = tl.sum(tl.where(is_parent, log_norm, 0.0), axis=0)
+            child_rank, child_log_q = _draw_child(
+                cond_log_q, parent_row, parent_drawn | ~parent_allowed, u, K
+            )
+            # Once no node has a candidate left in its support, the remaining slots
+            # are padding: a child that is no draw, after its parent's real children,
+            # where verification finds no q mass left, so visiting it changes nothing.
+            pad = child_rank < 0
+            child_rank = tl.maximum(child_rank, 0)
+            edge = parent * K + tl.where(pad, K - 1, parent_taken)
+        else:
+            child_rank, child_log_q = _draw_child(
+                cond_log_q, parent_row, parent_drawn, u, K
+            )
+            edge = parent * K + parent_taken
         token = tl.load(
             candidate_ids
             + batch * CAND_BATCH_STRIDE
             + parent_depth * CAND_DEPTH_STRIDE
             + child_rank
         )
-        # The k-th drawn child of a node is its k-th sibling, the order verification replays.
-        edge = parent * K + parent_taken
         out = batch * (Q - 1) + node_index - 1
         tl.store(draft_tokens + out, token)
         tl.store(selected_edges + out, edge)
         if node_index < Q - 1:
-            tl.store(parent_list + batch * PARENT_BATCH_STRIDE + node_index, edge)
+            if TRUNCATE:
+                tl.store(
+                    parent_list + batch * PARENT_BATCH_STRIDE + node_index,
+                    tl.where(pad, -1, edge),
+                )
+            else:
+                tl.store(parent_list + batch * PARENT_BATCH_STRIDE + node_index, edge)
         tl.store(node_depths + batch * Q + node_index, parent_depth + 1)
         tl.store(node_ranks + batch * Q + node_index, child_rank)
 
+        # The q the child was drawn with: q' under TRUNCATE.
+        drawn_log_q = child_log_q
+        if TRUNCATE:
+            drawn_log_q = child_log_q - parent_log_norm
         # Calibration slot: (parent depth, draw class, octave bin of the drawn q).
         cal_slot = (
             parent_depth * NUM_CLASSES + tl.minimum(parent_taken, NUM_CLASSES - 1)
-        ) * NUM_BINS + _calibration_bin(child_log_q, NUM_BINS)
+        ) * NUM_BINS + _calibration_bin(drawn_log_q, NUM_BINS)
         draw_log_prior = _draw_prior(
             parent_taken, log_first, log_miss_first, log_sibling, log_miss_sibling
         )
-        parent_drawn = parent_drawn | (1 << child_rank)
-        parent_taken += 1
+        if TRUNCATE:
+            parent_drawn = tl.where(pad, parent_drawn, parent_drawn | (1 << child_rank))
+            parent_taken += tl.where(pad, 0, 1)
+        else:
+            parent_drawn = parent_drawn | (1 << child_rank)
+            parent_taken += 1
         child_depth = parent_depth + 1
+        child_row = (
+            lq_row
+            + tl.minimum(child_depth, NUM_DEPTHS - 1) * LQ_DEPTH_STRIDE
+            + child_rank * LQ_PARENT_STRIDE
+        )
+        if TRUNCATE:
+            child_path = parent_path + child_log_q
+            child_allowed, child_log_norm = _allowed_draws(
+                cond_log_q, child_row, child_path, log_tau, K
+            )
+            child_allowed = tl.where(
+                pad | (child_depth >= NUM_DEPTHS), 0, child_allowed
+            )
+            tl.store(node_allowed + batch * Q + node_index, child_allowed)
         if ACCEPT_PRIOR:
             parent_bound = _rank_prior(
                 rank_table,
@@ -669,17 +767,20 @@ def _build_dflash_sampled_tree_kernel(
                 NUM_CLASSES,
                 RANK_TABLE,
             )
+            if TRUNCATE:
+                parent_left = (parent_allowed & ~parent_drawn) != 0
+                parent_bound = tl.where(parent_left, parent_bound, -float("inf"))
+                child_bound = tl.where(child_allowed != 0, child_bound, -float("inf"))
             child_mass = parent_mass + parent_next
+        elif TRUNCATE:
+            parent_bound = _max_undrawn_log_q(
+                cond_log_q, parent_row, parent_drawn | ~parent_allowed, K
+            )
+            child_bound = _max_undrawn_log_q(cond_log_q, child_row, ~child_allowed, K)
+            child_mass = parent_mass + child_log_q
         else:
             parent_bound = _max_undrawn_log_q(cond_log_q, parent_row, parent_drawn, K)
-            child_bound = _max_undrawn_log_q(
-                cond_log_q,
-                lq_row
-                + tl.minimum(child_depth, NUM_DEPTHS - 1) * LQ_DEPTH_STRIDE
-                + child_rank * LQ_PARENT_STRIDE,
-                no_draws,
-                K,
-            )
+            child_bound = _max_undrawn_log_q(cond_log_q, child_row, no_draws, K)
             child_mass = parent_mass + child_log_q
         if CALIBRATE:
             # The chance verification accepts the node once its parent is accepted:
@@ -692,10 +793,19 @@ def _build_dflash_sampled_tree_kernel(
         else:
             # With ACCEPT_PRIOR a node's mass is the log chance verification accepts it.
             child_survival = child_mass
+        edge_prob = tl.exp(drawn_log_q)
+        if TRUNCATE:
+            parent_bound = tl.where(pad, -float("inf"), parent_bound)
+            child_bound = tl.where(pad, -float("inf"), child_bound)
+            child_mass = tl.where(pad, -float("inf"), child_mass)
+            child_survival = tl.where(pad, -float("inf"), child_survival)
+            cal_slot = tl.where(pad, -1, cal_slot)
+            edge_prob = tl.where(pad, 0.0, edge_prob)
+            num_real += tl.where(pad, 0, 1)
         expected_len += tl.exp(child_survival)
         tl.store(node_log_survival + batch * Q + node_index, child_survival)
         tl.store(node_cal_slot + batch * Q + node_index, cal_slot)
-        tl.store(node_edge_prob + batch * Q + node_index, tl.exp(child_log_q))
+        tl.store(node_edge_prob + batch * Q + node_index, edge_prob)
         tl.store(prefix_accept_len + batch * Q + node_index, expected_len)
         taken = tl.where(is_parent, parent_taken, taken)
         drawn = tl.where(is_parent, parent_drawn, drawn)
@@ -712,6 +822,12 @@ def _build_dflash_sampled_tree_kernel(
             tl.where(child_depth < NUM_DEPTHS, child_bound, -float("inf")),
             bound,
         )
+        if TRUNCATE:
+            path_log_q = tl.where(is_new, child_path, path_log_q)
+            allowed = tl.where(is_new, child_allowed, allowed)
+            log_norm = tl.where(is_new, child_log_norm, log_norm)
+    if TRUNCATE:
+        tl.store(node_count + batch, num_real)
 
 
 def log_draw_priors(accept_prior: tuple[float, float] | None) -> tuple[float, ...]:
@@ -741,6 +857,8 @@ class DFlashSampledTree(msgspec.Struct, frozen=True):
     proposal: DFlashTreeProposal
     node_depths: Tensor
     node_ranks: Tensor
+    # [B, Q] int32 bit masks of each node's draft support under ``log_tau``.
+    node_allowed: Tensor | None = None
 
 
 @torch.inference_mode()
@@ -755,6 +873,7 @@ def build_dflash_sampled_tree(
     calibration: Tensor | None = None,
     calibration_prior: float = 2.0,
     rank_table: Tensor | None = None,
+    log_tau: float | None = None,
 ) -> DFlashSampledTree:
     """Sampled tree for lossless multi-draft verification at temperature > 0.
 
@@ -777,6 +896,13 @@ def build_dflash_sampled_tree(
     ``rank_table`` (``[L * NUM_DRAW_CLASSES]``, ``update_rank_table``) replaces the draw
     prior's ranking by log accept rates per (depth, draw class) learned in earlier
     steps; it does not depend on this step's draws, so the tree stays draw-independent.
+
+    ``log_tau`` truncates every node's q to the candidates whose path log q (the sum
+    of q's log-probs from the root) is at least ``log_tau``, renormalized: q', which
+    the node draws from and verification must replay (``sampled_node_drafts``). The
+    support only depends on the node's path, fixed before its first draw, so every
+    child is still a draw from the distribution verification assumes. When no node
+    has a candidate left, the remaining nodes are padding (``node_count``).
     """
     batch_size, num_depths, candidate_top_k = candidate_ids.shape
     if rank_table is not None and (
@@ -793,6 +919,8 @@ def build_dflash_sampled_tree(
             f"EAGLE's parent-list ABI holds 2 <= Q <= min(128, K*(depth-1)+2) nodes; "
             f"got Q={max_nodes}, K={candidate_top_k}, depth={num_depths}"
         )
+    if chain and log_tau is not None:
+        raise ValueError("a q-truncated tree is not a chain")
     if chain and max_nodes > num_depths + 1:
         raise ValueError(
             f"a chain of {max_nodes} nodes is deeper than the lattice ({num_depths})"
@@ -843,6 +971,9 @@ def build_dflash_sampled_tree(
             )
             if workspace is not None:
                 workspace[key] = log_priors
+    truncate = log_tau is not None
+    node_allowed = buffer("node_allowed", node_shape, torch.int32) if truncate else None
+    node_count = buffer("node_count", (batch_size,), torch.int32) if truncate else None
     _build_dflash_sampled_tree_kernel[(batch_size,)](
         candidate_ids,
         cond_log_q,
@@ -859,7 +990,10 @@ def build_dflash_sampled_tree(
         survival.node_cal_slot,
         survival.node_edge_prob,
         survival.prefix_accept_len,
+        node_allowed if truncate else node_depths,
+        node_count if truncate else node_depths,
         float(calibration_prior),
+        log_tau if truncate else 0.0,
         CAND_BATCH_STRIDE=candidate_ids.stride(0),
         CAND_DEPTH_STRIDE=candidate_ids.stride(1),
         LQ_BATCH_STRIDE=cond_log_q.stride(0),
@@ -874,6 +1008,7 @@ def build_dflash_sampled_tree(
         RANK_TABLE=rank_table is not None,
         CHAIN=chain,
         CALIBRATE=calibration is not None,
+        TRUNCATE=truncate,
         NUM_BINS=NUM_CALIBRATION_BINS,
         NUM_CLASSES=NUM_DRAW_CLASSES,
         num_warps=4,
@@ -886,9 +1021,13 @@ def build_dflash_sampled_tree(
         survival=(
             survival if accept_prior is not None or calibration is not None else None
         ),
+        node_count=node_count,
     )
     return DFlashSampledTree(
-        proposal=proposal, node_depths=node_depths, node_ranks=node_ranks
+        proposal=proposal,
+        node_depths=node_depths,
+        node_ranks=node_ranks,
+        node_allowed=node_allowed,
     )
 
 
@@ -907,6 +1046,11 @@ def sampled_node_drafts(
         rows, depths, tree.node_ranks[:, :num_nodes].long()
     ].exp()
     node_draft_probs = node_draft_probs * (node_depths < num_depths).unsqueeze(-1)
+    if tree.node_allowed is not None:
+        # q' up to its normalization, which verification redoes over undrawn candidates.
+        ranks = torch.arange(candidate_ids.shape[-1], device=candidate_ids.device)
+        support = (tree.node_allowed[:, :num_nodes, None] >> ranks) & 1
+        node_draft_probs = node_draft_probs * support
     return node_draft_tokens, node_draft_probs
 
 
@@ -919,6 +1063,7 @@ def build_dflash_sampled_tree_proposal(
     workspace: dict[str, Tensor] | None = None,
     accept_prior: tuple[float, float] | Tensor | None = None,
     chain: bool = False,
+    log_tau: float | None = None,
 ) -> tuple[DFlashTreeProposal, Tensor, Tensor]:
     """``build_dflash_sampled_tree`` with every node's drafts (``sampled_node_drafts``)."""
     candidate_ids = candidate_ids.contiguous()
@@ -930,6 +1075,7 @@ def build_dflash_sampled_tree_proposal(
         workspace=workspace,
         accept_prior=accept_prior,
         chain=chain,
+        log_tau=log_tau,
     )
     node_draft_tokens, node_draft_probs = sampled_node_drafts(
         candidate_ids, cond_log_q, tree, max_nodes
@@ -965,6 +1111,7 @@ def update_draw_acceptance(
     topk: int,
     decay: float = 0.99,
     sampled_rows: Tensor | None = None,
+    node_count: Tensor | None = None,
 ) -> None:
     """Online estimate of the draw priors of a sampled tree from one verify step.
 
@@ -974,13 +1121,18 @@ def update_draw_acceptance(
     later draws, the last of them accepted; at the path's end every drawn child was
     rejected. ``accept_index`` holds global node ids, root first, -1 past
     ``accept_lens``. ``sampled_rows`` ([bs] bool), when given, limits the counts to the
-    rows whose tree was sampled. Runs on the device without a host sync.
+    rows whose tree was sampled. ``node_count`` ([bs], the proposal's) leaves a
+    truncated tree's padding out. Runs on the device without a host sync.
     """
     bs = accept_lens.shape[0]
     edges = top_scores_index[:bs]
     draw = edges % topk
+    is_draw = torch.ones_like(edges, dtype=torch.float32)
+    if node_count is not None:
+        child_ids = torch.arange(1, num_nodes, device=edges.device)
+        is_draw = (child_ids[None, :] < node_count[:bs, None]).float()
     children = torch.zeros(bs, num_nodes, dtype=torch.float32, device=edges.device)
-    children.scatter_add_(1, edges // topk, torch.ones_like(edges, dtype=torch.float32))
+    children.scatter_add_(1, edges // topk, is_draw)
     offsets = torch.arange(bs, device=edges.device).unsqueeze(1) * num_nodes
     nodes = accept_index[:bs].long() - offsets
     stepped = accept_index[:bs, 1:] >= 0
@@ -1054,6 +1206,8 @@ def _update_tree_calibration_kernel(
             tl.sum((parent[:, None] == path[None, :]).to(tl.int32), axis=1) > 0
         )
         slot = tl.load(node_cal_slot + b * NODE_STRIDE + nodes, mask=reached, other=0)
+        # Padding nodes of a q-truncated tree have no slot.
+        reached = reached & (slot >= 0)
         prob = tl.load(
             node_edge_prob + b * NODE_STRIDE + nodes, mask=reached, other=0.0
         )

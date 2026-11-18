@@ -72,6 +72,7 @@ from sglang.srt.speculative.dflash_tree_verify import (
     ONLINE_PRIOR_START,
     propose_adaptive_sampled_tree,
     propose_dflash_mixed_tree,
+    parse_q_threshold_table,
     propose_dflash_sampled_tree,
     propose_dflash_tree,
     read_accept_prior_setting,
@@ -666,6 +667,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise NotImplementedError(
                     "the ragged chain member of the DFLASH adaptive width does not "
                     "commit linear-attention state yet"
+                )
+            self._tree_q_threshold = parse_q_threshold_table(
+                envs.SGLANG_DFLASH_TREE_Q_THRESHOLD.get()
+            )
+            if self._tree_q_threshold is not None and not self._block_verification:
+                # Recursive rejection sampling assumes each node's q sums to one,
+                # while the truncated trees hand verification q' unnormalized.
+                raise NotImplementedError(
+                    "SGLANG_DFLASH_TREE_Q_THRESHOLD needs "
+                    "--speculative-use-block-verification"
                 )
             self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
         if self._is_domino and self.block_size <= 1:
@@ -2622,6 +2633,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 device=self.device,
             )
 
+    def _tree_log_tau(self, bs: int) -> float | None:
+        if self._tree_q_threshold is None:
+            return None
+        return self._tree_q_threshold.log_tau(bs)
+
     def _tree_temperatures(self, sampling_info, bs: int) -> torch.Tensor:
         # Greedy rows take the best-first tree; temperature 1 only keeps their
         # discarded sampled tree finite.
@@ -2777,6 +2793,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 num_nodes=self.tree_num_nodes,
                 workspace=self._tree_workspace,
                 accept_prior=self._tree_accept_prior,
+                log_tau=self._tree_log_tau(bs),
             )
         elif adaptive is not None:
             member = adaptive.choose_sampled_member(bs=bs)
@@ -2801,6 +2818,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 workspace=self._tree_workspace,
                 accept_prior=self._tree_accept_prior,
                 bs=bs,
+                log_tau=self._tree_log_tau(bs),
             )
             proposal = sampled_plan.proposal
             node_draft_tokens = sampled_plan.node_draft_tokens
@@ -2815,6 +2833,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 num_nodes=self.tree_num_nodes,
                 workspace=self._tree_workspace,
                 accept_prior=self._tree_accept_prior,
+                log_tau=self._tree_log_tau(bs),
             )
         if adaptive is not None:
             if sampled_plan is None and not greedy:
@@ -2902,6 +2921,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 num_nodes=width,
                 topk=self.tree_topk,
                 sampled_rows=sampled_rows,
+                node_count=verify_proposal.node_count,
             )
             if sampled_plan is not None:
                 adaptive.refresh_rank_table(self._tree_accept_prior)

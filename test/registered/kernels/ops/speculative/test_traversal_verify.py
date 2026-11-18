@@ -33,10 +33,10 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-l
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
-def _sampled_tree(candidate_ids, log_q, max_nodes, chain=False):
+def _sampled_tree(candidate_ids, log_q, max_nodes, chain=False, log_tau=None):
     rows, num_depths, k = candidate_ids.shape
     proposal, node_tokens, node_probs = build_dflash_sampled_tree_proposal(
-        candidate_ids, log_q, max_nodes=max_nodes, chain=chain
+        candidate_ids, log_q, max_nodes=max_nodes, chain=chain, log_tau=log_tau
     )
     seq_lens = torch.full((rows,), 10, dtype=torch.long, device="cuda")
     _, _, retrive_index, next_token, next_sibling, tokens = build_tree_kernel_efficient(
@@ -92,10 +92,17 @@ def _committed(predicts, accept_index, accept_token_num, num_tokens):
 
 
 @pytest.mark.parametrize(
-    "num_depths, k, max_nodes, vocab",
-    [(7, 16, 16, 4099), (7, 16, 8, 131), (3, 4, 10, 37)],
+    "num_depths, k, max_nodes, vocab, log_tau",
+    [
+        (7, 16, 16, 4099, None),
+        (7, 16, 8, 131, None),
+        (3, 4, 10, 37, None),
+        (7, 16, 16, 4099, -4.0),
+        (3, 4, 10, 37, -1.5),
+    ],
 )
-def test_kernel_matches_reference(num_depths, k, max_nodes, vocab):
+def test_kernel_matches_reference(num_depths, k, max_nodes, vocab, log_tau):
+    """Also on q-truncated trees, whose padding children carry no q mass."""
     torch.manual_seed(num_depths * 1000 + k * 10 + max_nodes)
     rows = 96
     candidate_ids = torch.stack(
@@ -104,7 +111,7 @@ def test_kernel_matches_reference(num_depths, k, max_nodes, vocab):
     scores = torch.randn(rows, num_depths, k, k) * 2
     scores[:, 0] = scores[:, 0, :1]
     log_q = torch.log_softmax(scores, dim=-1)
-    tree = _sampled_tree(candidate_ids.cuda(), log_q.cuda(), max_nodes)
+    tree = _sampled_tree(candidate_ids.cuda(), log_q.cuda(), max_nodes, log_tau=log_tau)
     # A target near each node's draft, so rows accept paths of every length.
     logits = torch.randn(rows, max_nodes, vocab, device="cuda")
     boost = math.log(vocab) + 1 + tree["node_draft_probs"].log().clamp(min=-30) * 0.7
@@ -219,12 +226,16 @@ def runtime_context():
         reset_context()
 
 
-def test_served_tree_rows_commit_each_requests_truncated_target(runtime_context):
+@pytest.mark.parametrize("log_tau", [None, -1.5])
+def test_served_tree_rows_commit_each_requests_truncated_target(
+    runtime_context, log_tau
+):
     """Served T>0 tree verify: a request's tree is drawn from the selector q at its
     temperature with the online draw prior, its tree rows take its temperature, top-k
     and top-p, and Traversal Verification with seeded coins commits exactly that
     truncated target. Three settings in one batch catch rows taking another request's
-    settings."""
+    settings. With ``log_tau`` the tree draws from q truncated to paths whose log q
+    clears it, padding the rows that run out of candidates."""
     settings = [(1.0, 5, 0.8), (0.7, 8, 0.9), (1.3, 3, 1.0)]  # T, top-k, top-p
     per_setting, num_depths, k, max_nodes = 60000, 3, 4, 6
     rows = per_setting * len(settings)
@@ -253,7 +264,10 @@ def test_served_tree_rows_commit_each_requests_truncated_target(runtime_context)
         num_nodes=max_nodes,
         workspace={},
         accept_prior=torch.tensor(log_draw_priors(ONLINE_PRIOR_START)).cuda(),
+        log_tau=log_tau,
     )
+    if log_tau is not None:
+        assert (proposal.node_count < max_nodes).any()
     seq_lens = torch.full((rows,), 10, dtype=torch.long, device="cuda")
     _, _, retrive_index, next_token, next_sibling, tokens = build_tree_kernel_efficient(
         bonus_tokens=torch.zeros(rows, dtype=torch.long, device="cuda"),
