@@ -30,7 +30,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.speculative.dflash_adaptive_width import CHAIN, AdaptiveVerifyWidth
+from sglang.srt.speculative.dflash_adaptive_width import AdaptiveVerifyWidth, is_chain
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_common import (
@@ -180,7 +180,8 @@ def propose_adaptive_sampled_tree(
         chain_survival=None if chain is None else chain.proposal.survival,
         bs=bs,
     )
-    chosen = chain if member == CHAIN else tree
+    # A shorter chain member verifies the first rows of the full-block chain.
+    chosen = chain if is_chain(member) else tree
     rows = adaptive.member_rows(member)
     node_draft_tokens, node_draft_probs = sampled_node_drafts(
         lattice.candidate_ids, lattice.cond_log_q, chosen, rows

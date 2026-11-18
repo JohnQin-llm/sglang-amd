@@ -83,18 +83,37 @@ def make_step_timer() -> Optional[StepTimer]:
 
 
 # Member id of the chain in a sampled width set: every node's first draw, one path as
-# deep as the draft block, whose traversal verification is block verification.
+# deep as the draft block, whose traversal verification is block verification. A
+# shorter chain, the first k nodes of that path ("chain<k>"), is -k.
 CHAIN = 0
 
 
+def is_chain(member: int) -> bool:
+    return member <= CHAIN
+
+
 def member_label(member: int) -> str:
-    return "chain" if member == CHAIN else str(member)
+    if member == CHAIN:
+        return "chain"
+    return f"chain{-member}" if member < 0 else str(member)
+
+
+def _parse_member(value: str) -> int:
+    value = value.strip()
+    if value == "chain":
+        return CHAIN
+    if value.startswith("chain"):
+        rows = int(value[len("chain") :])
+        if rows < 2:
+            raise ValueError(f"a chain member needs >= 2 rows, got {value}")
+        return -rows
+    return int(value)
 
 
 def _parse_members(value: str) -> tuple[int, ...]:
-    """ "chain,16,32" -> (CHAIN, 16, 32): the chain first, then widths ascending."""
-    members = {CHAIN if x.strip() == "chain" else int(x) for x in value.split(",")}
-    return tuple(sorted(members))
+    """ "chain,chain10,16,32" -> (-10, CHAIN, 16, 32): the chains first, then widths
+    ascending."""
+    return tuple(sorted({_parse_member(x) for x in value.split(",")}))
 
 
 class StepPhases:
@@ -180,9 +199,9 @@ def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
         return None
     widths = _parse_members(value) if value else (max_width,)
     sampled_members = _parse_members(sampled_value) if sampled_value else widths
-    if CHAIN in widths:
+    if any(is_chain(m) for m in widths):
         raise ValueError("the chain member is for sampled batches only")
-    trees = sorted((set(widths) | set(sampled_members)) - {CHAIN})
+    trees = sorted(m for m in set(widths) | set(sampled_members) if not is_chain(m))
     if not trees or trees[-1] != max_width:
         raise ValueError(
             f"the largest tree width of {widths} and {sampled_members} must be "
@@ -428,11 +447,17 @@ class AdaptiveVerifyWidth:
         self.sampled_members = config.sampled_members
         self.max_width = max(config.widths + config.sampled_members)
         self.chain_rows = chain_rows
-        self.has_chain = CHAIN in config.sampled_members
+        self.has_chain = any(is_chain(m) for m in config.sampled_members)
         if self.has_chain and chain_rows > self.max_width:
             raise ValueError(
                 f"the chain verifies {chain_rows} rows, more than the server width "
                 f"{self.max_width}"
+            )
+        short = [m for m in config.sampled_members if m < CHAIN and -m >= chain_rows]
+        if short:
+            raise ValueError(
+                f"chain members {[member_label(m) for m in short]} need fewer rows than "
+                f"the draft block {chain_rows} (the full block is 'chain')"
             )
         self._config = config
         self._device = device
@@ -455,7 +480,13 @@ class AdaptiveVerifyWidth:
             [width - 1 for width in config.widths], dtype=torch.long, device=device
         )
         self._sampled_tree_columns = torch.tensor(
-            [m - 1 for m in config.sampled_members if m != CHAIN],
+            [m - 1 for m in config.sampled_members if not is_chain(m)],
+            dtype=torch.long,
+            device=device,
+        )
+        # Chain members sort before the trees in sampled_members, so their columns lead.
+        self._sampled_chain_columns = torch.tensor(
+            [self.member_rows(m) - 1 for m in config.sampled_members if is_chain(m)],
             dtype=torch.long,
             device=device,
         )
@@ -533,17 +564,19 @@ class AdaptiveVerifyWidth:
         )
 
     def member_rows(self, member: int) -> int:
-        return self.chain_rows if member == CHAIN else member
+        if member == CHAIN:
+            return self.chain_rows
+        return -member if member < 0 else member
 
     def _captured_keys(self) -> list[int]:
-        """Verify states to build besides the startup one (the largest width): tree
-        widths by row count, and CHAIN for the chain member."""
+        """Verify states to build besides the startup one (the largest width): the
+        chain members, then tree widths by row count."""
         force = self._config.force_width
         greedy = (force,) if force in self.widths else self.widths
         sampled = (force,) if force in self.sampled_members else self.sampled_members
-        rows = {m for m in greedy + sampled if m != CHAIN}
+        rows = {m for m in greedy + sampled if not is_chain(m)}
         keys = sorted(rows - {self.max_width})
-        return [CHAIN] + keys if CHAIN in sampled else keys
+        return sorted(m for m in sampled if is_chain(m)) + keys
 
     def capture(self, model_runner) -> None:
         """Build a target verify backend and graph set per verify state below the
@@ -567,7 +600,7 @@ class AdaptiveVerifyWidth:
         for key in self._captured_keys():
             width = self.member_rows(key)
             override = dict(speculative_num_draft_tokens=width)
-            if key == CHAIN:
+            if is_chain(key):
                 override["speculative_eagle_topk"] = 1
             with get_spec().override(**override):
                 saved_flag = model_runner.init_new_workspace
@@ -645,9 +678,7 @@ class AdaptiveVerifyWidth:
         columns = []
         if self.has_chain:
             columns.append(
-                chain_survival.prefix_accept_len[
-                    :bs, self.chain_rows - 1 : self.chain_rows
-                ]
+                chain_survival.prefix_accept_len[:bs, self._sampled_chain_columns]
             )
         if self._sampled_tree_columns.numel():
             columns.append(
@@ -678,7 +709,8 @@ class AdaptiveVerifyWidth:
         return self._static_accept_len * content.pow(self._config.content_weight)
 
     def activate(self, key: int, model_runner) -> None:
-        """Switch the target to the verify state of ``key``: a tree width, or CHAIN."""
+        """Switch the target to the verify state of ``key``: a tree width, or a chain
+        member."""
         if key == self._active:
             return
         state = self._states[key]

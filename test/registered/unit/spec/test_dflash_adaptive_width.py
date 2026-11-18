@@ -16,6 +16,7 @@ from sglang.srt.speculative.dflash_adaptive_width import (
     StaleDeviceStats,
     VerifyWidthPolicy,
     interpolate_cost,
+    member_label,
     read_adaptive_width_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -186,6 +187,38 @@ class TestReadConfig(CustomTestCase):
         # Greedy batches keep the server width; only the chain needs its own graphs.
         self.assertEqual(width.select_width(survival=None, bs=4), 32)
         self.assertEqual(width._captured_keys(), [CHAIN])
+
+    def test_shorter_chain_members(self):
+        sampled = {"chain10": {"1": 13.0}, "chain": {"1": 14.0}, "32": {"1": 16.0}}
+        with self._env(
+            SGLANG_DFLASH_TREE_SAMPLED_WIDTHS="32,chain,chain10",
+            SGLANG_DFLASH_TREE_COST_TABLE=self._table(sampled),
+        ):
+            config = read_adaptive_width_config(32)
+        self.assertEqual(config.sampled_members, (-10, CHAIN, 32))
+        self.assertEqual(config.sampled_cost_ms[-10][1], 13.0)
+        self.assertEqual(member_label(-10), "chain10")
+        width = AdaptiveVerifyWidth(
+            config=config, num_depths=15, chain_rows=16, device=torch.device("cpu")
+        )
+        self.assertEqual(width.member_rows(-10), 10)
+        self.assertEqual(width._captured_keys(), [-10, CHAIN])
+        # The chain columns lead, in member order: 10 rows, then the full 16.
+        tree = SimpleNamespace(prefix_accept_len=torch.arange(1.0, 33.0).view(1, 32))
+        chain = SimpleNamespace(prefix_accept_len=torch.arange(1.0, 17.0).view(1, 16))
+        out = width.predict_sampled(tree_survival=tree, chain_survival=chain, bs=1)
+        torch.testing.assert_close(out[0, 3:], torch.tensor([10.0, 16.0, 32.0]))
+
+    def test_chain_member_shorter_than_the_block(self):
+        with self._env(
+            SGLANG_DFLASH_TREE_SAMPLED_WIDTHS="chain16,32",
+            SGLANG_DFLASH_TREE_FORCE_WIDTH="32",
+        ):
+            config = read_adaptive_width_config(32)
+        with self.assertRaises(ValueError):
+            AdaptiveVerifyWidth(
+                config=config, num_depths=15, chain_rows=16, device=torch.device("cpu")
+            )
 
 
 class TestChainMember(CustomTestCase):

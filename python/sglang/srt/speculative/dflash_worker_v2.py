@@ -74,8 +74,8 @@ from sglang.srt.speculative.dflash_tree_verify import (
     verify_dflash_tree,
 )
 from sglang.srt.speculative.dflash_adaptive_width import (
-    CHAIN,
     AdaptiveVerifyWidth,
+    is_chain,
     make_step_timer,
     member_label,
     set_debug_rank,
@@ -2563,9 +2563,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     # order, and the width never depends on this step's draws.
                     node_draft_tokens = node_draft_tokens[:, :width].contiguous()
                     node_draft_probs = node_draft_probs[:, :width].contiguous()
-            chain = sampled_plan is not None and sampled_plan.member == CHAIN
+            chain = sampled_plan is not None and is_chain(sampled_plan.member)
             adaptive.activate(
-                CHAIN if chain else width, self.target_worker.model_runner
+                sampled_plan.member if chain else width,
+                self.target_worker.model_runner,
             )
             if self._step_timer is not None:
                 self._step_timer.set_member(
@@ -2623,7 +2624,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if (
             node_draft_probs is not None
             and self._tree_draw_stats is not None
-            and (sampled_plan is None or sampled_plan.member != CHAIN)
+            and (sampled_plan is None or not is_chain(sampled_plan.member))
         ):
             update_draw_acceptance(
                 stats=self._tree_draw_stats,
