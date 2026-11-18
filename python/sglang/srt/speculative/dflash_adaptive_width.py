@@ -194,9 +194,8 @@ class AdaptiveWidthConfig(msgspec.Struct, frozen=True):
     (sampled batches fall back to ``cost_ms``); a member's measured accept length
     (``member_accept_len`` for greedy widths, ``sampled_member_accept_len`` for sampled
     members) is one number, or ``{"<bs>": AL}`` for the ragged chain, whose rows per
-    request change with the batch size.
-    SGLANG_DFLASH_TREE_FORCE_WIDTH verifies
-    at this member every step where it is one (for measurements), and
+    request change with the batch size. SGLANG_DFLASH_TREE_FORCE_WIDTH verifies at this
+    member every step where it is one (for measurements), and
     SGLANG_DFLASH_TREE_CALIBRATION_DUMP appends per-step predicted and actual accept
     lengths (one host sync every few dozen steps). SGLANG_DFLASH_TREE_RANK=depth ranks
     sampled-tree slots by accept rates learned per (depth, draw class) instead of the
@@ -502,8 +501,8 @@ class AdaptiveVerifyWidth:
         self.has_ragged = RAGGED in config.widths + config.sampled_members
         if self.has_ragged != (ragged is not None):
             raise ValueError(
-                "the sampled member 'ragged' needs SGLANG_DFLASH_RAGGED_CHAIN_TABLE, "
-                "and the table needs that member"
+                "the member 'ragged' needs SGLANG_DFLASH_RAGGED_CHAIN_TABLE, and the "
+                "table needs that member"
             )
         if ragged is not None and ragged.block != chain_rows:
             raise ValueError(
@@ -641,7 +640,7 @@ class AdaptiveVerifyWidth:
         if config is None:
             return None
         ragged = None
-        if RAGGED in config.sampled_members:
+        if RAGGED in config.widths + config.sampled_members:
             table = read_ragged_chain_table()
             if table is not None:
                 ragged = RaggedChainPolicy(table=table, device=device)

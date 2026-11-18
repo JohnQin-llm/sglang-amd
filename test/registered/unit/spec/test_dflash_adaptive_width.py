@@ -24,6 +24,7 @@ from sglang.srt.speculative.dflash_adaptive_width import (
 from sglang.srt.speculative.dflash_ragged_chain import (
     RaggedChainPolicy,
     RaggedChainTable,
+    read_ragged_chain_table,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -411,6 +412,35 @@ class TestRaggedMember(CustomTestCase):
             },
         ):
             self.assertEqual(read_adaptive_width_config(32).widths, (RAGGED, 32))
+
+    def test_greedy_only_member_reads_the_ragged_table(self):
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(
+            {
+                "block": 16,
+                "bin_edges": [],
+                "accept_lens": [[1.0 + 0.3 * k for k in range(16)]],
+                "rows_per_request": [[4096, 8]],
+            },
+            f,
+        )
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        read_ragged_chain_table.cache_clear()
+        self.addCleanup(read_ragged_chain_table.cache_clear)
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_DFLASH_TREE_WIDTHS": "ragged,32",
+                "SGLANG_DFLASH_TREE_FORCE_WIDTH": "ragged",
+                "SGLANG_DFLASH_RAGGED_CHAIN_TABLE": f.name,
+            },
+        ):
+            width = AdaptiveVerifyWidth.maybe_create(
+                max_width=32, num_depths=15, chain_rows=16, device=torch.device("cpu")
+            )
+        self.assertEqual(width.ragged.widths, [8])
+        self.assertEqual(width.choose_width(bs=4), RAGGED)
 
     def test_table_reads_per_batch_size_levels(self):
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
