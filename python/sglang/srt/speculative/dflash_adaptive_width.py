@@ -337,8 +337,9 @@ class VerifyWidthState(msgspec.Struct, frozen=True):
 _DUMP_FLUSH_STEPS = 64
 # Every this many sampled steps verify the runner-up member, and every this many of
 # those the members in turn, so the members the policy does not pick stay calibrated.
-# Exploring all members in turn every 32 steps cost about 1% of throughput at C16 on
-# Qwen (one step in eight at twice the cost); otherwise arbitrary.
+# Exploring all members in turn every 32 steps was estimated from the cost table to
+# cost about 1% of throughput at C16 on Qwen; otherwise arbitrary. Not used when the
+# cost table carries measured member accept lengths.
 _EXPLORE_EVERY = 32
 _EXPLORE_ROUND_ROBIN = 8
 # Per-member accept-length scale: decay per verify of the member, and the prior weight
