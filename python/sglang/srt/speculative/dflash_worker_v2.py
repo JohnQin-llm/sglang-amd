@@ -2643,8 +2643,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_chain,
     ) -> GenerationBatchResult:
         """The adaptive width's ragged chain member: draw a chain from the selector
-        lattice as the DFLASH chain path does, set each request's verify rows from the
-        lattice alone, and verify those rows on the chain path."""
+        lattice as the DFLASH chain path does (greedy rows take its argmax path), set
+        each request's verify rows from the lattice alone, and verify those rows on the
+        chain path."""
         adaptive = self._adaptive_width
         sampling_info = batch.sampling_info
         check_ragged_chain_batch(
@@ -2664,7 +2665,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             temperatures=temperatures,
             greedy_mask=greedy_mask,
         )
-        self._selector_sample = (candidate_ids, q_rows)
+        greedy = _is_all_greedy(sampling_info)
+        if not greedy:
+            self._selector_sample = (candidate_ids, q_rows)
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(bonus_tokens)
         draft_tokens[:, 1:].copy_(tokens.view(bs, num_pred))
@@ -2694,7 +2697,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_positions=verify_positions,
         )
         adaptive.after_ragged_verify(
-            accept_lens=result.accept_lens, verify_lens=rows.verify_lens
+            accept_lens=result.accept_lens, verify_lens=rows.verify_lens, greedy=greedy
         )
         return result
 
@@ -2736,6 +2739,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         width = self.tree_num_nodes
         greedy = _is_all_greedy(batch.sampling_info)
         if greedy:
+            if adaptive is not None:
+                width = adaptive.choose_width(bs=bs)
+                if width == RAGGED:
+                    return self._verify_ragged_member(
+                        batch=batch,
+                        bs=bs,
+                        candidate_ids=candidate_ids,
+                        scores=scores,
+                        bonus_tokens=bonus_tokens,
+                        positions=positions_2d.reshape(-1),
+                        verify_chain=verify_chain,
+                    )
             proposal = propose_dflash_tree(
                 candidate_ids=candidate_ids,
                 scores=scores,
@@ -2744,6 +2759,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 workspace=self._tree_workspace,
                 calibration=None if adaptive is None else adaptive.calibration_stats,
             )
+            if adaptive is not None:
+                adaptive.push_greedy(survival=proposal.survival, bs=bs)
         # Host-side check (no device sync): batches without greedy rows keep the plain
         # sampled tree.
         elif any(req.sampling_params.top_k <= 1 for req in batch.reqs):
@@ -2800,8 +2817,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_prior=self._tree_accept_prior,
             )
         if adaptive is not None:
-            if sampled_plan is None:
-                width = adaptive.select_width(survival=proposal.survival, bs=bs)
+            if sampled_plan is None and not greedy:
+                # A batch of greedy and sampling rows takes the greedy widths' choice,
+                # but not the ragged chain: it verifies the largest width instead.
+                width = adaptive.choose_width(bs=bs)
+                if width == RAGGED:
+                    width = self.tree_num_nodes
+                adaptive.push_greedy(survival=proposal.survival, bs=bs)
                 if node_draft_tokens is not None and width < self.tree_num_nodes:
                     # A sampled tree's prefix keeps each node's first draws, in draw
                     # order, and the width never depends on this step's draws.

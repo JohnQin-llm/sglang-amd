@@ -191,9 +191,10 @@ class AdaptiveWidthConfig(msgspec.Struct, frozen=True):
     batches with sampling rows; the largest tree width must be
     --speculative-num-draft-tokens. SGLANG_DFLASH_TREE_COST_TABLE is a JSON of
     ``{"cost_ms": {"<Q>": {"<bs>": ms}}, "sampled_cost_ms": {"chain" | "<Q>": ...}}``
-    (sampled batches fall back to ``cost_ms``); a sampled member's measured accept
-    length (``sampled_member_accept_len``) is one number, or ``{"<bs>": AL}`` for the
-    ragged chain, whose rows per request change with the batch size.
+    (sampled batches fall back to ``cost_ms``); a member's measured accept length
+    (``member_accept_len`` for greedy widths, ``sampled_member_accept_len`` for sampled
+    members) is one number, or ``{"<bs>": AL}`` for the ragged chain, whose rows per
+    request change with the batch size.
     SGLANG_DFLASH_TREE_FORCE_WIDTH verifies
     at this member every step where it is one (for measurements), and
     SGLANG_DFLASH_TREE_CALIBRATION_DUMP appends per-step predicted and actual accept
@@ -210,6 +211,7 @@ class AdaptiveWidthConfig(msgspec.Struct, frozen=True):
     rank_by_depth: bool = False
     sampled_accept_len: dict[int, dict[int, float]] = {}
     content_weight: float = 0.5
+    accept_len: dict[int, dict[int, float]] = {}
 
 
 def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
@@ -221,8 +223,8 @@ def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
         return None
     widths = _parse_members(value) if value else (max_width,)
     sampled_members = _parse_members(sampled_value) if sampled_value else widths
-    if any(is_chain(m) or m == RAGGED for m in widths):
-        raise ValueError("chain members are for sampled batches only")
+    if any(is_chain(m) for m in widths):
+        raise ValueError("tree-verified chain members are for sampled batches only")
     trees = sorted(
         m for m in set(widths) | set(sampled_members) if not is_chain(m) and m != RAGGED
     )
@@ -239,8 +241,8 @@ def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
             f"forced width {force} is not in {widths} or {sampled_members}"
         )
     table_path = os.environ.get("SGLANG_DFLASH_TREE_COST_TABLE")
-    cost_ms, sampled_cost_ms, sampled_accept_len = (
-        load_cost_table(table_path) if table_path else ({}, {}, {})
+    cost_ms, sampled_cost_ms, accept_len, sampled_accept_len = (
+        load_cost_table(table_path) if table_path else ({}, {}, {}, {})
     )
     for name, members, costs in (
         ("greedy", widths, cost_ms),
@@ -264,6 +266,7 @@ def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
         content_weight=float(
             os.environ.get("SGLANG_DFLASH_TREE_CONTENT_WEIGHT") or 0.5
         ),
+        accept_len=accept_len,
     )
 
 
@@ -273,12 +276,13 @@ def load_cost_table(
     dict[int, dict[int, float]],
     dict[int, dict[int, float]],
     dict[int, dict[int, float]],
+    dict[int, dict[int, float]],
 ]:
     """The greedy and sampled step-cost tables, ``{member: {bs: ms}}`` (the sampled one
-    is the greedy one where the file has no ``sampled_cost_ms``), and the sampled
-    members' measured accept lengths, ``{member: {bs: AL}}`` from
-    ``sampled_member_accept_len`` (a single number is the same at every batch size;
-    empty when absent)."""
+    is the greedy one where the file has no ``sampled_cost_ms``), and the greedy and
+    sampled members' measured accept lengths, ``{member: {bs: AL}}`` from
+    ``member_accept_len`` and ``sampled_member_accept_len`` (a single number is the
+    same at every batch size; empty when absent)."""
     with open(path) as f:
         raw = json.load(f)
 
@@ -290,15 +294,23 @@ def load_cost_table(
 
     greedy = table(raw["cost_ms"])
     sampled = table(raw["sampled_cost_ms"]) if "sampled_cost_ms" in raw else greedy
-    accept_len = {
-        _parse_members(q)[0]: (
-            {int(b): float(x) for b, x in al.items()}
-            if isinstance(al, dict)
-            else {1: float(al)}
-        )
-        for q, al in raw.get("sampled_member_accept_len", {}).items()
-    }
-    return greedy, sampled, accept_len
+
+    def levels(section: dict) -> dict[int, dict[int, float]]:
+        return {
+            _parse_members(q)[0]: (
+                {int(b): float(x) for b, x in al.items()}
+                if isinstance(al, dict)
+                else {1: float(al)}
+            )
+            for q, al in section.items()
+        }
+
+    return (
+        greedy,
+        sampled,
+        levels(raw.get("member_accept_len", {})),
+        levels(raw.get("sampled_member_accept_len", {})),
+    )
 
 
 def interpolate_cost(row: dict[int, float], bs: int) -> float:
@@ -440,10 +452,13 @@ _EXPLORE_ROUND_ROBIN = 8
 # scale by 25% on Glimmer at T=1; otherwise arbitrary.
 _MEMBER_SCALE_DECAY = 0.995
 _MEMBER_SCALE_PRIOR = 1000.0
-# Sampled decisions read an exponential average of the per-step predictions, weight per
-# step. Per-step choices on one request's noisy prediction picked the chain on steps
+# Decisions read an exponential average of the per-step predictions, weight per step.
+# Sampled: per-step choices on one request's noisy prediction picked the chain on steps
 # that looked easy, trained the chain's calibration on them, and lost 5-6% at C1 to the
-# best fixed tree on Glimmer and Qwen; the window length is otherwise arbitrary.
+# best fixed tree on Glimmer and Qwen. Greedy: replaying a forced-32 Qwen greedy sweep's
+# calibration dump, per-step choices lost 1.9% at bs 1-3 and 0.2% at bs 12-15 to the
+# best fixed width, the averaged ones were within 0.1% of it at every batch size. The
+# window length is otherwise arbitrary.
 _PREDICTION_AVERAGE = 1.0 / 32
 # With measured member accept lengths, a member's prediction is its measured length
 # times (its per-node estimate / that estimate's long-run average) ** content_weight:
@@ -484,7 +499,7 @@ class AdaptiveVerifyWidth:
         self.max_width = max(config.widths + config.sampled_members)
         self.chain_rows = chain_rows
         self.has_chain = any(is_chain(m) for m in config.sampled_members)
-        self.has_ragged = RAGGED in config.sampled_members
+        self.has_ragged = RAGGED in config.widths + config.sampled_members
         if self.has_ragged != (ragged is not None):
             raise ValueError(
                 "the sampled member 'ragged' needs SGLANG_DFLASH_RAGGED_CHAIN_TABLE, "
@@ -528,8 +543,11 @@ class AdaptiveVerifyWidth:
             if config.rank_by_depth
             else None
         )
+        # Tree widths; the ragged chain (first in widths) takes a column of ones.
         self._width_columns = torch.tensor(
-            [width - 1 for width in config.widths], dtype=torch.long, device=device
+            [width - 1 for width in config.widths if width > CHAIN],
+            dtype=torch.long,
+            device=device,
         )
         self._sampled_tree_columns = torch.tensor(
             [m - 1 for m in config.sampled_members if m > CHAIN],
@@ -545,7 +563,18 @@ class AdaptiveVerifyWidth:
         )
         force = config.force_width
         self._policy = self._stats = None
+        self._greedy_average: Optional[torch.Tensor] = None
+        self._greedy_raw_average: Optional[torch.Tensor] = None
+        # Host-side {bs: AL} per greedy width, when the table measured every one.
+        self._accept_len: Optional[list[dict[int, float]]] = None
+        if config.accept_len and all(m in config.accept_len for m in config.widths):
+            self._accept_len = [config.accept_len[m] for m in config.widths]
         if len(config.widths) > 1 and force not in config.widths:
+            if RAGGED in config.widths and self._accept_len is None:
+                raise ValueError(
+                    "choosing the ragged chain for greedy batches needs measured "
+                    "accept lengths (member_accept_len) for every greedy width"
+                )
             self._policy = VerifyWidthPolicy(
                 widths=config.widths, cost_ms=config.cost_ms
             )
@@ -646,7 +675,7 @@ class AdaptiveVerifyWidth:
         rows = {m for m in greedy + sampled if m > CHAIN}
         keys = sorted(rows - {self.max_width})
         chains = {m for m in sampled if is_chain(m)}
-        if RAGGED in sampled:
+        if RAGGED in greedy + sampled:
             chains |= {self.ragged_key(r) for r in self.ragged.widths}
         return sorted(chains) + keys
 
@@ -703,19 +732,46 @@ class AdaptiveVerifyWidth:
             (free_before - free_after) / (1 << 30),
         )
 
-    def select_width(self, *, survival, bs: int) -> int:
-        """Greedy batches: hand this step's expected accept lengths to a later step's
-        host decision and pick this step's width from an earlier one's. ``survival`` is
-        None for a tree without an acceptance estimate, verified at the largest width."""
+    def choose_width(self, *, bs: int) -> int:
+        """Greedy batches: the width (or the ragged chain) to verify, from earlier
+        steps' expected accept lengths (``push_greedy``), before this step's tree is
+        built."""
         force = self._config.force_width
         if force is not None and force in self.widths:
             return force
-        if survival is None or self._policy is None:
+        if self._policy is None:
             return self.max_width
-        self._stats.push(
-            survival.prefix_accept_len[:bs, self._width_columns].mean(dim=0)
-        )
-        return self._policy.choose(bs=bs, expected_accept_lens=self._stats.latest())
+        expected = self._stats.latest()
+        if self._accept_len is not None:
+            # The pushed values are content factors on the measured levels.
+            expected = [
+                interpolate_cost(level, bs) * factor
+                for level, factor in zip(self._accept_len, expected)
+            ]
+        return self._policy.choose(bs=bs, expected_accept_lens=expected)
+
+    def push_greedy(self, *, survival, bs: int) -> None:
+        """Hand this step's expected accept lengths at every greedy width (with
+        measured levels, their content factors), averaged over steps, to later
+        steps' choices. ``survival`` is None for a tree without an acceptance
+        estimate."""
+        if survival is None or self._policy is None:
+            return
+        mean = survival.prefix_accept_len[:bs, self._width_columns].mean(dim=0)
+        if RAGGED in self.widths:
+            mean = torch.cat([torch.ones(1, device=mean.device), mean])
+        if self._accept_len is not None:
+            if self._greedy_raw_average is None:
+                self._greedy_raw_average = mean.clone()
+            else:
+                self._greedy_raw_average.lerp_(mean, _RAW_AVERAGE)
+            mean = (mean / self._greedy_raw_average.clamp(min=1e-3)).clamp(min=1e-3)
+            mean = mean.pow(self._config.content_weight)
+        if self._greedy_average is None:
+            self._greedy_average = mean
+        else:
+            self._greedy_average.lerp_(mean, _PREDICTION_AVERAGE)
+        self._stats.push(self._greedy_average)
 
     def choose_sampled_member(self, *, bs: int) -> int:
         """Batches with sampling rows: the member to verify, from earlier steps'
@@ -878,13 +934,16 @@ class AdaptiveVerifyWidth:
         )
 
     def after_ragged_verify(
-        self, *, accept_lens: torch.Tensor, verify_lens: torch.Tensor
+        self, *, accept_lens: torch.Tensor, verify_lens: torch.Tensor, greedy: bool
     ) -> None:
         """A ragged chain verify updates no calibration (it verifies no tree build);
         the dump gets each request's accept length and verified rows."""
         if self._dump is not None:
             self._queue_dump(
-                {"kind": "sampled", "member": member_label(RAGGED)},
+                {
+                    "kind": "greedy" if greedy else "sampled",
+                    "member": member_label(RAGGED),
+                },
                 torch.stack([accept_lens.float(), verify_lens.float()], dim=1),
             )
 

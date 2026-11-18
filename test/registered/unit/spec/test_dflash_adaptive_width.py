@@ -191,7 +191,7 @@ class TestReadConfig(CustomTestCase):
         self.assertEqual(width.choose_sampled_member(bs=4), CHAIN)
         self.assertEqual(width.member_rows(CHAIN), 8)
         # Greedy batches keep the server width; only the chain needs its own graphs.
-        self.assertEqual(width.select_width(survival=None, bs=4), 32)
+        self.assertEqual(width.choose_width(bs=4), 32)
         self.assertEqual(width._captured_keys(), [CHAIN])
 
     def test_shorter_chain_members(self):
@@ -403,9 +403,14 @@ class TestRaggedMember(CustomTestCase):
             config = read_adaptive_width_config(32)
         self.assertEqual(config.sampled_members, (RAGGED, CHAIN, 32))
         self.assertEqual(config.force_width, RAGGED)
-        with patch.dict(os.environ, {"SGLANG_DFLASH_TREE_WIDTHS": "ragged,32"}):
-            with self.assertRaises(ValueError):
-                read_adaptive_width_config(32)
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_DFLASH_TREE_WIDTHS": "ragged,32",
+                "SGLANG_DFLASH_TREE_FORCE_WIDTH": "ragged",
+            },
+        ):
+            self.assertEqual(read_adaptive_width_config(32).widths, (RAGGED, 32))
 
     def test_table_reads_per_batch_size_levels(self):
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
@@ -421,7 +426,8 @@ class TestRaggedMember(CustomTestCase):
         )
         f.close()
         self.addCleanup(os.unlink, f.name)
-        _, _, accept_len = load_cost_table(f.name)
+        _, _, greedy_levels, accept_len = load_cost_table(f.name)
+        self.assertEqual(greedy_levels, {})
         self.assertEqual(accept_len, {RAGGED: {1: 5.4, 16: 4.9}, CHAIN: {1: 5.36}})
 
     def test_needs_the_table_exactly_with_the_member(self):
@@ -477,6 +483,71 @@ class TestRaggedMember(CustomTestCase):
             }
         )
         self.assertEqual(cheap_tree.choose_sampled_member(bs=16), 8)
+
+
+class TestGreedyPolicy(CustomTestCase):
+    def _width(self, accept_len=None, widths=(8, 16)):
+        config = AdaptiveWidthConfig(
+            widths=widths,
+            sampled_members=(16,),
+            # Shaped like Qwen at bs 16: 16 nodes cost 21% more than 8.
+            cost_ms={RAGGED: {16: 19.0}, 8: {16: 20.0}, 16: {16: 24.2}},
+            sampled_cost_ms={},
+            force_width=None,
+            calibration_dump=None,
+            accept_len=accept_len or {},
+        )
+        width = AdaptiveVerifyWidth(
+            config=config,
+            num_depths=15,
+            chain_rows=16,
+            device=torch.device("cpu"),
+            ragged=_ragged_policy([[4096, 8]]) if RAGGED in widths else None,
+        )
+        width._stats._events = [_FakeEvent() for _ in range(4)]
+        return width
+
+    def _push(self, width, al8, al16):
+        survival = SimpleNamespace(
+            prefix_accept_len=torch.tensor([[1.0] * 7 + [al8] + [1.0] * 7 + [al16]])
+        )
+        width.push_greedy(survival=survival, bs=1)
+        for event in width._stats._events:
+            event.done = True
+
+    def test_one_noisy_step_does_not_switch(self):
+        width = self._width()
+        for _ in range(100):
+            self._push(width, 4.4, 4.9)
+        self.assertEqual(width.choose_width(bs=16), 8)
+        # One step predicting 16 a third better than 8: the average barely moves.
+        self._push(width, 4.0, 5.4)
+        self.assertEqual(width.choose_width(bs=16), 8)
+        # A lasting change does switch.
+        for _ in range(100):
+            self._push(width, 4.0, 5.4)
+        self.assertEqual(width.choose_width(bs=16), 16)
+
+    def test_measured_levels(self):
+        # The per-node model favors 16 by 30%; the measured levels by 10%, under the
+        # cost ratio.
+        width = self._width(accept_len={8: {1: 4.6}, 16: {1: 5.06}})
+        self._push(width, 4.0, 5.2)
+        self.assertEqual(width.choose_width(bs=16), 8)
+
+    def test_ragged_chain_for_greedy_batches(self):
+        with self.assertRaises(ValueError):
+            self._width(widths=(RAGGED, 8, 16))
+        width = self._width(
+            accept_len={RAGGED: {16: 4.5}, 8: {1: 4.6}, 16: {1: 5.06}},
+            widths=(RAGGED, 8, 16),
+        )
+        self.assertEqual(width.choose_width(bs=16), RAGGED)
+        self.assertEqual(width._captured_keys(), [-8, 8])
+        self._push(width, 4.4, 4.9)
+        torch.testing.assert_close(
+            width._greedy_average, torch.ones(3), rtol=1e-6, atol=1e-6
+        )
 
 
 class TestStaleDeviceStats(CustomTestCase):
