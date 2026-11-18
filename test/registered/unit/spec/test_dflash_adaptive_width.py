@@ -257,6 +257,51 @@ class TestSampledPolicy(CustomTestCase):
         )
 
 
+class TestMeasuredMemberLevels(CustomTestCase):
+    def _width(self):
+        config = AdaptiveWidthConfig(
+            widths=(16,),
+            sampled_members=(CHAIN, 8),
+            cost_ms={},
+            # Glimmer at bs 16: the chain verifies 16 rows, the 8-node tree 8.
+            sampled_cost_ms={CHAIN: {16: 25.64}, 8: {16: 20.53}},
+            force_width=None,
+            calibration_dump=None,
+            sampled_accept_len={CHAIN: 5.35, 8: 4.62},
+        )
+        width = AdaptiveVerifyWidth(
+            config=config, num_depths=15, chain_rows=16, device=torch.device("cpu")
+        )
+        width._sampled_stats._events = [_FakeEvent() for _ in range(4)]
+        return width
+
+    def _predict(self, width, chain_al, tree_al):
+        tree = SimpleNamespace(prefix_accept_len=torch.full((16, 16), tree_al))
+        chain = SimpleNamespace(prefix_accept_len=torch.full((16, 16), chain_al))
+        width.predict_sampled(tree_survival=tree, chain_survival=chain, bs=16)
+        for event in width._sampled_stats._events:
+            event.done = True
+
+    def test_levels_come_from_the_measured_lengths(self):
+        # The per-node model favors the chain by 30%; its level is ignored.
+        width = self._width()
+        self._predict(width, chain_al=6.5, tree_al=5.0)
+        self.assertEqual(width.choose_sampled_member(bs=16), 8)
+
+    def test_content_moves_the_choice(self):
+        width = self._width()
+        for _ in range(200):
+            self._predict(width, chain_al=5.0, tree_al=5.0)
+        # Content that lifts the chain's estimate well over its long-run average (and
+        # not the tree's) makes the chain the faster member.
+        for _ in range(40):
+            self._predict(width, chain_al=9.0, tree_al=5.0)
+        self.assertEqual(width.choose_sampled_member(bs=16), CHAIN)
+        # No exploration steps: every pick is the policy's.
+        picks = {width.choose_sampled_member(bs=16) for _ in range(64)}
+        self.assertEqual(picks, {CHAIN})
+
+
 class TestStaleDeviceStats(CustomTestCase):
     def test_reads_only_finished_copies_newest_last(self):
         stats = StaleDeviceStats(

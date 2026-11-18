@@ -157,6 +157,8 @@ class AdaptiveWidthConfig(msgspec.Struct, frozen=True):
     force_width: Optional[int]
     calibration_dump: Optional[str]
     rank_by_depth: bool = False
+    sampled_accept_len: dict[int, float] = {}
+    content_weight: float = 0.5
 
 
 def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
@@ -184,7 +186,9 @@ def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
             f"forced width {force} is not in {widths} or {sampled_members}"
         )
     table_path = os.environ.get("SGLANG_DFLASH_TREE_COST_TABLE")
-    cost_ms, sampled_cost_ms = load_cost_table(table_path) if table_path else ({}, {})
+    cost_ms, sampled_cost_ms, sampled_accept_len = (
+        load_cost_table(table_path) if table_path else ({}, {}, {})
+    )
     for name, members, costs in (
         ("greedy", widths, cost_ms),
         ("sampled", sampled_members, sampled_cost_ms),
@@ -203,14 +207,20 @@ def read_adaptive_width_config(max_width: int) -> Optional[AdaptiveWidthConfig]:
         force_width=force_width,
         calibration_dump=calibration_dump,
         rank_by_depth=os.environ.get("SGLANG_DFLASH_TREE_RANK") == "depth",
+        sampled_accept_len=sampled_accept_len,
+        content_weight=float(
+            os.environ.get("SGLANG_DFLASH_TREE_CONTENT_WEIGHT") or 0.5
+        ),
     )
 
 
 def load_cost_table(
     path: str,
-) -> tuple[dict[int, dict[int, float]], dict[int, dict[int, float]]]:
-    """The greedy and sampled step-cost tables, ``{member: {bs: ms}}``; the sampled one
-    is the greedy one where the file has no ``sampled_cost_ms``."""
+) -> tuple[dict[int, dict[int, float]], dict[int, dict[int, float]], dict[int, float]]:
+    """The greedy and sampled step-cost tables, ``{member: {bs: ms}}`` (the sampled one
+    is the greedy one where the file has no ``sampled_cost_ms``), and the sampled
+    members' measured accept lengths, ``{member: AL}`` from ``sampled_member_accept_len``
+    (empty when absent)."""
     with open(path) as f:
         raw = json.load(f)
 
@@ -221,7 +231,12 @@ def load_cost_table(
         }
 
     greedy = table(raw["cost_ms"])
-    return greedy, table(raw["sampled_cost_ms"]) if "sampled_cost_ms" in raw else greedy
+    sampled = table(raw["sampled_cost_ms"]) if "sampled_cost_ms" in raw else greedy
+    accept_len = {
+        _parse_members(q)[0]: float(al)
+        for q, al in raw.get("sampled_member_accept_len", {}).items()
+    }
+    return greedy, sampled, accept_len
 
 
 def interpolate_cost(row: dict[int, float], bs: int) -> float:
@@ -337,6 +352,12 @@ _MEMBER_SCALE_PRIOR = 1000.0
 # that looked easy, trained the chain's calibration on them, and lost 5-6% at C1 to the
 # best fixed tree on Glimmer and Qwen; the window length is otherwise arbitrary.
 _PREDICTION_AVERAGE = 1.0 / 32
+# With measured member accept lengths, a member's prediction is its measured length
+# times (its per-node estimate / that estimate's long-run average) ** content_weight:
+# the per-node model only says how this content differs from the average, since its
+# level per member was 5-10% off in relative terms (Glimmer C16: chain vs tree8) under
+# traversal verification. The long-run window is arbitrary.
+_RAW_AVERAGE = 1.0 / 256
 
 
 class AdaptiveVerifyWidth:
@@ -406,6 +427,16 @@ class AdaptiveVerifyWidth:
             )
         self._sampled_policy = self._sampled_stats = None
         self._sampled_average: Optional[torch.Tensor] = None
+        self._raw_average: Optional[torch.Tensor] = None
+        self._static_accept_len = None
+        if config.sampled_accept_len and all(
+            m in config.sampled_accept_len for m in config.sampled_members
+        ):
+            self._static_accept_len = torch.tensor(
+                [config.sampled_accept_len[m] for m in config.sampled_members],
+                dtype=torch.float32,
+                device=device,
+            )
         self._sampled_steps = 0
         # Decayed sums of actual and predicted (per-node model) accept length over each
         # member's verifies; their ratio rescales the member's prediction.
@@ -537,7 +568,8 @@ class AdaptiveVerifyWidth:
             bs=bs, expected_accept_lens=self._sampled_stats.latest()
         )
         self._sampled_steps += 1
-        if self._sampled_steps % _EXPLORE_EVERY:
+        # Measured member levels need no exploration to stay calibrated.
+        if self._static_accept_len is not None or self._sampled_steps % _EXPLORE_EVERY:
             return ranked[0]
         explorations = self._sampled_steps // _EXPLORE_EVERY
         if explorations % _EXPLORE_ROUND_ROBIN:
@@ -571,12 +603,22 @@ class AdaptiveVerifyWidth:
         predicted = raw * scale
         if self._sampled_policy is not None:
             mean = predicted.mean(dim=0)
+            if self._static_accept_len is not None:
+                mean = self._content_scaled(raw.mean(dim=0))
             if self._sampled_average is None:
                 self._sampled_average = mean
             else:
                 self._sampled_average.lerp_(mean, _PREDICTION_AVERAGE)
             self._sampled_stats.push(self._sampled_average)
         return torch.cat([predicted, raw], dim=1)
+
+    def _content_scaled(self, mean_raw: torch.Tensor) -> torch.Tensor:
+        if self._raw_average is None:
+            self._raw_average = mean_raw.clone()
+        else:
+            self._raw_average.lerp_(mean_raw, _RAW_AVERAGE)
+        content = (mean_raw / self._raw_average.clamp(min=1e-3)).clamp(min=1e-3)
+        return self._static_accept_len * content.pow(self._config.content_weight)
 
     def activate(self, key: int, model_runner) -> None:
         """Switch the target to the verify state of ``key``: a tree width, or CHAIN."""
