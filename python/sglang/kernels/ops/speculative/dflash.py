@@ -388,6 +388,199 @@ def selector_collision_mass(*, scores, temperatures, out=None):
 
 
 @triton.jit
+def _ragged_chain_rows_kernel(
+    mass_ptr,
+    edges_ptr,
+    gains_ptr,
+    draft_tokens_ptr,
+    positions_ptr,
+    verify_lens_ptr,
+    qo_indptr_ptr,
+    token_reqs_ptr,
+    block_index_ptr,
+    packed_tokens_ptr,
+    packed_positions_ptr,
+    bs,
+    num_extra,
+    num_rows,
+    NUM_EDGES: tl.constexpr,
+    GAINS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BS_PAD: tl.constexpr,
+    EDGES_PAD: tl.constexpr,
+    GAINS_PAD: tl.constexpr,
+    ROWS_PAD: tl.constexpr,
+    ROW_CHUNK: tl.constexpr,
+):
+    """One program: each request verifies 1 + its share of the batch's num_extra
+    largest marginal gains (ties to the earlier request), then the packed rows."""
+    req = tl.arange(0, BS_PAD)
+    req_ok = req < bs
+    edge = tl.arange(0, EDGES_PAD)
+    mass = tl.load(mass_ptr + req, mask=req_ok, other=0.0)
+    edges = tl.load(edges_ptr + edge, mask=edge < NUM_EDGES, other=float("inf"))
+    # torch.bucketize(mass, edges): the number of edges below the mass.
+    bins = tl.sum((edges[None, :] < mass[:, None]).to(tl.int32), axis=1)
+    col = tl.arange(0, GAINS_PAD)
+    # Gains are >= 0, so the -1 padding is never among the num_extra largest.
+    gains = tl.load(
+        gains_ptr + bins[:, None] * GAINS + col[None, :],
+        mask=req_ok[:, None] & (col[None, :] < GAINS),
+        other=-1.0,
+    )
+    ranked = tl.sort(tl.reshape(gains, (BS_PAD * GAINS_PAD,)), descending=True)
+    rank = tl.arange(0, BS_PAD * GAINS_PAD)
+    threshold = tl.max(tl.where(rank == num_extra - 1, ranked, -2.0), axis=0)
+    threshold = tl.where(num_extra > 0, threshold, float("inf"))
+    above = tl.sum((gains > threshold).to(tl.int32), axis=1)
+    ties = tl.sum((gains == threshold).to(tl.int32), axis=1)
+    left = num_extra - tl.sum(above, axis=0)
+    take = tl.minimum(tl.maximum(left - (tl.cumsum(ties, axis=0) - ties), 0), ties)
+    verify_lens = tl.where(req_ok, 1 + above + take, 0)
+    ends = tl.cumsum(verify_lens, axis=0)
+    starts = ends - verify_lens
+    tl.store(verify_lens_ptr + req, verify_lens, mask=req_ok)
+    tl.store(qo_indptr_ptr + 1 + req, ends, mask=req_ok)
+    tl.store(qo_indptr_ptr + req, starts, mask=req == 0)
+    for chunk in tl.static_range(0, ROWS_PAD, ROW_CHUNK):
+        row = chunk + tl.arange(0, ROW_CHUNK)
+        row_ok = row < num_rows
+        ended = (ends[None, :] <= row[:, None]) & req_ok[None, :]
+        owner = tl.sum(ended.to(tl.int32), axis=1)
+        owner_start = tl.sum(
+            tl.where(req[None, :] == owner[:, None], starts[None, :], 0), axis=1
+        )
+        index = owner.to(tl.int64) * BLOCK + (row - owner_start)
+        tl.store(token_reqs_ptr + row, owner, mask=row_ok)
+        tl.store(block_index_ptr + row, index, mask=row_ok)
+        tl.store(
+            packed_tokens_ptr + row,
+            tl.load(draft_tokens_ptr + index, mask=row_ok, other=0),
+            mask=row_ok,
+        )
+        tl.store(
+            packed_positions_ptr + row,
+            tl.load(positions_ptr + index, mask=row_ok, other=0),
+            mask=row_ok,
+        )
+
+
+def ragged_chain_rows(
+    *,
+    collision_mass: torch.Tensor,
+    bin_edges: torch.Tensor,
+    gains: torch.Tensor,
+    rows_per_request: int,
+    draft_tokens: torch.Tensor,
+    positions: torch.Tensor,
+):
+    """Each request's verify rows from its collision-mass bin's marginal accept
+    lengths (``gains`` [bins, block - 1], non-increasing), summing to
+    rows_per_request * bs, and the packed rows: (verify_lens [bs] int32,
+    qo_indptr [bs + 1] int32, token_reqs [rows] int32, block_index [rows] int64
+    into the [bs, block] ``draft_tokens`` / ``positions``, packed tokens, packed
+    positions)."""
+    bs, block = draft_tokens.shape
+    device = draft_tokens.device
+    num_rows = rows_per_request * bs
+    verify_lens = torch.empty(bs, dtype=torch.int32, device=device)
+    qo_indptr = torch.empty(bs + 1, dtype=torch.int32, device=device)
+    token_reqs = torch.empty(num_rows, dtype=torch.int32, device=device)
+    block_index = torch.empty(num_rows, dtype=torch.int64, device=device)
+    packed_tokens = torch.empty(num_rows, dtype=draft_tokens.dtype, device=device)
+    packed_positions = torch.empty(num_rows, dtype=positions.dtype, device=device)
+    rows_pad = triton.next_power_of_2(num_rows)
+    _ragged_chain_rows_kernel[(1,)](
+        collision_mass.contiguous(),
+        bin_edges,
+        gains,
+        draft_tokens.contiguous(),
+        positions.contiguous(),
+        verify_lens,
+        qo_indptr,
+        token_reqs,
+        block_index,
+        packed_tokens,
+        packed_positions,
+        bs,
+        (rows_per_request - 1) * bs,
+        num_rows,
+        NUM_EDGES=bin_edges.numel(),
+        GAINS=block - 1,
+        BLOCK=block,
+        BS_PAD=triton.next_power_of_2(bs),
+        EDGES_PAD=triton.next_power_of_2(bin_edges.numel()),
+        GAINS_PAD=triton.next_power_of_2(block - 1),
+        ROWS_PAD=rows_pad,
+        ROW_CHUNK=min(rows_pad, 128),
+        num_warps=4,
+    )
+    return (
+        verify_lens,
+        qo_indptr,
+        token_reqs,
+        block_index,
+        packed_tokens,
+        packed_positions,
+    )
+
+
+@triton.jit
+def _pad_chain_rows_kernel(
+    live_qo_indptr_ptr,
+    live_token_reqs_ptr,
+    qo_indptr_ptr,
+    token_reqs_ptr,
+    live_bs,
+    bs,
+    rows_per_request,
+    BS_PAD: tl.constexpr,
+    ROWS_PAD: tl.constexpr,
+    ROW_CHUNK: tl.constexpr,
+):
+    req = tl.arange(0, BS_PAD)
+    live_rows = live_bs * rows_per_request
+    is_live = req <= live_bs
+    qo = tl.load(live_qo_indptr_ptr + req, mask=is_live & (live_bs > 0), other=0)
+    qo = tl.where(is_live, qo, live_rows + (req - live_bs) * rows_per_request)
+    tl.store(qo_indptr_ptr + req, qo, mask=req <= bs)
+    for chunk in tl.static_range(0, ROWS_PAD, ROW_CHUNK):
+        row = chunk + tl.arange(0, ROW_CHUNK)
+        live = row < live_rows
+        owner = tl.load(live_token_reqs_ptr + row, mask=live, other=0)
+        owner = tl.where(live, owner, live_bs + (row - live_rows) // rows_per_request)
+        tl.store(token_reqs_ptr + row, owner, mask=row < bs * rows_per_request)
+
+
+def pad_chain_rows(
+    *,
+    live_qo_indptr,
+    live_token_reqs,
+    live_bs: int,
+    bs: int,
+    rows_per_request: int,
+    qo_indptr_out,
+    token_reqs_out,
+):
+    """The first live_bs requests' ragged rows, then rows_per_request rows for each
+    of the bs - live_bs padding requests, into [bs + 1] / [bs * rows] buffers."""
+    rows_pad = triton.next_power_of_2(max(1, bs * rows_per_request))
+    _pad_chain_rows_kernel[(1,)](
+        live_qo_indptr,
+        live_token_reqs,
+        qo_indptr_out,
+        token_reqs_out,
+        live_bs,
+        bs,
+        rows_per_request,
+        BS_PAD=triton.next_power_of_2(bs + 1),
+        ROWS_PAD=rows_pad,
+        ROW_CHUNK=min(rows_pad, 256),
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _fused_correct_drafts_and_bonus_kernel(
     candidates_ptr,
     target_predict_ptr,

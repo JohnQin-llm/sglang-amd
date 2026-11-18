@@ -2363,12 +2363,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _plan_ragged_chain(
-        self, *, batch: ScheduleBatch, bs: int, draft_ran_graph: bool
-    ) -> Optional[RaggedChainRows]:
-        """This step's verify rows per request, from the draft's collision mass, and
-        the target verify state for their total; None without ragged chains."""
+        self,
+        *,
+        batch: ScheduleBatch,
+        bs: int,
+        draft_ran_graph: bool,
+        draft_tokens: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[Optional[RaggedChainRows], torch.Tensor, torch.Tensor]:
+        """This step's verify rows per request, from the draft's collision mass, the
+        verify's packed tokens and positions, and the target verify state for their
+        total; without ragged chains, no rows and the whole block."""
         if self._ragged_chain is None:
-            return None
+            return None, draft_tokens.reshape(-1), positions
         check_ragged_chain_batch(
             sampling_info=batch.sampling_info,
             has_grammar=batch.has_grammar,
@@ -2378,11 +2385,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             collision_mass = self._draft_sampler.collision_mass_out[:bs]
         else:
             collision_mass = self._collision_mass
-        rows = self._ragged_chain.plan(collision_mass=collision_mass)
+        rows, tokens, packed_positions = self._ragged_chain.plan(
+            collision_mass=collision_mass,
+            draft_tokens=draft_tokens,
+            positions=positions,
+        )
         self._ragged_chain.activate(
             rows.rows_per_request, self.target_worker.model_runner
         )
-        return rows
+        return rows, tokens, packed_positions
 
     def _accept_block(
         self,
@@ -3280,14 +3291,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
-        ragged_rows = self._plan_ragged_chain(
-            batch=batch, bs=bs, draft_ran_graph=draft_out.can_run_graph
+        ragged_rows, verify_input_ids, verify_positions = self._plan_ragged_chain(
+            batch=batch,
+            bs=bs,
+            draft_ran_graph=draft_out.can_run_graph,
+            draft_tokens=draft_tokens,
+            positions=positions,
         )
-        verify_input_ids = draft_tokens.reshape(-1)
-        verify_positions = positions
-        if ragged_rows is not None:
-            verify_input_ids = verify_input_ids[ragged_rows.block_index]
-            verify_positions = positions[ragged_rows.block_index]
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
             positions=verify_positions,

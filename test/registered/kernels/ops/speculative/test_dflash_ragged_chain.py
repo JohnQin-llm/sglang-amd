@@ -123,3 +123,86 @@ def test_packed_rows_and_graph_padding():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+@pytest.mark.parametrize(
+    "bs,rows_per_request", [(16, 8), (13, 8), (8, 10), (3, 12), (2, 16), (32, 1)]
+)
+def test_fused_rows_match_the_torch_split(bs, rows_per_request):
+    """The one-kernel split and layout equal the torch ops (distinct gains: no ties)."""
+    gen = torch.Generator().manual_seed(bs * 100 + rows_per_request)
+    block, bins = 16, 20
+    gains = (
+        torch.rand(bins, block - 1, generator=gen).sort(dim=1, descending=True).values
+    )
+    curves = torch.cat([torch.ones(bins, 1), 1 + gains.cumsum(1)], 1)
+    policy = _policy(curves.tolist())
+    mass = torch.rand(bs, generator=gen) * bins
+    draft_tokens = torch.randint(0, 1000, (bs, block), generator=gen)
+    positions = torch.randint(0, 5000, (bs, block), generator=gen)
+    expected, tokens, packed = policy.plan(
+        collision_mass=mass, rows_per_request=rows_per_request,
+        draft_tokens=draft_tokens, positions=positions,
+    )  # fmt: skip
+    gpu = _policy(curves.tolist())
+    gpu._bin_edges, gpu._gains = gpu._bin_edges.cuda(), gpu._gains.cuda()
+    rows, gpu_tokens, gpu_packed = gpu.plan(
+        collision_mass=mass.cuda(), rows_per_request=rows_per_request,
+        draft_tokens=draft_tokens.cuda(), positions=positions.cuda(),
+    )  # fmt: skip
+    for name in ("verify_lens", "qo_indptr", "token_reqs", "block_index"):
+        assert getattr(rows, name).tolist() == getattr(expected, name).tolist(), name
+    assert gpu_tokens.tolist() == tokens.tolist()
+    assert gpu_packed.tolist() == packed.tolist()
+
+
+def test_fused_rows_split_ties_to_the_earlier_request():
+    policy = _policy([[1.0, 2.0, 2.5, 3.0]] * 2)
+    policy._bin_edges, policy._gains = policy._bin_edges.cuda(), policy._gains.cuda()
+    rows, _, _ = policy.plan(
+        collision_mass=torch.zeros(3, device="cuda"), rows_per_request=2,
+        draft_tokens=torch.zeros(3, 4, dtype=torch.long, device="cuda"),
+        positions=torch.zeros(3, 4, dtype=torch.long, device="cuda"),
+    )  # fmt: skip
+    # Equal curves: the three extra rows take each request's 1.0 gain, in order.
+    assert rows.verify_lens.tolist() == [2, 2, 2]
+    rows, _, _ = policy.plan(
+        collision_mass=torch.zeros(2, device="cuda"), rows_per_request=3,
+        draft_tokens=torch.zeros(2, 4, dtype=torch.long, device="cuda"),
+        positions=torch.zeros(2, 4, dtype=torch.long, device="cuda"),
+    )  # fmt: skip
+    # Gains 1, .5, .5 each, four extra rows: both 1s, then the earlier request's .5s.
+    assert rows.verify_lens.tolist() == [4, 2]
+
+
+@pytest.mark.parametrize("live_bs", [0, 3, 5])
+def test_graph_padding_kernel_matches_torch(live_bs):
+    bs, rows_per_request = 5, 4
+    rows = None
+    if live_bs:
+        lens = torch.tensor([1, 7, 4, 4, 4][:live_bs], dtype=torch.int32)
+        lens[-1] += rows_per_request * live_bs - int(lens.sum())
+        rows = RaggedChainRows.build(
+            verify_lens=lens, rows_per_request=rows_per_request, block=16
+        )
+    outs = []
+    for device in ("cpu", "cuda"):
+        live = None
+        if rows is not None:
+            live = RaggedChainRows(
+                verify_lens=rows.verify_lens.to(device),
+                qo_indptr=rows.qo_indptr.to(device),
+                token_reqs=rows.token_reqs.to(device),
+                block_index=rows.block_index.to(device),
+                rows_per_request=rows_per_request,
+            )
+        qo_indptr = torch.full((bs + 2,), -1, dtype=torch.int32, device=device)
+        token_reqs = torch.full(
+            (bs * rows_per_request + 3,), -1, dtype=torch.int32, device=device
+        )
+        fill_padded_chain_rows(
+            rows=live, bs=bs, rows_per_request=rows_per_request,
+            qo_indptr_out=qo_indptr, token_reqs_out=token_reqs,
+        )  # fmt: skip
+        outs.append((qo_indptr.tolist(), token_reqs.tolist()))
+    assert outs[0] == outs[1]

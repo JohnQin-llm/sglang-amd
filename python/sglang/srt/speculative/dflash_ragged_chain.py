@@ -104,6 +104,19 @@ def fill_padded_chain_rows(
     live requests' ragged rows, then rows_per_request rows for each graph padding
     request (all of them with no ragged rows: graph capture, a uniform chain)."""
     device = qo_indptr_out.device
+    if device.type == "cuda":
+        from sglang.kernels.ops.speculative.dflash import pad_chain_rows
+
+        pad_chain_rows(
+            live_qo_indptr=qo_indptr_out if rows is None else rows.qo_indptr,
+            live_token_reqs=token_reqs_out if rows is None else rows.token_reqs,
+            live_bs=0 if rows is None else rows.verify_lens.numel(),
+            bs=bs,
+            rows_per_request=rows_per_request,
+            qo_indptr_out=qo_indptr_out,
+            token_reqs_out=token_reqs_out,
+        )
+        return
     verify_lens = torch.full((bs,), rows_per_request, dtype=torch.int32, device=device)
     if rows is not None:
         verify_lens[: rows.verify_lens.numel()] = rows.verify_lens
@@ -158,6 +171,50 @@ class RaggedChainPolicy:
             picked // (self.block - 1),
             torch.ones(extra, dtype=torch.int32, device=device),
         )
+
+    def plan(
+        self,
+        *,
+        collision_mass: torch.Tensor,
+        rows_per_request: int,
+        draft_tokens: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[RaggedChainRows, torch.Tensor, torch.Tensor]:
+        if not collision_mass.is_cuda:
+            rows = RaggedChainRows.build(
+                verify_lens=self.verify_lens(
+                    collision_mass=collision_mass, rows_per_request=rows_per_request
+                ),
+                rows_per_request=rows_per_request,
+                block=self.block,
+            )
+            return (
+                rows,
+                draft_tokens.reshape(-1)[rows.block_index],
+                positions.reshape(-1)[rows.block_index],
+            )
+        from sglang.kernels.ops.speculative.dflash import ragged_chain_rows
+
+        # One kernel for the split and the layout: as separate torch ops they
+        # added about 25 launches per step.
+        verify_lens, qo_indptr, token_reqs, block_index, tokens, packed_positions = (
+            ragged_chain_rows(
+                collision_mass=collision_mass,
+                bin_edges=self._bin_edges,
+                gains=self._gains,
+                rows_per_request=rows_per_request,
+                draft_tokens=draft_tokens,
+                positions=positions.view(draft_tokens.shape),
+            )
+        )
+        rows = RaggedChainRows(
+            verify_lens=verify_lens,
+            qo_indptr=qo_indptr,
+            token_reqs=token_reqs,
+            block_index=block_index,
+            rows_per_request=rows_per_request,
+        )
+        return rows, tokens, packed_positions
 
 
 class _VerifyState(msgspec.Struct, frozen=True):
@@ -241,14 +298,20 @@ class RaggedChainVerify:
         model_runner.decode_cuda_graph_runner = state.graph_runner
         self._active = rows_per_request
 
-    def plan(self, *, collision_mass: torch.Tensor) -> RaggedChainRows:
-        rows_per_request = self.policy.rows_per_request(collision_mass.numel())
-        return RaggedChainRows.build(
-            verify_lens=self.policy.verify_lens(
-                collision_mass=collision_mass, rows_per_request=rows_per_request
-            ),
-            rows_per_request=rows_per_request,
-            block=self.block,
+    def plan(
+        self,
+        *,
+        collision_mass: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[RaggedChainRows, torch.Tensor, torch.Tensor]:
+        """This step's rows and the verify's packed tokens and positions, from the
+        [bs, block] drafted ``draft_tokens`` and ``positions``."""
+        return self.policy.plan(
+            collision_mass=collision_mass,
+            rows_per_request=self.policy.rows_per_request(collision_mass.numel()),
+            draft_tokens=draft_tokens,
+            positions=positions,
         )
 
 
