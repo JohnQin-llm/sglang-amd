@@ -110,6 +110,8 @@ def _sparse_chain_speculative_sampling_kernel(
     TargetProbs,
     DraftIds,
     DraftProbs,
+    VerifyLens,
+    TargetRowStarts,
     stride_cand_b,
     stride_idx_b,
     stride_uni_b,
@@ -131,7 +133,14 @@ def _sparse_chain_speculative_sampling_kernel(
     cand_base = Candidates + pid * stride_cand_b
     idx_base = RetriveIndex + pid * stride_idx_b
     uni_base = UniformSamples + pid * stride_uni_b
-    t_base = pid.to(tl.int64) * stride_t_b
+    # A ragged chain verifies its first num_slots - 1 drafts, with its target rows
+    # packed from TargetRowStarts[pid]; otherwise every request has NUM_SLOTS rows.
+    if VerifyLens is None:
+        num_slots = NUM_SLOTS
+        t_base = pid.to(tl.int64) * stride_t_b
+    else:
+        num_slots = tl.load(VerifyLens + pid)
+        t_base = tl.load(TargetRowStarts + pid).to(tl.int64) * stride_t_s
     d_base = pid.to(tl.int64) * stride_d_b
 
     root_global_idx = tl.load(idx_base)
@@ -147,16 +156,23 @@ def _sparse_chain_speculative_sampling_kernel(
         prefix_prob = 1.0
         prefix_probs = ()
         for step in tl.static_range(1, NUM_SLOTS):
+            # Slots past a ragged chain's own read its first target row instead and
+            # count as rejected.
+            in_chain = step < num_slots
             draft_token = tl.load(cand_base + step).to(tl.int64)
             t_ids, t_vals = row_support(
-                TargetIds, TargetProbs, t_base + (step - 1) * stride_t_s, K, K_PAD
+                TargetIds,
+                TargetProbs,
+                t_base + tl.where(in_chain, step - 1, 0) * stride_t_s,
+                K,
+                K_PAD,
             )
             d_ids, d_vals = row_support(
                 DraftIds, DraftProbs, d_base + (step - 1) * stride_d_s, KQ, KQ_PAD
             )
             p = _lookup(t_ids, t_vals, draft_token)
             q = _lookup(d_ids, d_vals, draft_token)
-            q_is_prob = (q > 0.0) & (q <= 1.0)
+            q_is_prob = (q > 0.0) & (q <= 1.0) & in_chain
             prefix_prob = tl.where(q_is_prob, tl.minimum(prefix_prob * p / q, 1.0), 0.0)
             prefix_probs += (prefix_prob,)
 
@@ -168,7 +184,7 @@ def _sparse_chain_speculative_sampling_kernel(
                     accept_prob = prefix_prob
                     residual_mass = -1.0
                     if (
-                        (step < NUM_SLOTS - 1)
+                        (step < num_slots - 1)
                         & (prefix_prob > 0.0)
                         & (prefix_prob < 1.0)
                     ):
@@ -199,7 +215,7 @@ def _sparse_chain_speculative_sampling_kernel(
     else:
         step = 1
         continue_verifying = 1
-        while (step < NUM_SLOTS) and (continue_verifying == 1):
+        while (step < num_slots) and (continue_verifying == 1):
             draft_token = tl.load(cand_base + step).to(tl.int64)
             t_ids, t_vals = row_support(
                 TargetIds, TargetProbs, t_base + (step - 1) * stride_t_s, K, K_PAD
@@ -226,7 +242,7 @@ def _sparse_chain_speculative_sampling_kernel(
     tl.store(AcceptTokenNum + pid, num_accept)
 
     # Bonus token from the slot after the last accepted draft.
-    all_drafts_accepted = num_accept == NUM_SLOTS - 1
+    all_drafts_accepted = num_accept == num_slots - 1
     coin_final = tl.load(UniformSamplesFinal + pid)
     t_ids, t_vals = row_support(
         TargetIds, TargetProbs, t_base + num_accept * stride_t_s, K, K_PAD
@@ -267,11 +283,16 @@ def chain_speculative_sampling_sparse_triton(
     draft_probs: torch.Tensor,
     vocab_size: int,
     block_verification: bool = False,
+    verify_lens=None,
+    target_row_starts=None,
 ) -> None:
     """``chain_speculative_sampling_triton`` with ``target_probs`` given as each slot's
     support ``target_token_ids`` / ``target_probs`` ``[bs, num_slots, K]`` (unique ids,
     zero outside) and ``draft_probs`` as each draft slot's candidates
-    ``draft_token_ids`` / ``draft_probs`` ``[bs, num_slots - 1, KQ]``."""
+    ``draft_token_ids`` / ``draft_probs`` ``[bs, num_slots - 1, KQ]``. verify_lens
+    ([batch] int32, 1..num_slots) verifies each request's first verify_lens - 1 drafts;
+    the target supports are then ``[rows, K]``, request i's rows starting at
+    target_row_starts[i]."""
     batch_size, num_slots = candidates.shape
     if batch_size == 0:
         return
@@ -279,6 +300,11 @@ def chain_speculative_sampling_sparse_triton(
     kq = draft_token_ids.shape[-1]
     target_token_ids = target_token_ids.contiguous()
     target_probs = target_probs.contiguous()
+    if verify_lens is None:
+        t_strides = (target_token_ids.stride(0), target_token_ids.stride(1))
+    else:
+        assert target_token_ids.dim() == 2 and target_row_starts is not None
+        t_strides = (0, target_token_ids.stride(0))
     draft_token_ids = draft_token_ids.contiguous()
     draft_probs = draft_probs.contiguous()
     candidates = candidates.contiguous()
@@ -296,11 +322,12 @@ def chain_speculative_sampling_sparse_triton(
         target_probs,
         draft_token_ids,
         draft_probs,
+        verify_lens,
+        target_row_starts,
         candidates.stride(0),
         retrive_index.stride(0),
         uniform_samples.stride(0),
-        target_token_ids.stride(0),
-        target_token_ids.stride(1),
+        *t_strides,
         draft_token_ids.stride(0),
         draft_token_ids.stride(1),
         NUM_SLOTS=num_slots,

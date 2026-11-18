@@ -107,6 +107,10 @@ from sglang.srt.layers.attention.aiter_utils import (
 from sglang.srt.layers.attention.verify_mask import VerifyMask, tree_mask_numel
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.speculative.dflash_ragged_chain import (
+    fill_padded_chain_rows,
+    read_ragged_chain_table,
+)
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 from sglang.srt.utils import get_bool_env_var
@@ -252,6 +256,9 @@ class ForwardMetadata:
     # [tokens] int64: bit j set when the tree verify row sees tree node j;
     # None for a chain.
     tree_ancestors: Optional[torch.Tensor] = None
+    # Ragged chain verify: [bs + 1] int32 row offsets, [tokens] int32 requests.
+    chain_qo_indptr: Optional[torch.Tensor] = None
+    chain_token_reqs: Optional[torch.Tensor] = None
     local_kv_lens: Optional[torch.Tensor] = None
     verify_token_table: Optional[torch.Tensor] = None
     # (capturing, seq_lens + max_q_len) for target-verify attention
@@ -655,6 +662,13 @@ class AiterAttnBackend(AttentionBackend):
             )
         )
         self._splitkv_verify = self._tree_verify or self._chain_verify
+        # Verify rows per request at most under ragged chain lengths, else None.
+        ragged_chain_table = read_ragged_chain_table()
+        self._ragged_chain_block = (
+            ragged_chain_table.block
+            if self._chain_verify and ragged_chain_table is not None
+            else None
+        )
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -2474,6 +2488,19 @@ class AiterAttnBackend(AttentionBackend):
                         bs * draft_num, dtype=torch.int64, device=self.device
                     ),
                 )
+            chain_qo_indptr = chain_token_reqs = None
+            if self._ragged_chain_block is not None:
+                chain_qo_indptr, chain_token_reqs = self._fill_chain_rows(
+                    spec_info=spec_info,
+                    bs=bs,
+                    draft_num=draft_num,
+                    qo_indptr_out=torch.empty(
+                        bs + 1, dtype=torch.int32, device=self.device
+                    ),
+                    token_reqs_out=torch.empty(
+                        bs * draft_num, dtype=torch.int32, device=self.device
+                    ),
+                )
             self.forward_metadata = ForwardMetadata(
                 None,
                 None,
@@ -2485,6 +2512,8 @@ class AiterAttnBackend(AttentionBackend):
                 swa_out_cache_loc=swa_out_cache_loc,
                 splitkv_verify=True,
                 tree_ancestors=tree_ancestors,
+                chain_qo_indptr=chain_qo_indptr,
+                chain_token_reqs=chain_token_reqs,
             )
         elif forward_batch.forward_mode.is_target_verify():
             if self.use_mla:
@@ -3046,6 +3075,13 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        if self._ragged_chain_block is not None:
+            self.cuda_graph_chain_qo_indptr = torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            )
+            self.cuda_graph_chain_token_reqs = torch.zeros(
+                max_num_tokens, dtype=torch.int32, device=self.device
+            )
         if self._tree_verify:
             self.cuda_graph_tree_ancestors = torch.zeros(
                 max_bs * self.num_draft_tokens, dtype=torch.int64, device=self.device
@@ -3333,6 +3369,15 @@ class AiterAttnBackend(AttentionBackend):
                     spec_info=spec_info,
                     out=self.cuda_graph_tree_ancestors[: bs * draft_num],
                 )
+            chain_qo_indptr = chain_token_reqs = None
+            if self._ragged_chain_block is not None:
+                chain_qo_indptr, chain_token_reqs = self._fill_chain_rows(
+                    spec_info=spec_info,
+                    bs=bs,
+                    draft_num=draft_num,
+                    qo_indptr_out=self.cuda_graph_chain_qo_indptr,
+                    token_reqs_out=self.cuda_graph_chain_token_reqs,
+                )
             self.forward_metadata = ForwardMetadata(
                 None,
                 None,
@@ -3343,6 +3388,8 @@ class AiterAttnBackend(AttentionBackend):
                 max_extend_len=draft_num,
                 splitkv_verify=True,
                 tree_ancestors=tree_ancestors,
+                chain_qo_indptr=chain_qo_indptr,
+                chain_token_reqs=chain_token_reqs,
             )
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
@@ -3689,6 +3736,26 @@ class AiterAttnBackend(AttentionBackend):
             num_masked_reqs=num_masked_reqs,
         )
 
+    def _fill_chain_rows(
+        self,
+        *,
+        spec_info,
+        bs: int,
+        draft_num: int,
+        qo_indptr_out: torch.Tensor,
+        token_reqs_out: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Ragged chain rows of a verify of ``bs`` requests and ``draft_num`` rows
+        per request in all; a capture or a verify without them gets uniform rows."""
+        fill_padded_chain_rows(
+            rows=spec_info.ragged_chain_rows if spec_info is not None else None,
+            bs=bs,
+            rows_per_request=draft_num,
+            qo_indptr_out=qo_indptr_out,
+            token_reqs_out=token_reqs_out,
+        )
+        return qo_indptr_out[: bs + 1], token_reqs_out[: bs * draft_num]
+
     def _forward_splitkv_verify(
         self,
         *,
@@ -3725,6 +3792,9 @@ class AiterAttnBackend(AttentionBackend):
             v_scale=v_descale,
             logit_cap=layer.logit_cap,
             sinks=sinks,
+            qo_indptr=self.forward_metadata.chain_qo_indptr,
+            token_reqs=self.forward_metadata.chain_token_reqs,
+            max_nodes=self._ragged_chain_block,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

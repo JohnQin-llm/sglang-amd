@@ -217,11 +217,14 @@ def accept_sampling_sparse(
     draft_probs: torch.Tensor,
     vocab_size: int,
     block_verification: bool,
+    verify_lens: Optional[torch.Tensor] = None,
+    target_row_starts: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``accept_sampling`` for a sparse target and a draft given as each slot's candidates
     ``draft_token_ids`` and their q ``draft_probs`` (``[bs, gamma, KQ]``): the same coins
     and, up to the rounding the sparse kernel documents, the same accept lengths and
-    bonus tokens. No cutoff, Triton only."""
+    bonus tokens. No cutoff, Triton only. A ragged chain passes ``verify_lens`` and its
+    packed target rows' ``target_row_starts`` (``chain_speculative_sampling_sparse_triton``)."""
     bs, num_slots = candidates.shape
     device = candidates.device
     (
@@ -253,6 +256,8 @@ def accept_sampling_sparse(
         draft_probs=draft_probs,
         vocab_size=vocab_size,
         block_verification=block_verification,
+        verify_lens=verify_lens,
+        target_row_starts=target_row_starts,
     )
     bonus = gather_two_level_bonus_triton(
         accept_index=accept_index, predicts=predicts, correct_len=accept_token_num

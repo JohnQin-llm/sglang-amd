@@ -19,6 +19,7 @@ from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.speculative.dflash_ragged_chain import RaggedChainRows
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 _is_npu = is_npu()
@@ -59,6 +60,8 @@ class DFlashVerifyInput(SpecInput):
     # part of it this verify writes (`IterationIds.write_ids`).
     iteration_ids: Optional[IterationIds] = None
     iteration_cols: Optional[Cols] = None
+    # Ragged chain verify: the packed rows, draft_token_num rows per request in all.
+    ragged_chain_rows: Optional[RaggedChainRows] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)

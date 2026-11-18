@@ -1715,6 +1715,9 @@ class Envs:
     # A/B: the T>0 DFLASH verify takes its top-k in one fused kernel instead of
     # torch.topk over a temperature-scaled copy of the logits (same tokens and values).
     SGLANG_OPT_DFLASH_FUSED_VERIFY_TOPK = EnvBool(False)
+    # JSON table that turns on ragged per-request DFLASH chain verify lengths
+    # (speculative/dflash_ragged_chain.py); unset keeps one block per request.
+    SGLANG_DFLASH_RAGGED_CHAIN_TABLE = EnvStr(None)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

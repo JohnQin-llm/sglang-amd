@@ -198,6 +198,7 @@ def _tree_verify_partials_kernel(
     SEQ_LENS,
     POSITIONS,
     ANCESTORS,
+    QO_INDPTR,
     SLOT_MAP,
     K_SCALE,
     V_SCALE,
@@ -238,16 +239,23 @@ def _tree_verify_partials_kernel(
     prefix = tl.load(SEQ_LENS + seq).to(tl.int32)
     low, tile_lo, tile_hi = _prefix_tiles(prefix, WINDOW, BN)
     active = _active_splits(tile_lo, tile_hi, SPLITS, MIN_TILES)
-    if split < active:
+    # A ragged chain packs request seq's nodes at QO_INDPTR[seq], NODES at most.
+    if QO_INDPTR is None:
+        first_token = seq * NODES
+        num_nodes = NODES
+    else:
+        first_token = tl.load(QO_INDPTR + seq)
+        num_nodes = tl.load(QO_INDPTR + seq + 1) - first_token
+    if (split < active) & (row_block * BM < num_nodes * GQA):
         req_row = (
             REQ_TO_TOKEN
             + tl.load(REQ_POOL_INDICES + seq).to(tl.int64) * req_to_token_stride
         )
         rows = row_block * BM + tl.arange(0, BM)
-        row_ok = rows < NODES * GQA
+        row_ok = rows < num_nodes * GQA
         node = rows // GQA
         head = kvhead * GQA + rows % GQA
-        token = seq * NODES + node
+        token = first_token + node
         d = tl.arange(0, HEAD_DIM)
         q = tl.load(
             Q + token[:, None] * q_stride_0 + head[:, None] * q_stride_1 + d[None, :],
@@ -275,7 +283,7 @@ def _tree_verify_partials_kernel(
         # Tree nodes sit at [prefix, prefix + NODES), inside every node's window.
         if split == active - 1:
             nodes = tl.arange(0, BNODE)
-            key_ok = nodes < NODES
+            key_ok = nodes < num_nodes
             if ANCESTORS is None:
                 visible = key_ok[None, :] & (nodes[None, :] <= node[:, None])
             else:
@@ -404,6 +412,7 @@ def _tree_verify_reduce_kernel(
     DENOM,
     OUT,
     SEQ_LENS,
+    TOKEN_REQS,
     V_SCALE,
     SINKS,
     o_stride_0,
@@ -419,7 +428,11 @@ def _tree_verify_reduce_kernel(
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
-    prefix = tl.load(SEQ_LENS + token // NODES).to(tl.int32)
+    if TOKEN_REQS is None:
+        seq = token // NODES
+    else:
+        seq = tl.load(TOKEN_REQS + token)
+    prefix = tl.load(SEQ_LENS + seq).to(tl.int32)
     _, tile_lo, tile_hi = _prefix_tiles(prefix, WINDOW, BN)
     active = _active_splits(tile_lo, tile_hi, SPLITS, MIN_TILES)
     # One active range wrote the output itself.
@@ -507,6 +520,9 @@ def tree_verify_attention(
     block_n: Optional[int] = None,
     num_warps: Optional[int] = None,
     num_stages: int = 2,
+    qo_indptr: Optional[torch.Tensor] = None,
+    token_reqs: Optional[torch.Tensor] = None,
+    max_nodes: Optional[int] = None,
 ) -> torch.Tensor:
     """Attention for every request's tree nodes against its prefix and the tree.
 
@@ -522,13 +538,22 @@ def tree_verify_attention(
     window: keys visible to a query at position p are (p - window, p]; 0 = all.
     slot_map: full-pool slot -> window-pool slot, for a sliding-window pool.
     k_scale, v_scale: [1] fp32 dequant scales of an fp8 cache.
+    qo_indptr, token_reqs: a ragged chain, request i's nodes at rows
+    [qo_indptr[i], qo_indptr[i + 1]) ([reqs + 1] int32), each row's request
+    ([tokens] int32), at most ``max_nodes`` nodes per request.
     """
     num_reqs = seq_lens.numel()
     num_tokens, num_heads, head_dim = q.shape
     num_kv_heads = k_cache.shape[1]
     num_nodes = num_tokens // max(1, num_reqs)
     gqa = num_heads // num_kv_heads
-    assert num_tokens == num_reqs * num_nodes and num_heads == num_kv_heads * gqa
+    assert num_heads == num_kv_heads * gqa
+    if qo_indptr is None:
+        assert num_tokens == num_reqs * num_nodes
+    else:
+        # Programs cover max_nodes rows; a request's row blocks past its own exit at once.
+        assert ancestors is None and token_reqs is not None and max_nodes
+        num_nodes = max_nodes
     assert tree_verify_supported(head_dim=head_dim, num_nodes=num_nodes)
     assert k_cache.shape[-1] == v_cache.shape[-1] == head_dim
     assert k_cache.stride(-1) == v_cache.stride(-1) == q.stride(-1) == 1
@@ -569,6 +594,7 @@ def tree_verify_attention(
         seq_lens,
         positions,
         ancestors,
+        qo_indptr,
         slot_map,
         k_scale,
         v_scale,
@@ -611,6 +637,7 @@ def tree_verify_attention(
             denom,
             out,
             seq_lens,
+            token_reqs,
             v_scale,
             sinks,
             out.stride(0),

@@ -1128,16 +1128,30 @@ SPARSE_VERIFY_MAX_TOP_K = 256
 
 class SparseVerifyTargetProbs(msgspec.Struct, frozen=True):
     """The verify target as each row's top-k support, zero elsewhere: ``token_ids``
-    (int64, unique per row) and ``probs`` (fp32), both ``[bs, draft_token_num, k]``."""
+    (int64, unique per row) and ``probs`` (fp32), both ``[bs, draft_token_num, k]``,
+    or ``[rows, k]`` for a ragged chain's packed rows."""
 
     token_ids: torch.Tensor
     probs: torch.Tensor
 
 
-def _repeated_top_ks(
-    sampling_info: Any, draft_token_num: int, vocab_size: int
+def _per_row(
+    values: torch.Tensor, draft_token_num: int, row_requests: Optional[torch.Tensor]
 ) -> torch.Tensor:
-    top_ks = torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0)
+    """Per-request ``values`` repeated for every verify row: ``draft_token_num`` rows
+    per request, or packed rows whose requests are ``row_requests``."""
+    if row_requests is not None:
+        return values.index_select(0, row_requests)
+    return torch.repeat_interleave(values, draft_token_num, dim=0)
+
+
+def _repeated_top_ks(
+    sampling_info: Any,
+    draft_token_num: int,
+    vocab_size: int,
+    row_requests: Optional[torch.Tensor],
+) -> torch.Tensor:
+    top_ks = _per_row(sampling_info.top_ks, draft_token_num, row_requests)
     return top_ks.to(dtype=torch.int64).clamp_(min=1, max=vocab_size)
 
 
@@ -1150,6 +1164,7 @@ def _top_k_first_target_probs(
     max_top_k: Optional[int],
     uniform_top_k_value: Optional[int],
     fused_top_k: bool,
+    row_requests: Optional[torch.Tensor],
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
     """Exact top-k/top-p probabilities on k entries per row (top-k-first semantics) and
     their token ids, ``[rows, k]`` each; None when k covers the vocabulary."""
@@ -1157,7 +1172,9 @@ def _top_k_first_target_probs(
     vocab_size = int(next_token_logits.shape[-1])
     if max_top_k is None:
         max_top_k = int(
-            _repeated_top_ks(sampling_info, draft_token_num, vocab_size).max().item()
+            _repeated_top_ks(sampling_info, draft_token_num, vocab_size, row_requests)
+            .max()
+            .item()
         )
     max_top_k = min(max(int(max_top_k), 1), vocab_size)
     if max_top_k >= vocab_size:
@@ -1171,29 +1188,34 @@ def _top_k_first_target_probs(
         and next_token_logits.dtype == torch.float32
         and next_token_logits.stride(-1) == 1
     ):
+        if row_requests is None:
+            temperatures, rows_per_request = sampling_info.temperatures, draft_token_num
+        else:
+            temperatures = sampling_info.temperatures.index_select(0, row_requests)
+            rows_per_request = 1
         topk_logits, topk_indices = verify_head_top_k(
             logits=next_token_logits,
-            temperatures=sampling_info.temperatures,
-            rows_per_request=draft_token_num,
+            temperatures=temperatures,
+            rows_per_request=rows_per_request,
             k=max_top_k,
         )
     else:
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, draft_token_num, dim=0
+        expanded_temperature = _per_row(
+            sampling_info.temperatures, draft_token_num, row_requests
         )
         scaled_logits = next_token_logits / expanded_temperature
         topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
     if not uniform:
-        top_ks = _repeated_top_ks(sampling_info, draft_token_num, vocab_size)
+        top_ks = _repeated_top_ks(
+            sampling_info, draft_token_num, vocab_size, row_requests
+        )
         ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[None, :]
         valid = ranks < top_ks.unsqueeze(1)
         topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
 
     topk_probs = F.softmax(topk_logits, dim=-1)
     if need_top_p:
-        repeated_top_ps = torch.repeat_interleave(
-            sampling_info.top_ps, draft_token_num, dim=0
-        )
+        repeated_top_ps = _per_row(sampling_info.top_ps, draft_token_num, row_requests)
         topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
     return topk_probs, topk_indices
 
@@ -1208,9 +1230,17 @@ def build_speculative_verify_target_probs(
     uniform_top_k_value: Optional[int] = None,
     use_sparse_topk: bool = True,
     fused_top_k: bool = False,
+    row_requests: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """[bs, draft_token_num, vocab] target probabilities, or [rows, vocab] for
+    packed rows whose requests are ``row_requests``."""
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+
+    def shaped(target_probs: torch.Tensor) -> torch.Tensor:
+        if row_requests is not None:
+            return target_probs.contiguous()
+        return target_probs.view(bs, draft_token_num, -1).contiguous()
 
     if use_sparse_topk and need_top_k:
         sparse = _top_k_first_target_probs(
@@ -1221,6 +1251,7 @@ def build_speculative_verify_target_probs(
             max_top_k=max_top_k,
             uniform_top_k_value=uniform_top_k_value,
             fused_top_k=fused_top_k,
+            row_requests=row_requests,
         )
         if sparse is not None:
             topk_probs, topk_indices = sparse
@@ -1230,24 +1261,22 @@ def build_speculative_verify_target_probs(
                 device=next_token_logits.device,
             )
             target_probs.scatter_(1, topk_indices, topk_probs)
-            return target_probs.view(bs, draft_token_num, -1).contiguous()
+            return shaped(target_probs)
 
-    expanded_temperature = torch.repeat_interleave(
-        sampling_info.temperatures, draft_token_num, dim=0
+    expanded_temperature = _per_row(
+        sampling_info.temperatures, draft_token_num, row_requests
     )
     scaled_logits = next_token_logits / expanded_temperature
     target_probs = F.softmax(scaled_logits, dim=-1)
     if need_top_k:
         target_probs = _dflash_top_k_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+            target_probs, _per_row(sampling_info.top_ks, draft_token_num, row_requests)
         )
     if need_top_p:
         target_probs = _dflash_top_p_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            target_probs, _per_row(sampling_info.top_ps, draft_token_num, row_requests)
         )
-    return target_probs.view(bs, draft_token_num, -1).contiguous()
+    return shaped(target_probs)
 
 
 def build_speculative_verify_sparse_target_probs(
@@ -1259,10 +1288,12 @@ def build_speculative_verify_sparse_target_probs(
     max_top_k: int,
     uniform_top_k_value: Optional[int],
     fused_top_k: bool,
+    row_requests: Optional[torch.Tensor] = None,
 ) -> Optional[SparseVerifyTargetProbs]:
     """``build_speculative_verify_target_probs``'s top-k path without the dense
     ``[rows, vocab]`` matrix; None for batches without top-k sampling or with a
-    top-k above ``SPARSE_VERIFY_MAX_TOP_K``, which keep the dense path."""
+    top-k above ``SPARSE_VERIFY_MAX_TOP_K``, which keep the dense path. Packed rows
+    (``row_requests``) come back as ``[rows, k]``."""
     if not sampling_info.need_top_k_sampling or max_top_k > SPARSE_VERIFY_MAX_TOP_K:
         return None
     sparse = _top_k_first_target_probs(
@@ -1273,10 +1304,13 @@ def build_speculative_verify_sparse_target_probs(
         max_top_k=max_top_k,
         uniform_top_k_value=uniform_top_k_value,
         fused_top_k=fused_top_k,
+        row_requests=row_requests,
     )
     if sparse is None:
         return None
     topk_probs, topk_indices = sparse
+    if row_requests is not None:
+        return SparseVerifyTargetProbs(token_ids=topk_indices, probs=topk_probs)
     return SparseVerifyTargetProbs(
         token_ids=topk_indices.view(bs, draft_token_num, -1),
         probs=topk_probs.view(bs, draft_token_num, -1),

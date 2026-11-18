@@ -256,3 +256,97 @@ def test_64_node_mask_uses_sign_bit():
     expected = [((1 << (i + 1)) - 1) for i in range(nodes)]
     expected = [x - (1 << 64) if x >= 1 << 63 else x for x in expected]
     assert bits.tolist() == expected
+
+
+def _ragged_chain_inputs(
+    *, prefixes, lens, max_nodes, heads, kv_heads, head_dim, window, seed
+):
+    gen = torch.Generator().manual_seed(seed)
+    num_reqs = len(prefixes)
+    table, num_slots = _slots(num_reqs, [p + max_nodes for p in prefixes], 1, gen)
+    pool_rows = torch.arange(1, num_reqs + 1)
+    slot_map = torch.randperm(num_slots, generator=gen) if window > 0 else None
+    k = torch.randn(num_slots, kv_heads, head_dim, generator=gen)
+    v = torch.randn(num_slots, kv_heads, head_dim, generator=gen)
+    # Block columns past a request's verified rows hold unwritten KV.
+    for r, (prefix, n) in enumerate(zip(prefixes, lens)):
+        stale = table[pool_rows[r], prefix + n : prefix + max_nodes].long()
+        if slot_map is not None:
+            stale = slot_map[stale]
+        k[stale] = float("nan")
+        v[stale] = float("nan")
+    q = torch.randn(sum(lens), heads, head_dim, generator=gen)
+    qo_indptr = torch.tensor([0] + lens).cumsum(0).to(torch.int32)
+    token_reqs = torch.repeat_interleave(torch.arange(num_reqs), torch.tensor(lens))
+    return table, pool_rows, slot_map, k, v, q, qo_indptr, token_reqs.to(torch.int32)
+
+
+# (prefixes, verify rows per request, max rows, heads, kv_heads, head_dim, window):
+# Muse-Glimmer full and sliding-window layers at its block of 16.
+RAGGED_CHAIN_SHAPES = [
+    ([1000, 37, 4100, 5, 2200], [16, 1, 3, 9, 11], 16, 32, 2, 128, 0),
+    ([3000, 5, 2047, 900], [2, 16, 8, 6], 16, 32, 2, 128, 2047),
+    ([1500, 9, 6000], [8, 1, 7], 8, 24, 4, 256, 0),
+]
+
+
+@pytest.mark.parametrize(
+    "prefixes,lens,max_nodes,heads,kv_heads,head_dim,window", RAGGED_CHAIN_SHAPES
+)
+def test_ragged_chain_matches_per_request_chains(
+    prefixes, lens, max_nodes, heads, kv_heads, head_dim, window
+):
+    """Each request attends to its prefix and its own first lens[i] chain nodes
+    only: the KV past them is NaN and must never reach the output."""
+    table, pool_rows, slot_map, k, v, q, qo_indptr, token_reqs = _ragged_chain_inputs(
+        prefixes=prefixes, lens=lens, max_nodes=max_nodes, heads=heads,
+        kv_heads=kv_heads, head_dim=head_dim, window=window, seed=3,
+    )  # fmt: skip
+    k, v, q = k.bfloat16(), v.bfloat16(), q.bfloat16()
+    sm_scale = head_dim**-0.5
+    to = lambda t: None if t is None else t.to("cuda")  # noqa: E731
+    out = torch.empty(q.shape, dtype=q.dtype, device="cuda")
+    tree_verify_attention(
+        q=to(q), k_cache=to(k), v_cache=to(v), out=out, req_to_token=to(table),
+        req_pool_indices=to(pool_rows), seq_lens=to(torch.tensor(prefixes)),
+        positions=None, ancestors=None, sm_scale=sm_scale, window=window,
+        slot_map=to(slot_map), qo_indptr=to(qo_indptr), token_reqs=to(token_reqs),
+        max_nodes=max_nodes,
+    )  # fmt: skip
+    out = out.cpu().double()
+    for r, (prefix, n) in enumerate(zip(prefixes, lens)):
+        rows = slice(int(qo_indptr[r]), int(qo_indptr[r + 1]))
+        ref = _reference(
+            q[rows].double(), k.double(), v.double(), table, pool_rows[r : r + 1],
+            [prefix], [torch.ones(n, n, dtype=torch.bool).tril()],
+            prefix + torch.arange(n), slot_map=slot_map, window=window,
+            sm_scale=sm_scale, k_scale=1.0, v_scale=1.0, logit_cap=0.0, sinks=None,
+        )  # fmt: skip
+        err = (out[rows] - ref).abs().max().item()
+        assert err < 2e-2, (r, err)
+
+
+@pytest.mark.parametrize("nodes", [8, 16])
+def test_uniform_ragged_chain_is_bitwise_chain(nodes):
+    """A ragged chain whose every request verifies the whole block computes
+    exactly what the uniform chain does."""
+    prefixes = [1000, 37, 4100, 2047]
+    lens = [nodes] * len(prefixes)
+    table, pool_rows, _, k, v, q, qo_indptr, token_reqs = _ragged_chain_inputs(
+        prefixes=prefixes, lens=lens, max_nodes=nodes, heads=32, kv_heads=2,
+        head_dim=128, window=2047, seed=5,
+    )  # fmt: skip
+    args = dict(
+        q=q.bfloat16().cuda(), k_cache=k.bfloat16().cuda(), v_cache=v.bfloat16().cuda(),
+        req_to_token=table.cuda(), req_pool_indices=pool_rows.cuda(),
+        seq_lens=torch.tensor(prefixes).cuda(), positions=None, ancestors=None,
+        sm_scale=128**-0.5, window=2047,
+    )  # fmt: skip
+    uniform = torch.empty_like(args["q"])
+    tree_verify_attention(out=uniform, **args)
+    ragged = torch.empty_like(args["q"])
+    tree_verify_attention(
+        out=ragged, qo_indptr=qo_indptr.cuda(), token_reqs=token_reqs.cuda(),
+        max_nodes=nodes, **args,
+    )  # fmt: skip
+    assert torch.equal(uniform, ragged)

@@ -336,6 +336,128 @@ def test_context_dependent_output_distribution(block, steps):
         assert abs(observed.item() - expected.item()) < 0.008
 
 
+def _verify_ragged(
+    target_rows, draft, candidates, verify_lens, coins, final_coins, *, block=True
+):
+    """The kernel with per-request lengths: target_rows [rows, vocab], request i's
+    verify_lens[i] rows packed in request order."""
+    batch, slots = candidates.shape
+    device = candidates.device
+    indices = torch.arange(batch * slots, device=device).view(batch, slots)
+    predicts = torch.full((batch * slots,), -1, dtype=torch.int32, device=device)
+    accepted = torch.full((batch, slots), -1, dtype=torch.int32, device=device)
+    lengths = torch.empty(batch, dtype=torch.int32, device=device)
+    starts = torch.cumsum(verify_lens, 0, dtype=torch.int32) - verify_lens
+    chain_speculative_sampling_triton(
+        predicts, accepted, lengths, candidates, indices, None, None, coins,
+        final_coins, target_rows, draft, 1.0, 1.0, True, block_verification=block,
+        verify_lens=verify_lens.to(torch.int32), target_row_starts=starts,
+    )  # fmt: skip
+    return lengths, predicts[indices]
+
+
+def _random_chains(batch, slots, vocab, gen):
+    target = torch.rand(batch, slots, vocab, generator=gen).softmax(-1)
+    draft = torch.rand(batch, slots - 1, vocab, generator=gen).softmax(-1)
+    candidates = torch.zeros(batch, slots, dtype=torch.long)
+    candidates[:, 1:] = torch.multinomial(draft.flatten(0, 1), 1, generator=gen).view(
+        batch, slots - 1
+    )
+    coins = torch.rand(batch, slots, generator=gen)
+    final_coins = torch.rand(batch, generator=gen)
+    return target, draft, candidates, coins, final_coins
+
+
+@pytest.mark.parametrize("block", [False, True])
+@pytest.mark.parametrize("vocab", [5, 4099])
+def test_ragged_lengths_verify_each_truncated_chain(block, vocab):
+    """Per-request lengths k verify exactly the chain cut to k rows: the same
+    accepted drafts and bonus token as a uniform call on that chain alone."""
+    gen = torch.Generator().manual_seed(11)
+    batch, slots = 12, 16
+    target, draft, candidates, coins, final_coins = _random_chains(
+        batch, slots, vocab, gen
+    )
+    verify_lens = torch.tensor([1, 2, 16, 3, 8, 5, 16, 1, 9, 4, 12, 7])
+    target_rows = torch.cat([target[i, :k] for i, k in enumerate(verify_lens)])
+    lengths, output = _verify_ragged(
+        *(x.to(DEVICE) for x in (target_rows, draft, candidates, verify_lens, coins, final_coins)),
+        block=block,
+    )  # fmt: skip
+    for i, k in enumerate(verify_lens.tolist()):
+        one = slice(i, i + 1)
+        expected_length, expected = _verify(
+            *(x[one, :k].to(DEVICE) for x in (target, draft, candidates, coins)),
+            final_coins[one].to(DEVICE), block=block,
+        )  # fmt: skip
+        assert lengths[i].item() == expected_length.item() <= k - 1
+        n = expected_length.item() + 1
+        assert output[i, :n].tolist() == expected[0, :n].tolist()
+
+
+def test_whole_block_ragged_lengths_are_the_uniform_chain():
+    gen = torch.Generator().manual_seed(12)
+    batch, slots = 9, 16
+    target, draft, candidates, coins, final_coins = _random_chains(
+        batch, slots, 4099, gen
+    )
+    tensors = [x.to(DEVICE) for x in (target, draft, candidates, coins, final_coins)]
+    uniform_lengths, uniform = _verify(*tensors)
+    lengths, output = _verify_ragged(
+        tensors[0].flatten(0, 1), tensors[1], tensors[2],
+        torch.full((batch,), slots, device=DEVICE), tensors[3], tensors[4],
+    )  # fmt: skip
+    assert torch.equal(lengths, uniform_lengths)
+    valid = torch.arange(slots, device=DEVICE)[None, :] <= lengths[:, None]
+    assert torch.equal(output[valid], uniform[valid])
+
+
+@pytest.mark.parametrize("block", [False, True])
+def test_ragged_lengths_output_distribution(block):
+    """Lossless for any lengths fixed before verification: with each request's
+    length drawn independently of its drafts and target, the verified output
+    completed by the target matches the target's joint distribution."""
+    torch.manual_seed(789)
+    batch, steps = 131072, 4
+    target_initial = torch.tensor([0.4, 0.6], device=DEVICE)
+    draft_initial = torch.tensor([0.7, 0.3], device=DEVICE)
+    target_transition = torch.tensor([[0.25, 0.75], [0.65, 0.35]], device=DEVICE)
+    draft_transition = torch.tensor([[0.7, 0.3], [0.15, 0.85]], device=DEVICE)
+    tokens = [torch.multinomial(draft_initial, batch, replacement=True)]
+    for _ in range(1, steps):
+        tokens.append(torch.multinomial(draft_transition[tokens[-1]], 1).squeeze(1))
+    candidates = torch.stack([torch.zeros_like(tokens[0]), *tokens], dim=1)
+    target = torch.stack(
+        [target_initial.expand(batch, -1), *[target_transition[t] for t in tokens]],
+        dim=1,
+    )
+    draft = torch.stack(
+        [draft_initial.expand(batch, -1), *[draft_transition[t] for t in tokens[:-1]]],
+        dim=1,
+    )
+    verify_lens = torch.randint(1, steps + 2, (batch,), device=DEVICE)
+    rows = torch.arange(steps + 1, device=DEVICE)[None, :] < verify_lens[:, None]
+    lengths, output = _verify_ragged(
+        target[rows], draft, candidates, verify_lens,
+        torch.rand(batch, steps + 1, device=DEVICE), torch.rand(batch, device=DEVICE),
+        block=block,
+    )  # fmt: skip
+    assert (lengths < verify_lens).all()
+    for step in range(1, steps + 1):
+        completion = torch.multinomial(
+            target_transition[output[:, step - 1].long()], 1
+        ).squeeze(1)
+        output[:, step] = torch.where(step <= lengths, output[:, step], completion)
+    for sequence in itertools.product(range(2), repeat=steps + 1):
+        observed = (
+            (output == torch.tensor(sequence, device=DEVICE)).all(-1).float().mean()
+        )
+        expected = target_initial[sequence[0]]
+        for previous, token in zip(sequence, sequence[1:]):
+            expected = expected * target_transition[previous, token]
+        assert abs(observed.item() - expected.item()) < 0.003
+
+
 @pytest.mark.parametrize("any_greedy", [False, True])
 def test_dflash_family_accept_uses_block_verification(any_greedy):
     """The DFLASH-family accept path must reach the block sampler. Here r_1 = 1/2
