@@ -6,10 +6,12 @@ from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
+from sglang.kernels.ops.speculative.verify_head_topk import verify_head_top_k
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
@@ -1120,6 +1122,76 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
+# Arbitrary; served sparse verify is measured only at top-k 20 and 64.
+SPARSE_VERIFY_MAX_TOP_K = 256
+
+
+class SparseVerifyTargetProbs(msgspec.Struct, frozen=True):
+    """The verify target as each row's top-k support, zero elsewhere: ``token_ids``
+    (int64, unique per row) and ``probs`` (fp32), both ``[bs, draft_token_num, k]``."""
+
+    token_ids: torch.Tensor
+    probs: torch.Tensor
+
+
+def _top_k_first_target_probs(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+    need_top_p: bool,
+    max_top_k: Optional[int],
+    uniform_top_k_value: Optional[int],
+    fused_top_k: bool,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """Exact top-k/top-p probabilities on k entries per row (top-k-first semantics) and
+    their token ids, ``[rows, k]`` each; None when k covers the vocabulary."""
+    device = next_token_logits.device
+    vocab_size = int(next_token_logits.shape[-1])
+    repeated_top_ks = torch.repeat_interleave(
+        sampling_info.top_ks, draft_token_num, dim=0
+    ).to(dtype=torch.int64)
+    repeated_top_ks.clamp_(min=1, max=vocab_size)
+    if max_top_k is None:
+        max_top_k = int(repeated_top_ks.max().item())
+    max_top_k = min(max(int(max_top_k), 1), vocab_size)
+    if max_top_k >= vocab_size:
+        return None
+
+    uniform = uniform_top_k_value is not None and int(uniform_top_k_value) == max_top_k
+    # Mixed top-ks mask by rank below, where torch.topk's order of tied values matters.
+    if (
+        fused_top_k
+        and uniform
+        and next_token_logits.dtype == torch.float32
+        and next_token_logits.stride(-1) == 1
+    ):
+        topk_logits, topk_indices = verify_head_top_k(
+            logits=next_token_logits,
+            temperatures=sampling_info.temperatures,
+            rows_per_request=draft_token_num,
+            k=max_top_k,
+        )
+    else:
+        expanded_temperature = torch.repeat_interleave(
+            sampling_info.temperatures, draft_token_num, dim=0
+        )
+        scaled_logits = next_token_logits / expanded_temperature
+        topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
+    if not uniform:
+        ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[None, :]
+        valid = ranks < repeated_top_ks.unsqueeze(1)
+        topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
+
+    topk_probs = F.softmax(topk_logits, dim=-1)
+    if need_top_p:
+        repeated_top_ps = torch.repeat_interleave(
+            sampling_info.top_ps, draft_token_num, dim=0
+        )
+        topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
+    return topk_probs, topk_indices
+
+
 def build_speculative_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
@@ -1129,65 +1201,80 @@ def build_speculative_verify_target_probs(
     max_top_k: Optional[int] = None,
     uniform_top_k_value: Optional[int] = None,
     use_sparse_topk: bool = True,
+    fused_top_k: bool = False,
 ) -> torch.Tensor:
-    device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+
+    if use_sparse_topk and need_top_k:
+        sparse = _top_k_first_target_probs(
+            next_token_logits=next_token_logits,
+            sampling_info=sampling_info,
+            draft_token_num=draft_token_num,
+            need_top_p=need_top_p,
+            max_top_k=max_top_k,
+            uniform_top_k_value=uniform_top_k_value,
+            fused_top_k=fused_top_k,
+        )
+        if sparse is not None:
+            topk_probs, topk_indices = sparse
+            target_probs = torch.zeros(
+                next_token_logits.shape,
+                dtype=topk_probs.dtype,
+                device=next_token_logits.device,
+            )
+            target_probs.scatter_(1, topk_indices, topk_probs)
+            return target_probs.view(bs, draft_token_num, -1).contiguous()
+
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
     scaled_logits = next_token_logits / expanded_temperature
-    sparse_topk_applied = False
-
-    if use_sparse_topk and need_top_k:
-        repeated_top_ks = torch.repeat_interleave(
-            sampling_info.top_ks, draft_token_num, dim=0
-        ).to(dtype=torch.int64)
-        vocab_size = int(scaled_logits.shape[-1])
-        repeated_top_ks.clamp_(min=1, max=vocab_size)
-        if max_top_k is None:
-            max_top_k = int(repeated_top_ks.max().item())
-        else:
-            max_top_k = int(max_top_k)
-        if max_top_k < 1:
-            max_top_k = 1
-        elif max_top_k > vocab_size:
-            max_top_k = vocab_size
-
-        # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
-        if 0 < max_top_k < vocab_size:
-            topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
-            if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
-                ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
-                    None, :
-                ]
-                valid = ranks < repeated_top_ks.unsqueeze(1)
-                topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
-
-            topk_probs = F.softmax(topk_logits, dim=-1)
-            if need_top_p:
-                repeated_top_ps = torch.repeat_interleave(
-                    sampling_info.top_ps, draft_token_num, dim=0
-                )
-                topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
-
-            target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
-            target_probs.scatter_(1, topk_indices, topk_probs)
-            sparse_topk_applied = True
-
-    if not sparse_topk_applied:
-        target_probs = F.softmax(scaled_logits, dim=-1)
-        if need_top_k:
-            target_probs = _dflash_top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
-            )
-        if need_top_p:
-            target_probs = _dflash_top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
-            )
+    target_probs = F.softmax(scaled_logits, dim=-1)
+    if need_top_k:
+        target_probs = _dflash_top_k_renorm_prob(
+            target_probs,
+            torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+        )
+    if need_top_p:
+        target_probs = _dflash_top_p_renorm_prob(
+            target_probs,
+            torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+        )
     return target_probs.view(bs, draft_token_num, -1).contiguous()
+
+
+def build_speculative_verify_sparse_target_probs(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+    bs: int,
+    max_top_k: int,
+    uniform_top_k_value: Optional[int],
+    fused_top_k: bool,
+) -> Optional[SparseVerifyTargetProbs]:
+    """``build_speculative_verify_target_probs``'s top-k path without the dense
+    ``[rows, vocab]`` matrix; None for batches without top-k sampling or with a
+    top-k above ``SPARSE_VERIFY_MAX_TOP_K``, which keep the dense path."""
+    if not sampling_info.need_top_k_sampling or max_top_k > SPARSE_VERIFY_MAX_TOP_K:
+        return None
+    sparse = _top_k_first_target_probs(
+        next_token_logits=next_token_logits,
+        sampling_info=sampling_info,
+        draft_token_num=draft_token_num,
+        need_top_p=sampling_info.need_top_p_sampling,
+        max_top_k=max_top_k,
+        uniform_top_k_value=uniform_top_k_value,
+        fused_top_k=fused_top_k,
+    )
+    if sparse is None:
+        return None
+    topk_probs, topk_indices = sparse
+    return SparseVerifyTargetProbs(
+        token_ids=topk_indices.view(bs, draft_token_num, -1),
+        probs=topk_probs.view(bs, draft_token_num, -1),
+    )
 
 
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:

@@ -14,7 +14,11 @@ from sglang.kernels.ops.speculative.dflash import (
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.kernels.ops.speculative.sparse_reject_sampling import (
+    chain_speculative_sampling_sparse_triton,
+)
 from sglang.srt.speculative.dflash_utils import (
+    SparseVerifyTargetProbs,
     _get_or_create_chain_verify_buffers,
     build_speculative_verify_target_probs,
 )
@@ -103,6 +107,7 @@ def _accept_sampling_core(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor],
     block_verification: bool,
+    fused_top_k: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -120,6 +125,7 @@ def _accept_sampling_core(
             bs=bs,
             max_top_k=draft_input.max_top_k,
             uniform_top_k_value=draft_input.uniform_top_k_value,
+            fused_top_k=fused_top_k,
         )
     (
         retrieve_index,
@@ -181,6 +187,7 @@ def accept_sampling(
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
     block_verification: bool = False,
+    fused_top_k: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
@@ -194,11 +201,63 @@ def accept_sampling(
         verify_num_draft_tokens=verify_num_draft_tokens,
         cutoff_verify_lens=cutoff_verify_lens,
         block_verification=block_verification,
+        fused_top_k=fused_top_k,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
     return correct_len, bonus, cap_trim_lens
+
+
+def accept_sampling_sparse(
+    *,
+    candidates: torch.Tensor,
+    target: SparseVerifyTargetProbs,
+    draft_token_ids: torch.Tensor,
+    draft_probs: torch.Tensor,
+    vocab_size: int,
+    block_verification: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``accept_sampling`` for a sparse target and a draft given as each slot's candidates
+    ``draft_token_ids`` and their q ``draft_probs`` (``[bs, gamma, KQ]``): the same coins
+    and, up to the rounding the sparse kernel documents, the same accept lengths and
+    bonus tokens. No cutoff, Triton only."""
+    bs, num_slots = candidates.shape
+    device = candidates.device
+    (
+        retrieve_index,
+        _,
+        _,
+        predicts,
+        accept_index,
+        accept_token_num,
+    ) = _get_or_create_chain_verify_buffers(
+        bs=bs, draft_token_num=num_slots, device=device
+    )
+    # The dense path's draws, in its order.
+    uniform_samples = torch.rand(
+        (bs, num_slots - 1), dtype=torch.float32, device=device
+    )
+    uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
+    chain_speculative_sampling_sparse_triton(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrieve_index,
+        uniform_samples=uniform_samples,
+        uniform_samples_for_final_sampling=uniform_samples_final,
+        target_token_ids=target.token_ids,
+        target_probs=target.probs,
+        draft_token_ids=draft_token_ids,
+        draft_probs=draft_probs,
+        vocab_size=vocab_size,
+        block_verification=block_verification,
+    )
+    bonus = gather_two_level_bonus_triton(
+        accept_index=accept_index, predicts=predicts, correct_len=accept_token_num
+    )
+    return accept_token_num, bonus
 
 
 @triton.jit

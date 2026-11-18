@@ -17,6 +17,7 @@ from sglang.kernels.ops.speculative.dflash import (
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     accept_sampling,
+    accept_sampling_sparse,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
@@ -88,6 +89,7 @@ from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
     apply_dflash_verify_logits_adjustments,
+    build_speculative_verify_sparse_target_probs,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_sampling_correct_drafts_and_bonus,
     is_dense_head_weight,
@@ -551,6 +553,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 embed_proj=embed_proj,
             )
         self._block_verification = get_spec().speculative_use_block_verification
+        self._sparse_accept = envs.SGLANG_OPT_DFLASH_SPARSE_ACCEPT.get()
+        self._fused_verify_top_k = envs.SGLANG_OPT_DFLASH_FUSED_VERIFY_TOPK.get()
         if (
             self._block_verification
             and (
@@ -1620,10 +1624,31 @@ class DFlashWorkerV2(BaseSpecWorker):
         sampling_info,
         draft_input,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Scatter the selector's sparse q into a dense one for DSpark's kernel."""
+        """Verify on the target's top-k support with the selector's sparse q as is, or
+        scatter q into a dense one for DSpark's kernel."""
         bs, block = candidates.shape
         gamma = block - 1
         vocab = int(next_token_logits.shape[-1])
+        if self._sparse_accept:
+            target = build_speculative_verify_sparse_target_probs(
+                next_token_logits=next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=block,
+                bs=bs,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+                fused_top_k=self._fused_verify_top_k,
+            )
+            if target is not None:
+                accept_len, bonus = accept_sampling_sparse(
+                    candidates=candidates,
+                    target=target,
+                    draft_token_ids=candidate_ids,
+                    draft_probs=q_rows,
+                    vocab_size=vocab,
+                    block_verification=self._block_verification,
+                )
+                return accept_len.to(torch.int32), bonus.to(torch.int64)
         # A fresh dense q would zero the whole vocabulary to carry top_k per row.
         buffer = self._draft_probs_buf
         if buffer is None or buffer.shape[0] < bs or buffer.shape[1:] != (gamma, vocab):
@@ -1645,6 +1670,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_num_draft_tokens=block,
                 cutoff_verify_lens=None,
                 block_verification=self._block_verification,
+                fused_top_k=self._fused_verify_top_k,
             )
         finally:
             # Here, not before the next write: candidate_ids may be a view of a
