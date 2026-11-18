@@ -548,7 +548,7 @@ class AdaptiveVerifyWidth:
             if config.rank_by_depth
             else None
         )
-        # Tree widths; the ragged chain (first in widths) takes a column of ones.
+        # Tree widths; the ragged chain (first in widths) repeats the narrowest one's.
         self._width_columns = torch.tensor(
             [width - 1 for width in config.widths if width > CHAIN],
             dtype=torch.long,
@@ -764,7 +764,11 @@ class AdaptiveVerifyWidth:
             return
         mean = survival.prefix_accept_len[:bs, self._width_columns].mean(dim=0)
         if RAGGED in self.widths:
-            mean = torch.cat([torch.ones(1, device=mean.device), mean])
+            # The ragged chain shares the narrowest tree's content factor. A fixed
+            # factor of 1 let every dip of the trees' noisy factors pick it: Glimmer
+            # greedy C16 then verified it on 2 of 3 steps although its measured level
+            # per ms is 2.8% under tree 16's.
+            mean = torch.cat([mean[:1], mean])
         if self._accept_len is not None:
             if self._greedy_raw_average is None:
                 self._greedy_raw_average = mean.clone()
