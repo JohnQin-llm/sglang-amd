@@ -244,9 +244,8 @@ def _gdn_tree_wy_verify_kernel(
 
 
 def _default_block_v(num_programs_per_block: int, V: int) -> int:
-    # Measured on MI355X at Qwen3.8 shapes: past ~1024 one-warp programs per
-    # launch a second wave starts and the step time jumps, so V is split only
-    # while the grid stays under that.
+    # Measured on MI355X at Qwen3.8 shapes: grids past ~1024 one-warp programs
+    # ran up to 1.7x slower, so V is split only while the grid stays under that.
     for block_v in (32, 64):
         if num_programs_per_block * triton.cdiv(V, block_v) <= 1024:
             return block_v
