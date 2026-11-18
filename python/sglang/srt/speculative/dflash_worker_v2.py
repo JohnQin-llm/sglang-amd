@@ -671,14 +671,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tree_q_threshold = parse_q_threshold_table(
                 envs.SGLANG_DFLASH_TREE_Q_THRESHOLD.get()
             )
-            if self._tree_q_threshold is not None and (
-                self._adaptive_width is not None or not self._block_verification
-            ):
+            if self._tree_q_threshold is not None and not self._block_verification:
                 # Recursive rejection sampling assumes each node's q sums to one,
                 # while the truncated trees hand verification q' unnormalized.
                 raise NotImplementedError(
-                    "SGLANG_DFLASH_TREE_Q_THRESHOLD applies to fixed-width sampled "
-                    "trees with --speculative-use-block-verification"
+                    "SGLANG_DFLASH_TREE_Q_THRESHOLD needs "
+                    "--speculative-use-block-verification"
                 )
             self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
         if self._is_domino and self.block_size <= 1:
@@ -2820,6 +2818,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 workspace=self._tree_workspace,
                 accept_prior=self._tree_accept_prior,
                 bs=bs,
+                log_tau=self._tree_log_tau(bs),
             )
             proposal = sampled_plan.proposal
             node_draft_tokens = sampled_plan.node_draft_tokens

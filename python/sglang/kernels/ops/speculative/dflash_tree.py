@@ -1206,6 +1206,8 @@ def _update_tree_calibration_kernel(
             tl.sum((parent[:, None] == path[None, :]).to(tl.int32), axis=1) > 0
         )
         slot = tl.load(node_cal_slot + b * NODE_STRIDE + nodes, mask=reached, other=0)
+        # Padding nodes of a q-truncated tree have no slot.
+        reached = reached & (slot >= 0)
         prob = tl.load(
             node_edge_prob + b * NODE_STRIDE + nodes, mask=reached, other=0.0
         )

@@ -179,11 +179,13 @@ def propose_adaptive_sampled_tree(
     workspace: dict[str, torch.Tensor],
     accept_prior: tuple[float, float] | torch.Tensor | None,
     bs: int,
+    log_tau: float | None = None,
 ) -> SampledVerifyPlan:
     """Build the sampled tree at ``num_nodes`` and, when the chain is a member, the
     chain from the same q; their survival estimates feed later steps. ``member``
     (``adaptive.choose_sampled_member``, from earlier steps only) verifies its own
-    build, which keeps every node's first draws in draw order, so it stays lossless."""
+    build, which keeps every node's first draws in draw order, so it stays lossless.
+    ``log_tau`` draws the tree (not the chain) from q truncated by path log q."""
     lattice = sampled_lattice(
         candidate_ids=candidate_ids,
         scores=scores,
@@ -198,6 +200,7 @@ def propose_adaptive_sampled_tree(
         accept_prior=accept_prior,
         calibration=adaptive.sampled_stats,
         rank_table=adaptive.rank_table,
+        log_tau=log_tau,
     )
     chain = None
     if adaptive.has_chain:

@@ -18,11 +18,12 @@ from sglang.kernels.ops.speculative.dflash_tree import (
     build_dflash_sampled_tree_proposal,
     build_dflash_tree_proposal,
     log_draw_priors,
+    sampled_calibration_slots,
+    sampled_node_drafts,
     tree_depth,
     tree_prefix,
     update_draw_acceptance,
     update_rank_table,
-    sampled_node_drafts,
     update_tree_calibration,
 )
 from sglang.kernels.ops.speculative.multi_draft_sampling import (
@@ -1024,6 +1025,45 @@ def test_truncation_at_minus_infinity_is_bitwise(accept_prior):
         outputs.append([field.clone() for field in fields])
     for plain, truncated in zip(*outputs):
         assert torch.equal(plain, truncated)
+
+
+def test_calibration_skips_padding():
+    # Fewer paths clear tau than the tree has slots, so every row ends in padding under
+    # the root; a root-only accept reaches the root's real children and nothing else.
+    num_depths, k, max_nodes, rows = 2, 4, 5, 64
+    gen = torch.Generator().manual_seed(5)
+    scores = torch.randn(num_depths, k, k, generator=gen)
+    scores[0] = scores[0, :1]
+    log_q = torch.log_softmax(scores, dim=-1).repeat(rows, 1, 1, 1).cuda()
+    candidate_ids = torch.arange(num_depths * k).view(1, num_depths, k).repeat(rows, 1, 1)
+    num_slots = sampled_calibration_slots(num_depths)
+    # One guard element before the stats catches a write to slot -1.
+    guard = torch.zeros(3 * num_slots + 1, device="cuda")
+    stats = guard[1:].view(3, num_slots)
+    tree = build_dflash_sampled_tree(
+        candidate_ids.cuda(),
+        log_q,
+        max_nodes=max_nodes,
+        accept_prior=(0.7, 0.3),
+        calibration=stats,
+        log_tau=-2.0,
+    )
+    node_count = tree.proposal.node_count.cpu()
+    assert (node_count < max_nodes).all()
+    parents = tree.proposal.top_scores_index.cpu() // k
+    real = torch.arange(1, max_nodes)[None, :] < node_count[:, None]
+    update_tree_calibration(
+        stats=stats,
+        survival=tree.proposal.survival,
+        top_scores_index=tree.proposal.top_scores_index,
+        accept_index=torch.tensor([[b * max_nodes, -1, -1] for b in range(rows)]).cuda(),
+        accept_lens=torch.ones(rows, dtype=torch.int32).cuda(),
+        num_nodes=max_nodes,
+        topk=k,
+    )
+    assert guard[0].item() == 0.0
+    assert stats[0].sum().item() == 0.0
+    assert stats[1].sum().item() == ((parents == 0) & real).sum().item()
 
 
 def test_draw_acceptance_skips_padding():
