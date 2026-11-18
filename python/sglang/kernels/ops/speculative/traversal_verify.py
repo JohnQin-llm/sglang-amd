@@ -26,21 +26,60 @@ for every other token.
 """
 
 import math
+from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.speculative.sparse_reject_sampling import (
+    lookup_many,
+    row_support,
+    target_at,
+    walk_in_token_order,
+)
+
 
 @triton.jit
 def _node_draft(
-    node_tokens, node_probs, tp_node, stride_tp_v, node_row, K: tl.constexpr
+    node_tokens,
+    node_probs,
+    tp_node,
+    ids_node,
+    stride_tp_v,
+    node_row,
+    K: tl.constexpr,
+    KT: tl.constexpr,
+    KT_PAD: tl.constexpr,
+    SPARSE: tl.constexpr,
 ):
     ranks = tl.arange(0, K)
     tokens = tl.load(node_tokens + node_row * K + ranks)
     q = tl.load(node_probs + node_row * K + ranks).to(tl.float32)
-    p = tl.load(tp_node + tokens * stride_tp_v).to(tl.float32)
+    p = target_at(tp_node, ids_node, tokens, stride_tp_v, KT, KT_PAD, SPARSE)
     return tokens, q, p, tl.sum(p, axis=0)
+
+
+@triton.jit
+def _sparse_bonus_chunk_masses(
+    ids,
+    probs,
+    alpha,
+    cand_chunk,
+    cand_delta,
+    BLOCK_V: tl.constexpr,
+    NUM_CHUNKS,
+    CHUNKS: tl.constexpr,
+):
+    """The dense kernel's per-chunk residual masses, built the same way from the support."""
+    id_chunk = tl.where(ids >= 0, ids // BLOCK_V, -1).to(tl.int32)
+    chunk_ids = tl.arange(0, CHUNKS)
+    sums = tl.zeros((CHUNKS,), dtype=tl.float32)
+    for c in tl.range(0, NUM_CHUNKS):
+        mass = alpha * tl.sum(tl.where(id_chunk == c, probs, 0.0), axis=0)
+        mass += tl.sum(tl.where(cand_chunk == c, cand_delta, 0.0), axis=0)
+        sums = tl.where(chunk_ids == c, mass, sums)
+    return sums
 
 
 @triton.jit
@@ -63,6 +102,7 @@ def _traversal_verify_kernel(
     uniform_samples_ptr,
     uniform_samples_final_ptr,
     target_probs_ptr,
+    target_ids_ptr,
     node_tokens_ptr,
     node_probs_ptr,
     stride_tp_b,
@@ -76,10 +116,15 @@ def _traversal_verify_kernel(
     BLOCK_V: tl.constexpr,
     NUM_CHUNKS: tl.constexpr,
     CHUNKS: tl.constexpr,
+    KT: tl.constexpr,
+    KT_PAD: tl.constexpr,
+    SPARSE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     row = pid * NUM_DRAFT_TOKENS
     tp_row = target_probs_ptr + pid.to(tl.int64) * stride_tp_b
+    # A sparse target's token ids share its probabilities' layout.
+    ids_row = target_ids_ptr + pid.to(tl.int64) * stride_tp_b
     ranks = tl.arange(0, K)
     levels = tl.arange(0, STACK)
 
@@ -95,7 +140,16 @@ def _traversal_verify_kernel(
     node = 0
     level = 0
     tokens, q, w, cand_mass = _node_draft(
-        node_tokens_ptr, node_probs_ptr, tp_row, stride_tp_v, row, K
+        node_tokens_ptr,
+        node_probs_ptr,
+        tp_row,
+        ids_row,
+        stride_tp_v,
+        row,
+        K,
+        KT,
+        KT_PAD,
+        SPARSE,
     )
     alpha = tl.full((), 1.0, tl.float32)
     drawn = tl.full((), 0, tl.int32)
@@ -126,9 +180,13 @@ def _traversal_verify_kernel(
                 node_tokens_ptr,
                 node_probs_ptr,
                 tp_row + node.to(tl.int64) * stride_tp_n,
+                ids_row + node.to(tl.int64) * stride_tp_n,
                 stride_tp_v,
                 row + node,
                 K,
+                KT,
+                KT_PAD,
+                SPARSE,
             )
             w = p * p_child
             alpha = p_child
@@ -176,21 +234,28 @@ def _traversal_verify_kernel(
     # Bonus token from the accepted node's residual: candidates take w, the rest alpha * p.
     # Pass 1 finds the chunk holding u from per-chunk masses; pass 2 scans that chunk.
     tp_node = tp_row + node.to(tl.int64) * stride_tp_n
-    p_cand = tl.load(tp_node + tokens * stride_tp_v).to(tl.float32)
+    ids_node = ids_row + node.to(tl.int64) * stride_tp_n
+    p_cand = target_at(tp_node, ids_node, tokens, stride_tp_v, KT, KT_PAD, SPARSE)
     cand_delta = w - alpha * p_cand
     cand_chunk = (tokens // BLOCK_V).to(tl.int32)
     total = tl.sum(w, axis=0) + alpha * (1.0 - cand_mass)
     u = tl.load(uniform_samples_final_ptr + pid) * total
     chunk_ids = tl.arange(0, CHUNKS)
-    sums = tl.zeros((CHUNKS,), dtype=tl.float32)
-    for c in tl.range(0, NUM_CHUNKS):
-        offsets = c * BLOCK_V + tl.arange(0, BLOCK_V)
-        vals = tl.load(
-            tp_node + offsets * stride_tp_v, mask=offsets < VOCAB_SIZE, other=0.0
+    if SPARSE:
+        ids, probs = row_support(ids_node, tp_node, 0, KT, KT_PAD)
+        sums = _sparse_bonus_chunk_masses(
+            ids, probs, alpha, cand_chunk, cand_delta, BLOCK_V, NUM_CHUNKS, CHUNKS
         )
-        mass = alpha * tl.sum(vals.to(tl.float32), axis=0)
-        mass += tl.sum(tl.where(cand_chunk == c, cand_delta, 0.0), axis=0)
-        sums = tl.where(chunk_ids == c, mass, sums)
+    else:
+        sums = tl.zeros((CHUNKS,), dtype=tl.float32)
+        for c in tl.range(0, NUM_CHUNKS):
+            offsets = c * BLOCK_V + tl.arange(0, BLOCK_V)
+            vals = tl.load(
+                tp_node + offsets * stride_tp_v, mask=offsets < VOCAB_SIZE, other=0.0
+            )
+            mass = alpha * tl.sum(vals.to(tl.float32), axis=0)
+            mass += tl.sum(tl.where(cand_chunk == c, cand_delta, 0.0), axis=0)
+            sums = tl.where(chunk_ids == c, mass, sums)
     ends = tl.cumsum(sums, axis=0)
     crossing = (ends > u) & (sums > 0.0)
     last_positive = tl.max(tl.where(sums > 0.0, chunk_ids, -1), axis=0)
@@ -201,21 +266,33 @@ def _traversal_verify_kernel(
     )
     chunk = tl.maximum(chunk, 0)
     base = tl.sum(tl.where(chunk_ids == chunk, ends - sums, 0.0), axis=0)
-    offsets = chunk * BLOCK_V + tl.arange(0, BLOCK_V)
-    val = tl.load(tp_node + offsets * stride_tp_v, mask=offsets < VOCAB_SIZE, other=0.0)
-    val = val.to(tl.float32) * alpha
-    for j in tl.static_range(K):
-        token_j = tl.sum(tl.where(ranks == j, tokens, 0), axis=0)
-        w_j = tl.sum(tl.where(ranks == j, w, 0.0), axis=0)
-        val = tl.where(offsets == token_j, w_j, val)
-    hit = ((base + tl.cumsum(val, axis=0)) > u) & (val > 0.0)
-    # u can exceed the summed mass by rounding; fall back to the last positive token.
-    last_valid = tl.max(tl.where(val > 0.0, offsets, -1), axis=0)
-    sampled = tl.where(
-        tl.max(hit.to(tl.int32), axis=0) > 0,
-        chunk * BLOCK_V + tl.argmax(hit.to(tl.int32), axis=0),
-        last_valid,
-    )
+    if SPARSE:
+        # The chunk's tokens: candidates take w, the rest alpha * p.
+        in_chunk = (ids >= 0) & (ids // BLOCK_V == chunk)
+        is_cand = tl.sum((ids[:, None] == tokens[None, :]).to(tl.int32), axis=1) > 0
+        val = tl.where(is_cand, lookup_many(tokens, w, ids), probs * alpha)
+        val = tl.where(in_chunk, val, 0.0)
+        _, sampled, found = walk_in_token_order(ids, val, base, u, BLOCK_V)
+        last_valid = tl.max(tl.where(val > 0.0, ids, -1), axis=0)
+        sampled = tl.where(found == 1, sampled, last_valid)
+    else:
+        offsets = chunk * BLOCK_V + tl.arange(0, BLOCK_V)
+        val = tl.load(
+            tp_node + offsets * stride_tp_v, mask=offsets < VOCAB_SIZE, other=0.0
+        )
+        val = val.to(tl.float32) * alpha
+        for j in tl.static_range(K):
+            token_j = tl.sum(tl.where(ranks == j, tokens, 0), axis=0)
+            w_j = tl.sum(tl.where(ranks == j, w, 0.0), axis=0)
+            val = tl.where(offsets == token_j, w_j, val)
+        hit = ((base + tl.cumsum(val, axis=0)) > u) & (val > 0.0)
+        # u can exceed the summed mass by rounding; fall back to the last positive token.
+        last_valid = tl.max(tl.where(val > 0.0, offsets, -1), axis=0)
+        sampled = tl.where(
+            tl.max(hit.to(tl.int32), axis=0) > 0,
+            chunk * BLOCK_V + tl.argmax(hit.to(tl.int32), axis=0),
+            last_valid,
+        )
     sampled = tl.where(sampled < 0, VOCAB_SIZE - 1, sampled)
     tl.store(predicts_ptr + last_slot, sampled.to(tl.int32))
 
@@ -233,10 +310,17 @@ def tree_speculative_sampling_traversal(
     target_probs: torch.Tensor,
     node_draft_tokens: torch.Tensor,
     node_draft_probs: torch.Tensor,
+    *,
+    target_token_ids: Optional[torch.Tensor] = None,
+    vocab_size: Optional[int] = None,
 ) -> None:
     """Drop-in for ``tree_speculative_sampling_multi_draft``, same inputs and outputs.
 
     ``uniform_samples[b, i]`` is node ``i``'s acceptance coin; the root's is unused.
+    With ``target_token_ids``, ``target_probs`` is each node's top-k support instead of
+    its dense row: probabilities and unique token ids ``[bs, num_draft_tokens, k]``, zero
+    elsewhere in a vocabulary of ``vocab_size``. Its decisions and draws are the dense
+    path's up to the rounding ``sparse_reject_sampling`` documents.
     """
     batch_size, num_draft_tokens = candidates.shape
     if batch_size == 0:
@@ -245,7 +329,14 @@ def tree_speculative_sampling_traversal(
         raise ValueError("traversal verification tracks rejected candidates in 32 bits")
     num_spec_tokens = accept_index.shape[1]
     target_probs = target_probs.view(batch_size, num_draft_tokens, -1)
-    vocab_size = target_probs.shape[-1]
+    sparse = target_token_ids is not None
+    if sparse:
+        target_probs = target_probs.contiguous()
+        target_token_ids = target_token_ids.view(target_probs.shape).contiguous()
+    else:
+        vocab_size = target_probs.shape[-1]
+        target_token_ids = target_probs
+    support = target_probs.shape[-1] if sparse else 1
     block_v = 4096
     num_chunks = triton.cdiv(vocab_size, block_v)
     _traversal_verify_kernel[(batch_size,)](
@@ -259,6 +350,7 @@ def tree_speculative_sampling_traversal(
         uniform_samples.contiguous(),
         uniform_samples_for_final_sampling,
         target_probs,
+        target_token_ids,
         node_draft_tokens.contiguous(),
         node_draft_probs.float().contiguous(),
         target_probs.stride(0),
@@ -272,6 +364,9 @@ def tree_speculative_sampling_traversal(
         BLOCK_V=block_v,
         NUM_CHUNKS=num_chunks,
         CHUNKS=triton.next_power_of_2(num_chunks),
+        KT=support,
+        KT_PAD=triton.next_power_of_2(support),
+        SPARSE=sparse,
         num_warps=8,
     )
 
