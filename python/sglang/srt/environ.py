@@ -1708,10 +1708,11 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
-    # A/B: T>0 DFLASH selector chains verify on each row's top-k support, with no dense
-    # [rows, vocab] probabilities; batches without a top-k of at most 256 stay dense.
+    # A/B: T>0 DFLASH verify (selector chains and sampled trees) works on each row's top-k
+    # support, with no dense [rows, vocab] probabilities; batches without a top-k of at
+    # most 256 stay dense.
     SGLANG_OPT_DFLASH_SPARSE_ACCEPT = EnvBool(False)
-    # A/B: the T>0 DFLASH chain verify takes its top-k in one fused kernel instead of
+    # A/B: the T>0 DFLASH verify takes its top-k in one fused kernel instead of
     # torch.topk over a temperature-scaled copy of the logits (same tokens and values).
     SGLANG_OPT_DFLASH_FUSED_VERIFY_TOPK = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)

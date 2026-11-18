@@ -497,6 +497,44 @@ def _seeded_verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _dflash_tree_target_probs(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    draft_token_num: int,
+    bs: int,
+    top_ks: set[int],
+) -> Tuple[torch.Tensor, dict]:
+    """A DFLASH sampled tree's verify target and the tree verifier's extra arguments:
+    each node's top-k support under SGLANG_OPT_DFLASH_SPARSE_ACCEPT when the batch has
+    one, else the dense ``[bs, nodes, vocab]`` probabilities."""
+    from sglang.srt.speculative.dflash_utils import (
+        build_speculative_verify_sparse_target_probs,
+        build_speculative_verify_target_probs,
+    )
+
+    # Same distribution as the dense path; top-k first keeps the top-p pass to k
+    # entries instead of a sort over the vocab. The host top-ks (sampling_info.top_ks'
+    # source) spare a device sync.
+    targets = dict(
+        next_token_logits=next_token_logits,
+        sampling_info=sampling_info,
+        draft_token_num=draft_token_num,
+        bs=bs,
+        max_top_k=max(top_ks),
+        uniform_top_k_value=next(iter(top_ks)) if len(top_ks) == 1 else None,
+        fused_top_k=envs.SGLANG_OPT_DFLASH_FUSED_VERIFY_TOPK.get(),
+    )
+    if envs.SGLANG_OPT_DFLASH_SPARSE_ACCEPT.get():
+        sparse = build_speculative_verify_sparse_target_probs(**targets)
+        if sparse is not None:
+            return sparse.probs, dict(
+                target_token_ids=sparse.token_ids,
+                vocab_size=int(next_token_logits.shape[-1]),
+            )
+    return build_speculative_verify_target_probs(**targets), {}
+
+
 def _verify_coins(
     *,
     sampling_info: SamplingBatchInfo,
@@ -806,21 +844,12 @@ def eagle_sample(
             sampling_fn = tree_speculative_sampling_target_only
 
         if verify_input.tree_draft_probs is not None:
-            from sglang.srt.speculative.dflash_utils import (
-                build_speculative_verify_target_probs,
-            )
-
-            # Same distribution as the dense path below; top-k first keeps the
-            # top-p pass to k entries instead of a sort over the vocab. The host
-            # top-ks (sampling_info.top_ks' source) spare a device sync.
-            top_ks = {req.sampling_params.top_k for req in batch.reqs}
-            target_probs = build_speculative_verify_target_probs(
+            target_probs, sparse_target = _dflash_tree_target_probs(
                 next_token_logits=next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=verify_input.draft_token_num,
                 bs=bs,
-                max_top_k=max(top_ks),
-                uniform_top_k_value=next(iter(top_ks)) if len(top_ks) == 1 else None,
+                top_ks={req.sampling_params.top_k for req in batch.reqs},
             )
             # Block verification on a sampled tree is Traversal Verification
             # (arXiv 2505.12398), which reduces to it on a chain.
@@ -832,6 +861,7 @@ def eagle_sample(
                 ),
                 node_draft_tokens=verify_input.tree_draft_tokens,
                 node_draft_probs=verify_input.tree_draft_probs,
+                **sparse_target,
             )
             draft_probs = None
         else:

@@ -22,7 +22,7 @@ _SUM_ONLY = tl.constexpr(2.0)
 
 
 @triton.jit
-def _row_support(ids_ptr, vals_ptr, row_offset, K: tl.constexpr, K_PAD: tl.constexpr):
+def row_support(ids_ptr, vals_ptr, row_offset, K: tl.constexpr, K_PAD: tl.constexpr):
     ranks = tl.arange(0, K_PAD)
     in_row = ranks < K
     ids = tl.load(ids_ptr + row_offset + ranks, mask=in_row, other=-1).to(tl.int64)
@@ -37,19 +37,37 @@ def _lookup(ids, vals, token):
 
 
 @triton.jit
-def _lookup_many(ids, vals, tokens):
+def lookup_many(ids, vals, tokens):
     """``_lookup`` for every entry of ``tokens``."""
     hit = tokens[:, None] == ids[None, :]
     return tl.sum(tl.where(hit, vals[None, :], 0.0), axis=1)
 
 
 @triton.jit
-def _walk_in_token_order(
-    ids, vals, target_u, VOCAB_SIZE: tl.constexpr, BLOCK: tl.constexpr
+def target_at(
+    tp_node,
+    ids_node,
+    tokens,
+    stride_tp_v,
+    KT: tl.constexpr,
+    KT_PAD: tl.constexpr,
+    SPARSE: tl.constexpr,
 ):
-    """Sum ``vals`` the way the dense kernel does (per vocabulary block, blocks in order)
-    and return the sum and the first token whose running sum exceeds ``target_u``
-    (``VOCAB_SIZE - 1`` when none does, as in the dense kernel)."""
+    """The node's target probabilities at ``tokens``: from its dense row, or looked up in
+    its top-k support (``KT`` token ids at ``ids_node``, their probabilities at ``tp_node``)."""
+    if SPARSE:
+        ids, probs = row_support(ids_node, tp_node, 0, KT, KT_PAD)
+        p = lookup_many(ids, probs, tokens)
+    else:
+        p = tl.load(tp_node + tokens * stride_tp_v).to(tl.float32)
+    return p
+
+
+@triton.jit
+def walk_in_token_order(ids, vals, start, target_u, BLOCK: tl.constexpr):
+    """Add ``vals`` to ``start`` the way the dense kernels do (per vocabulary block, blocks
+    in order) and return the total, the first token whose running total exceeds
+    ``target_u`` (-1 when none does) and whether one did."""
     positive = vals > 0.0
     # Only positive masses change a running sum; rank them by token id.
     order = tl.sum(
@@ -57,10 +75,11 @@ def _walk_in_token_order(
     )
     order = tl.where(positive, order, -1)
     num_positive = tl.sum(positive.to(tl.int32), axis=0)
-    closed = tl.full((), 0.0, tl.float32)
+    # A float32 scalar whatever the caller passes, as the loop carries it.
+    closed = tl.full((), 0.0, tl.float32) + start
     open_sum = tl.full((), 0.0, tl.float32)
     open_block = tl.full((), -1, tl.int64)
-    token = tl.full((), VOCAB_SIZE - 1, tl.int64)
+    token = tl.full((), -1, tl.int64)
     found = tl.full((), 0, tl.int32)
     for rank in range(0, num_positive):
         at = order == rank
@@ -75,7 +94,7 @@ def _walk_in_token_order(
         hit = (found == 0) & ((closed + open_sum) > target_u)
         token = tl.where(hit, tok, token)
         found = tl.where(hit, 1, found)
-    return closed + open_sum, token
+    return closed + open_sum, token, found
 
 
 @triton.jit
@@ -129,10 +148,10 @@ def _sparse_chain_speculative_sampling_kernel(
         prefix_probs = ()
         for step in tl.static_range(1, NUM_SLOTS):
             draft_token = tl.load(cand_base + step).to(tl.int64)
-            t_ids, t_vals = _row_support(
+            t_ids, t_vals = row_support(
                 TargetIds, TargetProbs, t_base + (step - 1) * stride_t_s, K, K_PAD
             )
-            d_ids, d_vals = _row_support(
+            d_ids, d_vals = row_support(
                 DraftIds, DraftProbs, d_base + (step - 1) * stride_d_s, KQ, KQ_PAD
             )
             p = _lookup(t_ids, t_vals, draft_token)
@@ -153,16 +172,16 @@ def _sparse_chain_speculative_sampling_kernel(
                         & (prefix_prob > 0.0)
                         & (prefix_prob < 1.0)
                     ):
-                        t_ids, t_vals = _row_support(
+                        t_ids, t_vals = row_support(
                             TargetIds, TargetProbs, t_base + step * stride_t_s, K, K_PAD
                         )
-                        d_ids, d_vals = _row_support(
+                        d_ids, d_vals = row_support(
                             DraftIds, DraftProbs, d_base + step * stride_d_s, KQ, KQ_PAD
                         )
-                        q_next = _lookup_many(d_ids, d_vals, t_ids)
+                        q_next = lookup_many(d_ids, d_vals, t_ids)
                         residual = tl.maximum(prefix_prob * t_vals - q_next, 0.0)
-                        residual_mass, _ = _walk_in_token_order(
-                            t_ids, residual, _SUM_ONLY, VOCAB_SIZE, BLOCK_REDUCE
+                        residual_mass, _, _ = walk_in_token_order(
+                            t_ids, residual, 0.0, _SUM_ONLY, BLOCK_REDUCE
                         )
                         accept_prob = residual_mass / (
                             residual_mass + 1.0 - prefix_prob
@@ -182,10 +201,10 @@ def _sparse_chain_speculative_sampling_kernel(
         continue_verifying = 1
         while (step < NUM_SLOTS) and (continue_verifying == 1):
             draft_token = tl.load(cand_base + step).to(tl.int64)
-            t_ids, t_vals = _row_support(
+            t_ids, t_vals = row_support(
                 TargetIds, TargetProbs, t_base + (step - 1) * stride_t_s, K, K_PAD
             )
-            d_ids, d_vals = _row_support(
+            d_ids, d_vals = row_support(
                 DraftIds, DraftProbs, d_base + (step - 1) * stride_d_s, KQ, KQ_PAD
             )
             p = _lookup(t_ids, t_vals, draft_token)
@@ -209,25 +228,27 @@ def _sparse_chain_speculative_sampling_kernel(
     # Bonus token from the slot after the last accepted draft.
     all_drafts_accepted = num_accept == NUM_SLOTS - 1
     coin_final = tl.load(UniformSamplesFinal + pid)
-    t_ids, t_vals = _row_support(
+    t_ids, t_vals = row_support(
         TargetIds, TargetProbs, t_base + num_accept * stride_t_s, K, K_PAD
     )
     if all_drafts_accepted:
         vals = t_vals
     else:
-        d_ids, d_vals = _row_support(
+        d_ids, d_vals = row_support(
             DraftIds, DraftProbs, d_base + num_accept * stride_d_s, KQ, KQ_PAD
         )
-        q_vals = _lookup_many(d_ids, d_vals, t_ids)
+        q_vals = lookup_many(d_ids, d_vals, t_ids)
         # The dense kernel's guard: a non-probability q counts as 0.
         q_vals = tl.where((q_vals >= 0.0) & (q_vals <= 1.0), q_vals, 0.0)
         diff = residual_scale * t_vals - q_vals
         vals = tl.where(diff > 0.0, diff, 0.0)
     if norm_sum < 0.0:
-        norm_sum, _ = _walk_in_token_order(t_ids, vals, _SUM_ONLY, VOCAB_SIZE, BLOCK_V)
-    _, final_token = _walk_in_token_order(
-        t_ids, vals, coin_final * norm_sum, VOCAB_SIZE, BLOCK_V
+        norm_sum, _, _ = walk_in_token_order(t_ids, vals, 0.0, _SUM_ONLY, BLOCK_V)
+    _, final_token, found = walk_in_token_order(
+        t_ids, vals, 0.0, coin_final * norm_sum, BLOCK_V
     )
+    # The dense kernel's fallback when rounding leaves the draw past the last token.
+    final_token = tl.where(found == 1, final_token, VOCAB_SIZE - 1)
     tl.store(Predicts + last_accepted_global_idx, final_token)
 
 

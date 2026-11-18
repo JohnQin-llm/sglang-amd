@@ -511,4 +511,5 @@ def test_verify_head_top_k_matches_torch(vocab, k, kind):
     assert torch.equal(ids.sort(dim=-1).values, expected_ids.sort(dim=-1).values)
 
 
-if __name
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))
