@@ -1035,7 +1035,9 @@ def test_calibration_skips_padding():
     scores = torch.randn(num_depths, k, k, generator=gen)
     scores[0] = scores[0, :1]
     log_q = torch.log_softmax(scores, dim=-1).repeat(rows, 1, 1, 1).cuda()
-    candidate_ids = torch.arange(num_depths * k).view(1, num_depths, k).repeat(rows, 1, 1)
+    candidate_ids = (
+        torch.arange(num_depths * k).view(1, num_depths, k).repeat(rows, 1, 1)
+    )
     num_slots = sampled_calibration_slots(num_depths)
     # One guard element before the stats catches a write to slot -1.
     guard = torch.zeros(3 * num_slots + 1, device="cuda")
@@ -1056,7 +1058,9 @@ def test_calibration_skips_padding():
         stats=stats,
         survival=tree.proposal.survival,
         top_scores_index=tree.proposal.top_scores_index,
-        accept_index=torch.tensor([[b * max_nodes, -1, -1] for b in range(rows)]).cuda(),
+        accept_index=torch.tensor(
+            [[b * max_nodes, -1, -1] for b in range(rows)]
+        ).cuda(),
         accept_lens=torch.ones(rows, dtype=torch.int32).cuda(),
         num_nodes=max_nodes,
         topk=k,
