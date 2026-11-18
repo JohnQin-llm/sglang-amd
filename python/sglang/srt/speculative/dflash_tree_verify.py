@@ -173,8 +173,7 @@ def propose_adaptive_sampled_tree(
             workspace=workspace,
             accept_prior=accept_prior,
             chain=True,
-            calibration=adaptive.chain_stats,
-            calibration_prior_stats=adaptive.sampled_stats,
+            calibration=adaptive.sampled_stats,
         )
     predicted = adaptive.predict_sampled(
         tree_survival=tree.proposal.survival,

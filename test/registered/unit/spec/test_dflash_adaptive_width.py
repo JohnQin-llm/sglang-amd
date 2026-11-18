@@ -233,12 +233,14 @@ class TestSampledPolicy(CustomTestCase):
             config=config, num_depths=15, chain_rows=16, device=torch.device("cpu")
         )
 
-    def test_exploration_visits_every_other_member(self):
+    def test_exploration_visits_the_runner_up_then_every_member(self):
         width = self._width()
         width._sampled_stats._events = [_FakeEvent() for _ in range(4)]
-        picks = [width.choose_sampled_member(bs=1) for _ in range(128)]
+        # Before any prediction lands the ranking is by cost: chain, 16, 32.
+        picks = [width.choose_sampled_member(bs=1) for _ in range(512)]
         explored = picks[31::32]
-        self.assertEqual(sorted(set(explored)), [16, 32])
+        self.assertEqual(explored[:8], [16] * 7 + [32])
+        self.assertEqual(explored[15], 16)
         self.assertTrue(all(p == CHAIN for i, p in enumerate(picks) if i % 32 != 31))
 
     def test_member_scale_rescales_the_prediction(self):

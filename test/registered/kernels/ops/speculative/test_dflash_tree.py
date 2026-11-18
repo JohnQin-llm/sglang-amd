@@ -746,9 +746,9 @@ def test_rank_table_is_the_slot_rate_by_depth_and_draw():
     assert rates[2, 2].item() == pytest.approx(0.3 * 0.7 * 0.3)
 
 
-def _sampled_survival_reference(tree, log_q, stats, prior_stats, log_priors, prior):
+def _sampled_survival_reference(tree, log_q, stats, log_priors, prior):
     """Calibrated survival of a sampled build: per node, its slot's rate shrunk toward
-    the draw prior (or toward ``prior_stats``' rate of the slot), multiplied down."""
+    the draw prior, multiplied down."""
     edges = tree.proposal.top_scores_index.cpu()
     depths, ranks = tree.node_depths.cpu(), tree.node_ranks.cpu()
     bs, num_edges = edges.shape
@@ -768,9 +768,6 @@ def _sampled_survival_reference(tree, log_q, stats, prior_stats, log_priors, pri
             r0 = math.exp(
                 first if draw == 0 else miss_first + (draw - 1) * miss_sibling + sibling
             )
-            if prior_stats is not None:
-                ph, pr = prior_stats[0, slot].item(), prior_stats[1, slot].item()
-                r0 = (ph + prior * r0) / (pr + prior)
             hits, reached = stats[0, slot].item(), stats[1, slot].item()
             rate = min((hits + prior * r0) / (reached + prior), 1.0)
             log_surv.append(log_surv[parent] + math.log(rate))
@@ -797,7 +794,6 @@ def test_calibrated_sampled_survival_matches_reference(chain):
         return torch.stack([hits, reached, reached * 0.5])
 
     stats = random_stats()
-    prior_stats = random_stats() if chain else None
     accept_prior = (0.7, 0.3)
     tree = build_dflash_sampled_tree(
         candidate_ids.cuda(),
@@ -806,11 +802,10 @@ def test_calibrated_sampled_survival_matches_reference(chain):
         accept_prior=accept_prior,
         chain=chain,
         calibration=stats.cuda(),
-        calibration_prior_stats=None if prior_stats is None else prior_stats.cuda(),
         calibration_prior=2.0,
     )
     expected, slots = _sampled_survival_reference(
-        tree, log_q, stats, prior_stats, log_draw_priors(accept_prior), prior=2.0
+        tree, log_q, stats, log_draw_priors(accept_prior), prior=2.0
     )
     survival = tree.proposal.survival
     assert torch.equal(survival.node_cal_slot.cpu(), slots)

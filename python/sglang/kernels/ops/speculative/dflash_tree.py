@@ -514,7 +514,6 @@ def _build_dflash_sampled_tree_kernel(
     log_priors,
     rank_table,
     cal_stats,
-    prior_stats,
     node_log_survival,
     node_cal_slot,
     node_edge_prob,
@@ -534,7 +533,6 @@ def _build_dflash_sampled_tree_kernel(
     RANK_TABLE: tl.constexpr,
     CHAIN: tl.constexpr,
     CALIBRATE: tl.constexpr,
-    PRIOR_FROM_STATS: tl.constexpr,
     NUM_BINS: tl.constexpr,
     NUM_CLASSES: tl.constexpr,
 ):
@@ -685,15 +683,8 @@ def _build_dflash_sampled_tree_kernel(
             child_mass = parent_mass + child_log_q
         if CALIBRATE:
             # The chance verification accepts the node once its parent is accepted:
-            # the slot's decayed hit rate, shrunk toward the draw prior, or toward the
-            # rate of the same slot in prior_stats.
+            # the slot's decayed hit rate, shrunk toward the draw prior.
             prior_rate = tl.exp(draw_log_prior)
-            if PRIOR_FROM_STATS:
-                prior_hits = tl.load(prior_stats + cal_slot)
-                prior_reached = tl.load(prior_stats + num_slots + cal_slot)
-                prior_rate = (prior_hits + cal_prior * prior_rate) / (
-                    prior_reached + cal_prior
-                )
             hits = tl.load(cal_stats + cal_slot)
             reached = tl.load(cal_stats + num_slots + cal_slot)
             rate = (hits + cal_prior * prior_rate) / (reached + cal_prior)
@@ -762,7 +753,6 @@ def build_dflash_sampled_tree(
     accept_prior: tuple[float, float] | Tensor | None = None,
     chain: bool = False,
     calibration: Tensor | None = None,
-    calibration_prior_stats: Tensor | None = None,
     calibration_prior: float = 2.0,
     rank_table: Tensor | None = None,
 ) -> DFlashSampledTree:
@@ -781,9 +771,8 @@ def build_dflash_sampled_tree(
 
     ``calibration`` (``[3, sampled_calibration_slots(L)]``, ``update_tree_calibration``'s
     statistics) makes the survival estimate the product down the path of each slot's
-    accept rate, ``(hits + prior * r0) / (reached + prior)``, with ``r0`` the draw prior
-    or, with ``calibration_prior_stats``, that table's rate of the slot. Only the
-    estimate changes, not the tree.
+    accept rate, ``(hits + prior * r0) / (reached + prior)``, with ``r0`` the draw prior.
+    Only the estimate changes, not the tree.
 
     ``rank_table`` (``[L * NUM_DRAW_CLASSES]``, ``update_rank_table``) replaces the draw
     prior's ranking by log accept rates per (depth, draw class) learned in earlier
@@ -809,11 +798,10 @@ def build_dflash_sampled_tree(
             f"a chain of {max_nodes} nodes is deeper than the lattice ({num_depths})"
         )
     num_slots = sampled_calibration_slots(num_depths)
-    for stats in (calibration, calibration_prior_stats):
-        if stats is not None and stats.shape != (3, num_slots):
-            raise ValueError(
-                f"calibration must be [3, {num_slots}], got {tuple(stats.shape)}"
-            )
+    if calibration is not None and calibration.shape != (3, num_slots):
+        raise ValueError(
+            f"calibration must be [3, {num_slots}], got {tuple(calibration.shape)}"
+        )
     device = candidate_ids.device
     prefix = "chain_" if chain else "sampled_"
 
@@ -867,11 +855,6 @@ def build_dflash_sampled_tree(
         log_priors,
         rank_table if rank_table is not None else log_priors,
         calibration if calibration is not None else survival.node_edge_prob,
-        (
-            calibration_prior_stats
-            if calibration_prior_stats is not None
-            else survival.node_edge_prob
-        ),
         survival.node_log_survival,
         survival.node_cal_slot,
         survival.node_edge_prob,
@@ -891,7 +874,6 @@ def build_dflash_sampled_tree(
         RANK_TABLE=rank_table is not None,
         CHAIN=chain,
         CALIBRATE=calibration is not None,
-        PRIOR_FROM_STATS=calibration_prior_stats is not None,
         NUM_BINS=NUM_CALIBRATION_BINS,
         NUM_CLASSES=NUM_DRAW_CLASSES,
         num_warps=4,

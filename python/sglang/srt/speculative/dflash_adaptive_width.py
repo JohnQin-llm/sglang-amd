@@ -258,14 +258,17 @@ class VerifyWidthPolicy:
     def choose(self, *, bs: int, expected_accept_lens: list[float]) -> int:
         """``expected_accept_lens[j]``: mean expected accept length per request at
         ``widths[j]``; ties go to the narrower width."""
-        best, best_rate = self.widths[0], -1.0
-        for width, accept_len, cost in zip(
-            self.widths, expected_accept_lens, self.costs(bs)
-        ):
-            rate = accept_len / cost
-            if rate > best_rate * (1.0 + 1e-6):
-                best, best_rate = width, rate
-        return best
+        return self.rank(bs=bs, expected_accept_lens=expected_accept_lens)[0]
+
+    def rank(self, *, bs: int, expected_accept_lens: list[float]) -> list[int]:
+        """The widths by expected tokens per second, best first; ties keep the narrower
+        width first."""
+        rates = [
+            accept_len / cost
+            for accept_len, cost in zip(expected_accept_lens, self.costs(bs))
+        ]
+        order = sorted(range(len(self.widths)), key=lambda j: -rates[j])
+        return [self.widths[j] for j in order]
 
 
 class StaleDeviceStats:
@@ -317,9 +320,12 @@ class VerifyWidthState(msgspec.Struct, frozen=True):
 # Calibration dump lines are queued on the device and written with one host sync per
 # this many steps; arbitrary.
 _DUMP_FLUSH_STEPS = 64
-# Every this many sampled steps verify another member in turn, so the calibration of
-# members the policy does not pick stays current; arbitrary.
+# Every this many sampled steps verify the runner-up member, and every this many of
+# those the members in turn, so the members the policy does not pick stay calibrated.
+# Exploring all members in turn every 32 steps cost about 1% of throughput at C16 on
+# Qwen (one step in eight at twice the cost); otherwise arbitrary.
 _EXPLORE_EVERY = 32
+_EXPLORE_ROUND_ROBIN = 8
 # Per-member accept-length scale: decay per verify of the member, and the prior weight
 # in accepted tokens that holds it at 1 until data arrives. A weaker prior let a dozen
 # exploration steps at batch size 1 (accept length sd ~3 tokens each) move a member's
@@ -370,10 +376,10 @@ class AdaptiveVerifyWidth:
             return torch.zeros((3, slots), dtype=torch.float32, device=device)
 
         self.calibration_stats = stats(num_depths * NUM_CALIBRATION_BINS)
+        # One calibration for every sampled member, the chain included: a separate one
+        # per member learned only on the steps the policy picked it for, which made it
+        # optimistic for the member picked on easy steps.
         self.sampled_stats = stats(sampled_calibration_slots(num_depths))
-        self.chain_stats = (
-            stats(sampled_calibration_slots(num_depths)) if self.has_chain else None
-        )
         # Filled by refresh_rank_table before the first step.
         self.rank_table = (
             torch.zeros(num_depths * NUM_DRAW_CLASSES, device=device)
@@ -517,14 +523,16 @@ class AdaptiveVerifyWidth:
             return force
         if self._sampled_policy is None:
             return self.sampled_members[-1]
-        choice = self._sampled_policy.choose(
+        ranked = self._sampled_policy.rank(
             bs=bs, expected_accept_lens=self._sampled_stats.latest()
         )
         self._sampled_steps += 1
-        if self._sampled_steps % _EXPLORE_EVERY == 0:
-            others = [m for m in self.sampled_members if m != choice]
-            choice = others[(self._sampled_steps // _EXPLORE_EVERY) % len(others)]
-        return choice
+        if self._sampled_steps % _EXPLORE_EVERY:
+            return ranked[0]
+        explorations = self._sampled_steps // _EXPLORE_EVERY
+        if explorations % _EXPLORE_ROUND_ROBIN:
+            return ranked[1]
+        return ranked[1:][(explorations // _EXPLORE_ROUND_ROBIN) % (len(ranked) - 1)]
 
     def predict_sampled(
         self, *, tree_survival, chain_survival, bs: int
@@ -608,8 +616,8 @@ class AdaptiveVerifyWidth:
         accept_lens: torch.Tensor,
         topk: int,
     ) -> None:
-        """Update the verified member's calibration (the chain's, or the sampled
-        trees'), whose survival and edges ``proposal`` (that member's build) holds."""
+        """Update the sampled calibration from the verified member's build (survival and
+        edges in ``proposal``) and that member's accept-length scale."""
         from sglang.kernels.ops.speculative.dflash_tree import update_tree_calibration
 
         if predicted is not None:
@@ -629,7 +637,7 @@ class AdaptiveVerifyWidth:
                 torch.cat([accept_lens.view(-1, 1).float(), predicted], dim=1),
             )
         update_tree_calibration(
-            stats=self.chain_stats if member == CHAIN else self.sampled_stats,
+            stats=self.sampled_stats,
             survival=proposal.survival,
             top_scores_index=proposal.top_scores_index,
             accept_index=accept_index,
