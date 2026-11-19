@@ -63,6 +63,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.kernels.ops.speculative.dflash_tree import (
+    DFlashTreeProposal,
     log_draw_priors,
     tree_depth,
     tree_prefix,
@@ -86,6 +87,7 @@ from sglang.srt.speculative.dflash_ragged_chain import (
     check_ragged_chain_batch,
     unpack_greedy_rows,
 )
+from sglang.srt.speculative.dflash_retrieval_extension import RetrievalExtension
 from sglang.srt.speculative.dflash_adaptive_width import (
     RAGGED,
     AdaptiveVerifyWidth,
@@ -631,6 +633,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
         self.draft_model.set_block_size(self.block_size)
         self.speculative_num_draft_tokens = int(self.block_size)
+        self._retrieval_extension: Optional[RetrievalExtension] = None
         if self.tree_mode:
             if self.selector is None:
                 raise ValueError(
@@ -681,6 +684,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "--speculative-use-block-verification"
                 )
             self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+            self._retrieval_extension = RetrievalExtension.maybe_create(
+                block_size=int(self.block_size),
+                topk=self.tree_topk,
+                device=torch.device(self.device),
+            )
+            if self._retrieval_extension is not None:
+                self._check_retrieval_extension_support()
         if self._is_domino and self.block_size <= 1:
             raise ValueError(
                 "DFLASH Domino requires speculative_num_draft_tokens > 1, "
@@ -2619,6 +2629,25 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def _check_retrieval_extension_support(self) -> None:
+        if not self._block_verification:
+            # Sampled trees then verify by recursive rejection sampling, whose exact
+            # enumeration with the chain was not done (explore/retrext/tree_lossless.py).
+            raise NotImplementedError(
+                "SGLANG_DFLASH_RETRIEVAL_EXTENSION needs "
+                "--speculative-use-block-verification"
+            )
+        if mambaish_config(self._target_worker.model_runner.model_config) is not None:
+            raise NotImplementedError(
+                "the DFLASH retrieval extension does not commit linear-attention state "
+                "past the draft block yet"
+            )
+        if self.use_compact_draft_cache:
+            raise NotImplementedError(
+                "the DFLASH retrieval extension writes the draft KV of the whole "
+                "accepted path, which a compact draft cache does not map"
+            )
+
     def _init_tree_accept_prior(self) -> None:
         # Online priors keep decayed draw counts on the device; the tree builder reads
         # the log priors each step, so no host sync is needed.
@@ -2734,12 +2763,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         host_seq_lens_bound: torch.Tensor | None,
         host_seq_lens_bound_sum: int | None,
         verify_chain=None,
+        retrieval_matches: torch.Tensor | None = None,
     ) -> GenerationBatchResult:
         """Build a tree from the selector lattice, verify it, then feed the accepted
         path's target features to the drafter like the chain path does.
         ``verify_window`` is ``[bs, tree_num_nodes]``, each request's KV slots from
         its committed length, read at the start of the step. ``verify_chain``
-        (``_verify_chain`` bound to this step) verifies the ragged chain member."""
+        (``_verify_chain`` bound to this step) verifies the ragged chain member.
+        ``retrieval_matches`` (``RetrievalExtension.match``) puts the retrieval chain
+        in the tree's last nodes where the drafted path agrees with it."""
         if self.draft_model.lm_head is None:
             self.draft_model.lm_head = lm_head
         draft_hidden = draft_logits_output.hidden_states
@@ -2862,22 +2894,45 @@ class DFlashWorkerV2(BaseSpecWorker):
                     else member_label(sampled_plan.member)
                 )
         verify_proposal = tree_prefix(proposal, width, topk=self.tree_topk)
+        verify_tree = verify_proposal
+        verify_depth = tree_depth(proposal, width, topk=self.tree_topk)
+        verify_draft_tokens, verify_draft_probs = node_draft_tokens, node_draft_probs
+        retrieval = self._retrieval_extension
+        extended = None
+        if retrieval_matches is not None and retrieval.extends(width):
+            extended = retrieval.extend(
+                matches=retrieval_matches,
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                proposal=verify_proposal,
+                width=width,
+                node_draft_tokens=node_draft_tokens,
+                node_draft_probs=node_draft_probs,
+            )
+            verify_tree = DFlashTreeProposal(
+                draft_tokens=extended.draft_tokens,
+                parent_list=extended.parent_list,
+                top_scores_index=extended.top_scores_index,
+            )
+            verify_depth = extended.depth
+            verify_draft_tokens = extended.node_draft_tokens
+            verify_draft_probs = extended.node_draft_probs
         if self._phases is not None:
             self._phases.mark("propose")
         result = verify_dflash_tree(
             batch=batch,
             bonus_tokens=bonus_tokens,
-            proposal=verify_proposal,
+            proposal=verify_tree,
             target_worker=self.target_worker,
             plan_stream=self.plan_stream,
             plan_stream_ctx=self.plan_stream_ctx,
             topk=self.tree_topk,
-            depth=tree_depth(proposal, width, topk=self.tree_topk),
+            depth=verify_depth,
             num_nodes=width,
             out_cache_loc=verify_window[:, :width].reshape(-1),
             device=self.device,
-            node_draft_tokens=node_draft_tokens,
-            node_draft_probs=node_draft_probs,
+            node_draft_tokens=verify_draft_tokens,
+            node_draft_probs=verify_draft_probs,
             target_logits=self._target_logits_processor,
             argmax_from_shard=(
                 _verify_logits_skippable(batch, batch.sampling_info)
@@ -2890,11 +2945,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._phases.mark("verify")
         if on_publish is not None:
             on_publish(result.new_seq_lens)
+        # The width calibration and draw priors learn from the drafted tree only.
+        stats_index, stats_lens = result.accept_index, result.accept_lens
+        if extended is not None:
+            stats_index, stats_lens = retrieval.block_accepts(
+                accept_index=stats_index, accept_lens=stats_lens
+            )
         if adaptive is not None and greedy:
             adaptive.after_verify(
                 proposal=proposal,
-                accept_index=result.accept_index,
-                accept_lens=result.accept_lens,
+                accept_index=stats_index,
+                accept_lens=stats_lens,
                 width=width,
                 topk=self.tree_topk,
                 raw_log_mass=self._tree_workspace.get("search_log_masses"),
@@ -2904,8 +2965,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 member=sampled_plan.member,
                 proposal=sampled_plan.proposal,
                 predicted=sampled_plan.predicted,
-                accept_index=result.accept_index,
-                accept_lens=result.accept_lens,
+                accept_index=stats_index,
+                accept_lens=stats_lens,
                 topk=self.tree_topk,
             )
         # The draw priors rank tree slots, so the chain's single draws do not feed them.
@@ -2918,8 +2979,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 stats=self._tree_draw_stats,
                 log_priors=self._tree_accept_prior,
                 top_scores_index=verify_proposal.top_scores_index,
-                accept_index=result.accept_index,
-                accept_lens=result.accept_lens,
+                accept_index=stats_index,
+                accept_lens=stats_lens,
                 num_nodes=width,
                 topk=self.tree_topk,
                 sampled_rows=sampled_rows,
@@ -2933,16 +2994,34 @@ class DFlashWorkerV2(BaseSpecWorker):
         hidden = result.logits_output.hidden_states
         if hidden is None:
             raise RuntimeError("DFLASH tree verify returned no target hidden states.")
-        hidden = hidden.view(bs, width, -1)[:, : min(width, int(self.block_size))]
-        path_width = hidden.shape[1]
-        cache_loc_2d = self._draft_write_ids(iteration_ids).view(
-            bs, int(self.block_size)
-        )[:, :path_width]
+        if extended is None:
+            hidden = hidden.view(bs, width, -1)[:, : min(width, int(self.block_size))]
+            path_width = hidden.shape[1]
+            cache_loc_2d = self._draft_write_ids(iteration_ids).view(
+                bs, int(self.block_size)
+            )[:, :path_width]
+            path_positions = positions_2d[:, :path_width]
+        else:
+            # A path through the retrieval chain runs past the block: its draft KV goes
+            # to the tree verify window's slots.
+            path_width = retrieval.path_width(width)
+            hidden = hidden.view(bs, width, -1)[:, :path_width]
+            path_ids = self.target_worker.model_runner.runner_ids.plan(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=batch.seq_lens,
+                seq_lens_cpu=None,
+                write_virtual=verify_window[:, :path_width].reshape(-1),
+                read_extent=path_width,
+            )
+            cache_loc_2d = self._draft_write_ids(path_ids).view(bs, path_width)
+            path_positions = batch.seq_lens.long().unsqueeze(1) + torch.arange(
+                path_width, device=hidden.device
+            )
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc_2d.reshape(-1),
             cache_loc_2d=cache_loc_2d,
-            positions=positions_2d[:, :path_width].reshape(-1),
+            positions=path_positions.reshape(-1),
             commit_lens=result.accept_lens,
         )
         result.logits_output.hidden_states = None
@@ -3067,6 +3146,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                 positions=positions,
                 extend_lens=ctx_lens,
             )
+            if self._retrieval_extension is not None:
+                self._retrieval_extension.record_extend(
+                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                    req_pool_indices=batch.req_pool_indices,
+                    input_ids=batch.input_ids,
+                    positions=positions,
+                    extend_lens=ctx_lens,
+                    num_tokens=int(sum(batch.extend_lens)),
+                )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
@@ -3374,7 +3462,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     on_publish=on_publish,
                     grammar_barrier=grammar_barrier,
                 )
-            return self._forward_decode_tree(
+            retrieval = self._retrieval_extension
+            req_to_token = self.model_runner.req_to_token_pool.req_to_token
+            retrieval_matches = None
+            if retrieval is not None:
+                retrieval_matches = retrieval.match(
+                    req_to_token=req_to_token,
+                    req_pool_indices=batch.req_pool_indices,
+                    seq_lens=prefix_lens,
+                    bonus_tokens=block_ids[:, 0],
+                )
+            result = self._forward_decode_tree(
                 batch=batch,
                 bs=bs,
                 bonus_tokens=block_ids[:, 0],
@@ -3387,7 +3485,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 host_seq_lens_bound=draft_input.nxt_kv_lens_cpu,
                 host_seq_lens_bound_sum=draft_input.nxt_kv_lens_sum,
                 verify_chain=verify_chain,
+                retrieval_matches=retrieval_matches,
             )
+            if retrieval is not None:
+                retrieval.record_commit(
+                    req_to_token=req_to_token,
+                    req_pool_indices=batch.req_pool_indices,
+                    seq_lens=prefix_lens,
+                    tokens=result.next_token_ids.view(bs, -1),
+                    accept_lens=result.accept_lens,
+                )
+            return result
 
         if (
             self._is_domino

@@ -1723,6 +1723,12 @@ class Envs:
     SGLANG_DFLASH_TREE_Q_THRESHOLD = EnvStr(None)
     # Debug: file for the DFLASH forward-call CPU/GPU timeline (dflash_join_trace.py).
     SGLANG_DFLASH_JOIN_TRACE = EnvStr(None)
+    # Most retrieval tokens a DFLASH verify tree takes past the draft block when the drafted
+    # path agrees with the continuation of the context's own suffix match
+    # (dflash_retrieval_extension.py); 0 keeps the trees as drafted.
+    SGLANG_DFLASH_RETRIEVAL_EXTENSION = EnvInt(0)
+    # Shortest context suffix match whose continuation the retrieval extension uses.
+    SGLANG_DFLASH_RETRIEVAL_MIN_MATCH = EnvInt(4)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
