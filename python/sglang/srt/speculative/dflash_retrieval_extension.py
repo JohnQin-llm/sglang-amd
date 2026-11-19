@@ -16,6 +16,7 @@ cap, not the drafter, ends the step.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 
 import torch
 from sglang.kernels.ops.speculative.dflash_retrieval import (
@@ -109,13 +110,30 @@ class RetrievalExtension:
         extend_lens: torch.Tensor,
         num_tokens: int,
     ) -> None:
-        """A prefill's tokens. A cached prefix (radix cache) is not recorded: its slots
-        keep older tokens, which can only weaken the proposals, never the outputs."""
+        """A prefill's own tokens (``record_cached_prefixes`` adds a cached prefix's)."""
         history = self._history_for(req_to_token)
         rows = torch.repeat_interleave(
             req_pool_indices.long(), extend_lens.long(), output_size=num_tokens
         )
         history[rows, positions.long()] = input_ids[:num_tokens].to(torch.int32)
+
+    def record_cached_prefixes(
+        self,
+        *,
+        req_to_token: torch.Tensor,
+        rows: list[int],
+        prefixes: list[Sequence[int]],
+    ) -> None:
+        """Prefixes a prefill took from the radix cache, which are not among its input
+        ids, from the host; history left unrecorded would only weaken the proposals."""
+        history = self._history_for(req_to_token)
+        tokens = torch.tensor([t for p in prefixes for t in p], dtype=torch.int32)
+        slots = torch.tensor([r for r, p in zip(rows, prefixes) for _ in p])
+        positions = torch.cat([torch.arange(len(p)) for p in prefixes])
+        history[
+            slots.to(self.device, non_blocking=True),
+            positions.to(self.device, non_blocking=True),
+        ] = tokens.to(self.device, non_blocking=True)
 
     def record_commit(
         self,

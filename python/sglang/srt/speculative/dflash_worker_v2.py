@@ -3155,6 +3155,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     extend_lens=ctx_lens,
                     num_tokens=int(sum(batch.extend_lens)),
                 )
+                cached = [
+                    (req.kv.req_pool_idx, req.get_fill_ids()[:prefix_len])
+                    for req, prefix_len in zip(batch.reqs, batch.prefix_lens)
+                    if prefix_len > 0
+                ]
+                if cached:
+                    self._retrieval_extension.record_cached_prefixes(
+                        req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                        rows=[row for row, _ in cached],
+                        prefixes=[prefix for _, prefix in cached],
+                    )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None

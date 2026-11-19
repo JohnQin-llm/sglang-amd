@@ -232,6 +232,10 @@ def test_history_holds_prompt_and_committed_tokens():
         extend_lens=torch.tensor([7, 3], dtype=torch.int32, device=DEVICE),
         num_tokens=10,
     )
+    # A radix-cached prefix comes from the host.
+    retrieval.record_cached_prefixes(
+        req_to_token=req_to_token, rows=[3], prefixes=[[11, 12, 13]]
+    )
     streams = [list(p) for p in prompts]
     bonus = [int(torch.randint(0, 50, (1,), generator=gen)) for _ in streams]
     for _ in range(12):
@@ -260,6 +264,7 @@ def test_history_holds_prompt_and_committed_tokens():
         n = min(len(stream), context)
         assert history[slot, :n].tolist() == stream[:n]
     assert (history[1, :context] == -1).all()
+    assert history[3, :4].tolist() == [11, 12, 13, -1]
 
 
 @needs_gpu
