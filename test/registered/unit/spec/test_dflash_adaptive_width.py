@@ -15,6 +15,7 @@ from sglang.srt.speculative.dflash_adaptive_width import (
     AdaptiveVerifyWidth,
     AdaptiveWidthConfig,
     StaleDeviceStats,
+    StepPhases,
     VerifyWidthPolicy,
     interpolate_cost,
     load_cost_table,
@@ -49,6 +50,37 @@ class _FakeEvent:
 
     def synchronize(self):
         self.done = True
+
+
+class _TimedEvent(_FakeEvent):
+    def __init__(self, enable_timing=False):
+        pass
+
+    def elapsed_time(self, other):
+        return 1.5
+
+
+class TestStepPhases(CustomTestCase):
+    def test_completed_steps_reach_the_file_without_a_batch(self):
+        """A step is written once its events complete, so a killed server loses none."""
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch("torch.cuda.Event", _TimedEvent),
+        ):
+            path = os.path.join(tmp, "phases.jsonl")
+            phases = StepPhases(path)
+            phases.begin(4)
+            phases.mark("verify")
+            phases.end()
+            with open(path) as f:
+                self.assertEqual(f.read(), "")
+            phases._done[0][1][-1][1].synchronize()
+            phases.begin(2)
+            phases.end()
+            with open(path) as f:
+                lines = [json.loads(x) for x in f.read().splitlines()]
+            self.assertEqual([x["bs"] for x in lines], [4])
+            self.assertEqual(lines[0]["verify"], 1.5)
 
 
 class TestInterpolateCost(CustomTestCase):

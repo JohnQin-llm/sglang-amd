@@ -139,7 +139,7 @@ class StepPhases:
     """Debug instrumentation: GPU time between named marks of each decode step, from
     timing events on the current stream, one JSON line per step (``{"bs": n, "<mark>":
     ms since the previous mark, "cpu": {"<mark>": host ms since the previous mark}}``),
-    written with one host sync every 64 steps."""
+    written once the step's last event has completed (no host sync)."""
 
     def __init__(self, path: str):
         self._file = open(path, "a", buffering=1)
@@ -163,17 +163,15 @@ class StepPhases:
         self.mark("end")
         self._done.append(self._current)
         self._current = None
-        if len(self._done) < 64:
-            return
-        self._done[-1][1][-1][1].synchronize()
-        for bs, marks in self._done:
+        # The server is killed at the end of a benchmark: write steps as they complete, not in batches.
+        while self._done and self._done[0][1][-1][1].query():
+            bs, marks = self._done.pop(0)
             line, cpu = {"bs": bs}, {}
             for (_, prev, prev_t), (name, event, t) in zip(marks, marks[1:]):
                 line[name] = round(prev.elapsed_time(event), 4)
                 cpu[name] = round((t - prev_t) * 1e3, 4)
             line["cpu"] = cpu
             self._file.write(json.dumps(line) + "\n")
-        self._done = []
 
 
 _STEP_PHASES: Optional[StepPhases] = None
