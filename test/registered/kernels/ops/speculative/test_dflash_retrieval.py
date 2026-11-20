@@ -267,6 +267,39 @@ def test_history_holds_prompt_and_committed_tokens():
     assert history[3, :4].tolist() == [11, 12, 13, -1]
 
 
+@pytest.mark.parametrize("topk, extension", [(16, 0), (1, 31), (16, 4), (16, 31)])
+def test_decode_reserve_covers_the_longest_commit(monkeypatch, topk, extension):
+    """Regression: DFLASH's decode KV reserve assumed a step commits at most the draft
+    block F, but a step that accepts into the retrieval chain commits up to F + L. The
+    next step's verify window then ran past the allocated req_to_token slots, whose
+    stale ids pointed into radix-cached prefixes, and the verify overwrote their KV
+    (served T=1 lossless failure). The reserve's commit term must cover the longest
+    path an extended tree of any verify width can commit."""
+    from types import SimpleNamespace
+
+    from sglang.srt.speculative import dflash_retrieval_extension as ext
+
+    block, num_nodes = 16, 32
+    monkeypatch.setenv("SGLANG_DFLASH_RETRIEVAL_EXTENSION", str(extension))
+    monkeypatch.setattr(
+        ext, "get_spec", lambda: SimpleNamespace(speculative_eagle_topk=topk)
+    )
+    commit = ext.max_step_commit(block_size=block, num_nodes=num_nodes)
+    assert block <= commit <= num_nodes
+    if extension == 0 or topk == 1:
+        assert commit == block  # unchanged without the extension
+        return
+    retrieval = ext.RetrievalExtension(
+        max_extension=extension,
+        min_match=4,
+        path_depth=block - 1,
+        topk=topk,
+        device=torch.device("cpu"),
+    )
+    for width in range(2, num_nodes + 1):
+        assert retrieval.path_width(width) <= commit
+
+
 @needs_gpu
 def test_extended_tree_verifies_through_the_chain():
     """EAGLE's tree build places the chain below the leaf (positions one deeper per node),
