@@ -11,6 +11,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.dflash_retrieval_extension import max_step_commit
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.common import is_pin_memory_available
 
@@ -139,7 +140,8 @@ class DFlashDraftInputV2(SpecInput):
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
 
         # Each step drafts a block of F slots and verifies Q (F for a chain, tree nodes
-        # for a tree), both from the committed length; the next step starts up to F later.
+        # for a tree), both from the committed length; the next step starts up to F later
+        # (up to the retrieval chain's end with SGLANG_DFLASH_RETRIEVAL_EXTENSION).
         num_verify_tokens = int(get_spec().speculative_num_draft_tokens)
         block_size = int(get_spec().speculative_dflash_block_size or num_verify_tokens)
         if num_verify_tokens <= 0 or block_size <= 0:
@@ -147,7 +149,9 @@ class DFlashDraftInputV2(SpecInput):
                 f"DFLASH invalid speculative_num_draft_tokens={num_verify_tokens}, "
                 f"block_size={block_size}."
             )
-        reserve = max(num_verify_tokens, block_size) + block_size
+        reserve = max(num_verify_tokens, block_size) + max_step_commit(
+            block_size=block_size, num_nodes=num_verify_tokens
+        )
         page_size = batch.token_to_kv_pool_allocator.page_size
 
         cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(

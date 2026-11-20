@@ -28,8 +28,19 @@ from sglang.kernels.ops.speculative.dflash_retrieval import (
 )
 from sglang.kernels.ops.speculative.dflash_tree import DFlashTreeProposal
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_spec
 
 logger = logging.getLogger(__name__)
+
+
+def max_step_commit(*, block_size: int, num_nodes: int) -> int:
+    """Most tokens a DFLASH step commits: the draft block, or with the retrieval extension
+    (trees) the drafted path and its chain, at most the tree's nodes. The decode KV
+    reserve covers it, as the next step's verify window starts that much later."""
+    extension = envs.SGLANG_DFLASH_RETRIEVAL_EXTENSION.get()
+    if extension <= 0 or (get_spec().speculative_eagle_topk or 1) <= 1:
+        return block_size
+    return min(num_nodes, block_size + extension)
 
 
 class RetrievalExtension:
